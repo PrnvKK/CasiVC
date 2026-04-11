@@ -210,11 +210,13 @@ class MRSTFTLoss(nn.Module):
 # 3. Speaker Identity Loss – cosine distance on embeddings
 # ------------------------------------------------------------------
 # (in losses.py)
+# ------------------------------------------------------------------
+# 3. Speaker Identity Loss – cosine distance on embeddings
+# ------------------------------------------------------------------
 class SpeakerIdentityLoss(nn.Module):
     """
     Measures the cosine similarity between speaker embeddings extracted
     from predicted and ground-truth WAVEFORMS.
-    ...
     """
     def __init__(self, speaker_encoder: nn.Module) -> None:
         super().__init__()
@@ -228,22 +230,19 @@ class SpeakerIdentityLoss(nn.Module):
     @torch.no_grad()
     def _extract_embedding(self, wave: torch.Tensor) -> torch.Tensor:
         """Extracts speaker embedding from a waveform."""
-        # The .encode_batch method is the correct way to get embeddings
         return self.speaker_encoder.encode_batch(wave).detach()
 
     def forward(
         self,
-        pred_wave: torch.Tensor,    # (B, T_wav) - CHANGED
-        gt_wave: torch.Tensor,      # (B, T_wav) - CHANGED
+        pred_wave: torch.Tensor,    # (B, T_wav)
+        gt_wave: torch.Tensor,      # (B, T_wav)
     ) -> torch.Tensor:
         """Calculates the speaker identity loss on waveforms."""
         self.speaker_encoder.eval()
 
-        # Extract embeddings directly from the waveforms
         emb_pred = self.speaker_encoder.encode_batch(pred_wave)
         emb_gt = self._extract_embedding(gt_wave)
 
-        # The rest of the logic remains the same
         emb_pred = F.normalize(emb_pred.squeeze(1), p=2, dim=1)
         emb_gt = F.normalize(emb_gt.squeeze(1), p=2, dim=1)
         
@@ -251,6 +250,56 @@ class SpeakerIdentityLoss(nn.Module):
         loss = 1.0 - cosine_sim.mean()
         
         return loss
+
+# ------------------------------------------------------------------
+# 3b. Mel Spectral Stats Loss - Timbre/EQ Signature Loss
+# ------------------------------------------------------------------
+class MelSpectralStatsLoss(nn.Module):
+    """
+    Penalizes differences in the global mean and standard deviation of Mel-spectrograms.
+    Forces the network to match the target speaker's time-invariant acoustic signature (timbre/EQ)
+    rather than just phoneme structures, strongly mitigating the source-leakage 'shortcut trap'.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        pred: torch.Tensor,             # (B, n_mels, T)
+        target: torch.Tensor,           # (B, n_mels, T)
+        lengths: torch.Tensor = None,   # (B,) real frame counts
+    ) -> torch.Tensor:
+        if pred.shape != target.shape:
+            min_t = min(pred.size(-1), target.size(-1))
+            pred   = pred[..., :min_t]
+            target = target[..., :min_t]
+            
+        if lengths is not None:
+            T = pred.size(-1)
+            mask = (torch.arange(T, device=pred.device)[None, :] < lengths[:, None])  # (B, T)
+            mask = mask.unsqueeze(1).float()  # (B, 1, T)
+            
+            valid_frames = lengths.view(-1, 1).float() # (B, 1)
+            valid_frames = valid_frames.clamp(min=1.0)
+            
+            pred_mean = (pred * mask).sum(dim=-1) / valid_frames
+            target_mean = (target * mask).sum(dim=-1) / valid_frames
+            
+            pred_var = (((pred - pred_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
+            target_var = (((target - target_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
+            
+            pred_std = torch.sqrt(pred_var + 1e-6)
+            target_std = torch.sqrt(target_var + 1e-6)
+        else:
+            pred_mean = pred.mean(dim=-1)
+            target_mean = target.mean(dim=-1)
+            pred_std = pred.std(dim=-1)
+            target_std = target.std(dim=-1)
+            
+        l1_mean = F.l1_loss(pred_mean, target_mean)
+        l1_std = F.l1_loss(pred_std, target_std)
+        
+        return l1_mean + l1_std
 
 
 # ------------------------------------------------------------------
@@ -295,16 +344,17 @@ class VCGeneratorLoss(nn.Module):
 
         # 3. Speaker identity loss
         self.speaker_loss: Optional[SpeakerIdentityLoss] = None
+        self.mel_stats_loss = MelSpectralStatsLoss()
+        
         if hasattr(cfg, 'lambda_spk') and cfg.lambda_spk > 0:
             if speaker_encoder is None:
-                raise ValueError(
-                    "lambda_spk > 0 but no speaker_encoder was provided."
-                )
-            self.speaker_loss = SpeakerIdentityLoss(speaker_encoder)
+                print("Warning: lambda_spk > 0 but speaker_encoder is None. Using MelStatsLoss only.")
+            else:
+                self.speaker_loss = SpeakerIdentityLoss(speaker_encoder)
         else:
             print(
                 "Warning: `lambda_spk` is not defined or is 0. "
-                "SpeakerIdentityLoss will be disabled."
+                "Speaker Identity / Stats losses will be disabled."
             )
 
 
@@ -339,14 +389,19 @@ class VCGeneratorLoss(nn.Module):
             except Exception as exc:
                 raise RuntimeError(f"STFT loss failed: {exc}") from exc
 
-        # Speaker identity loss
-        if self.speaker_loss is not None and pred_wave is not None and gt_wave is not None:
+        # Speaker identity & Stats loss
+        if hasattr(self.cfg, 'lambda_spk') and self.cfg.lambda_spk > 0:
             try:
-                # pass waves instead of mels
-                l_spk = self.speaker_loss(pred_wave, gt_wave) 
-                outs["speaker"] = self.cfg.lambda_spk * l_spk
+                # 1. Always compute the highly potent Mel Stats Loss
+                l_spk_stats = self.mel_stats_loss(pred_mel, gt_mel, lengths=gt_lengths)
+                outs["speaker"] = self.cfg.lambda_spk * l_spk_stats
+                
+                # 2. Add True Speaker Cosine Loss IF waveforms were generated (not OOMing)
+                if self.speaker_loss is not None and pred_wave is not None and gt_wave is not None:
+                    l_spk_wave = self.speaker_loss(pred_wave, gt_wave) 
+                    outs["speaker"] = outs["speaker"] + (self.cfg.lambda_spk * l_spk_wave)
             except Exception as exc:
-                raise RuntimeError(f"Speaker loss failed: {exc}") from exc
+                raise RuntimeError(f"Speaker/Stats loss failed: {exc}") from exc
         
         return outs
 
