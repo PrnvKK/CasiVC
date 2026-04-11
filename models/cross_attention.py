@@ -329,30 +329,30 @@ class PositionAgnosticCrossAttention(nn.Module):
             residual = self.residual_proj(content_features)
             
             # STEP 1: ERASING THE SOURCE VOICE (The Information Leakage Shortcut)
-            # InstanceNorm normalizes over the *time* dimension for each channel.
-            # This strips away the Source Speaker's global volume and frequency formants.
-            # Without this, the model will cheat and just output the Source Voice!
+            # Drouput completely ruins the phoneme sequence's ability to act as a 
+            # crutch for predicting global mean/std, FORCING the network to rely on beta!
+            if self.training:
+                residual = F.dropout(residual, p=0.4, training=True)
+                
             residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
             
             # STEP 2: INJECTING THE TARGET VOICE
-            # Extract precise scale and shift from the Target Speaker Token
+            # Repurpose the existing output_proj into a 96x96 AdaIN Mapping Network!
+            # (Solves the scalar alpha bottleneck without adding new state_dict parameters)
+            style_beta = attended_features
+            if hasattr(self, 'output_proj') and self.enable_output_projection:
+                style_beta = self.output_proj(attended_features)
+                
             gamma = 1.0 + self.alpha * attended_features 
-            beta = self.alpha * attended_features
+            beta = self.alpha * style_beta
 
-            # Replace the stripped Source Identity with the Target Identity
             attended_features = residual_norm * gamma + beta
 
-        # (Removed destructive self.layer_norm(attended_features) here which was wiping out beta)
         print(f"[cross_attn] after AdaIN fusion stats: mean={attended_features.mean():.4f}, "
               f"std={attended_features.std():.4f}")
 
-        # ------------------------------------------------------------------
-        # Output projection
-        # ------------------------------------------------------------------
-        if self.enable_output_projection:
-            attended_features = self.output_proj(attended_features)
-            print(f"[cross_attn] after output_proj stats: mean={attended_features.mean():.4f}, "
-                  f"std={attended_features.std():.4f}")
+        # The output projection was moved into the AdaIN block to map the speaker token!
+        # Do not re-project the already-fused features.
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")
