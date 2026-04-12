@@ -584,10 +584,15 @@ class Trainer:
                     print(f"speaker_proj grad: mean={speaker_grad.abs().mean():.6f}, "
                           f"max={speaker_grad.abs().max():.6f}")
                 
-                # Alpha gradient (we know this one works)
-                print(f"alpha grad: {self.model.cross_attn.alpha.grad.item():.6f}")
-
-
+                # Mapping network gradients (replaced alpha scalar)
+                mapping_grad_found = False
+                for name, param in self.model.cross_attn.mapping_network.named_parameters():
+                    if param.grad is not None:
+                        print(f"mapping_network {name} grad: mean={param.grad.abs().mean():.6f}, max={param.grad.abs().max():.6f}")
+                        mapping_grad_found = True
+                
+                if not mapping_grad_found:
+                    print("mapping_network grad: None")
 
             self.analyze_gradient_flow()
 

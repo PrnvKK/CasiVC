@@ -347,18 +347,20 @@ class PositionAgnosticCrossAttention(nn.Module):
             if self.training:
                 residual = F.dropout(residual, p=0.4, training=True)
                 
-            residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
+            # Removed InstanceNorm here to prevent amplifying rare phoneme channels into buzzing static noise.
             
             # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
-            # Instead of manually scaling alpha, we let a non-linear mapping 
-            # network decipher the spatial ECAPA token into formal mean/std channel statistics.
             pooled_spk = speaker_features.mean(dim=1, keepdim=True) # [B, 1, 96]
             style_stats = self.mapping_network(pooled_spk)          # [B, 1, 192]
             
             gamma, beta = style_stats.chunk(2, dim=-1)              # [B, 1, 96] each
             
-            # Apply AdaIN: y = (x - mean)/std * gamma + beta
-            attended_features = residual_norm * (1.0 + gamma) + beta
+            # Bound gamma mathematically to be strictly positive to avoid Phase-Inversion
+            scale = torch.exp(gamma)
+            
+            # Apply FiLM / AdaIN directly to the residual (preserving true temporal variance).
+            # We ADD it to attended_features so we don't obliterate the cross attention output.
+            attended_features = attended_features + (residual * scale + beta)
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")
