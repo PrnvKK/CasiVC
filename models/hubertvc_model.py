@@ -142,6 +142,23 @@ class HubertVCModel(nn.Module):
 
         self.decoder = MobileNetDecoder(config=m_cfg, return_feats=False)    
 
+        # --------------------------------------------------------- #
+        # VECTOR QUANTIZER (The Leakage Destroyer)                  #
+        # --------------------------------------------------------- #
+        # We quantize the 96D continuous HuBERT representations into K=1024 
+        # discrete clusters. This physically destroys any residual Pitch (F0) 
+        # or Timbre (throat shape) lurking in the floating point decimals,
+        # forcing the MobileNet to rely on the AdaIN token for the identity.
+        self.codebook_size = 1024
+        self.vq_dim = 96
+        self.register_buffer('codebook', torch.randn(self.codebook_size, self.vq_dim))
+        
+        # Exponential Moving Average stats for offline codebook updates
+        self.register_buffer('cluster_size', torch.zeros(self.codebook_size))
+        self.register_buffer('ema_w', self.codebook.clone())
+        self.decay = 0.99
+        self.epsilon = 1e-5
+
         # 2. Sanity-check overall parameter budget
         trainables = sum(p.numel() for p in self.parameters()
                          if p.requires_grad)
@@ -268,6 +285,44 @@ class HubertVCModel(nn.Module):
 
             content_feats = self.hubert_proj(content_feats)  # [B, T, 768] → [B, T, 96]
             
+        # ========================================================= #
+        # VECTOR QUANTIZATION BOTTLENECK (The Cure)                 #
+        # ========================================================= #
+        # 1. Flatten the features
+        flat_feats = content_feats.reshape(-1, self.vq_dim)
+        
+        # 2. Compute L2 distance between features and codebook clusters
+        # ||x - e||^2 = ||x||^2 + ||e||^2 - 2 * x * e
+        dists = (torch.sum(flat_feats**2, dim=1, keepdim=True)
+                + torch.sum(self.codebook**2, dim=1)
+                - 2 * torch.matmul(flat_feats, self.codebook.t()))
+                
+        # 3. Find the closest cluster for every frame
+        encoding_indices = torch.argmin(dists, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.shape[0], self.codebook_size, device=device)
+        encodings.scatter_(1, encoding_indices, 1)
+        
+        # 4. Snap to the exact integer cluster (The Digitization)
+        quantized = torch.matmul(encodings, self.codebook).view_as(content_feats)
+        
+        # 5. EMA Codebook Update (Only during training!)
+        if self.training:
+            self.cluster_size.data.mul_(self.decay).add_(
+                encodings.sum(0), alpha=1 - self.decay
+            )
+            # Laplace smoothing to prevent dead codes
+            n = self.cluster_size.sum()
+            cluster_size = (
+                (self.cluster_size + self.epsilon)
+                / (n + self.codebook_size * self.epsilon) * n
+            )
+            dw = torch.matmul(encodings.t(), flat_feats)
+            self.ema_w.data.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+            self.codebook.data.copy_(self.ema_w / cluster_size.unsqueeze(1))
+            
+        # 6. Straight-Through Estimator (pass gradients cleanly)
+        content_feats = content_feats + (quantized - content_feats).detach()
+        
         # REMOVED F.instance_norm (Fixes Whispering)
         # Normalizing over the temporal dimension completely destroyed the F0/pitch 
         # contour encoded in the variance of HuBERT features, causing the model to minimize

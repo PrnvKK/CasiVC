@@ -404,32 +404,6 @@ class Trainer:
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()
             
-            # --- THE FINAL SHORTCUT SEVER (Adversarial Cross-Batch Stats Training) ---
-            # Even with heavy dropout, Auto-Encoders learn to guess Speaker from Content
-            # because the Training loss only rewards finding the correct Target offset.
-            # To physically force the model to USE the Speaker Enbedding, we SHUFFLE the
-            # target speakers, run a cross-conversion forward pass, and ONLY penalize it
-            # if it fails to match the SHUFFLED speaker's global Mel stats!
-            b_size = speaker_feats.shape[0] if speaker_feats is not None else 1
-            if b_size > 1 and hasattr(self.loss_fn, 'mel_stats_loss') and self.loss_fn.mel_stats_loss is not None:
-                # Roll the batch by 1: Content A gets Speaker B
-                idx = torch.roll(torch.arange(b_size, device=self.device), shifts=1)
-                shuffled_spk_feats = speaker_feats[idx]
-                shuffled_gt_mel = gt_mel[idx]
-                
-                # Forward pass for A -> B
-                cross_pred_mel, _, _ = self.model(wav_padded, shuffled_spk_feats)
-                cross_pred_mel = cross_pred_mel.to(torch.float32)
-                
-                # Ensure the predicted stats of (Content A + Speaker B) matches Speaker B!
-                # We do not compute full L1 mel_loss because shapes/phonemes are misaligned.
-                # This perfectly decouples timbre from phonetic shape.
-                cross_stats_loss = self.loss_fn.mel_stats_loss(cross_pred_mel, shuffled_gt_mel, lengths=None)
-                
-                # Weight it heavily so the model realizes the Speaker Token is mandatory
-                lambda_spk = getattr(self.loss_fn.cfg, 'lambda_spk', 3.0)
-                total = total + (lambda_spk * cross_stats_loss)
-            
             print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
             f"raw_stft={losses.get('stft', 0):.4f}, "
             f"actual_total={total:.4f}")
