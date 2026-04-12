@@ -265,9 +265,13 @@ class Trainer:
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"])
-        self.optimizer.load_state_dict(ckpt["optim_state"])
-        self.scheduler.load_state_dict(ckpt["sched_state"])
+        self.model.load_state_dict(ckpt["model_state"], strict=False)
+        
+        try:
+            self.optimizer.load_state_dict(ckpt["optim_state"])
+            self.scheduler.load_state_dict(ckpt["sched_state"])
+        except ValueError:
+            print("[Warning] Optimizer/Scheduler state mismatch (expected when adding new parameters). Continuing with fresh optimizer states for new weights.")
         self.start_epoch       = ckpt.get("epoch", 0)
         self.global_step       = ckpt.get("global_step", 0)
         self.best_val_loss     = ckpt.get("best_val_loss", float("inf"))

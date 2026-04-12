@@ -104,6 +104,15 @@ class PositionAgnosticCrossAttention(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(self.dropout_rate)
         
+        # AdaIN Mapping Network
+        # Converts the abstract target speaker token into independent scale (gamma) 
+        # and shift (beta) statistics per channel.
+        self.mapping_network = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.LeakyReLU(0.2),
+            nn.Linear(self.d_model, self.d_model * 2)
+        )
+        
         # Initialize parameters
         self._init_parameters()
         
@@ -130,6 +139,12 @@ class PositionAgnosticCrossAttention(nn.Module):
         if self.enable_output_projection:
             nn.init.xavier_uniform_(self.output_proj.weight)
             nn.init.zeros_(self.output_proj.bias)
+
+        # Mapping network initialization
+        for m in self.mapping_network.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
 
     
@@ -328,31 +343,22 @@ class PositionAgnosticCrossAttention(nn.Module):
         if self.enable_residual:
             residual = self.residual_proj(content_features)
             
-            # STEP 1: ERASING THE SOURCE VOICE (The Information Leakage Shortcut)
-            # Drouput completely ruins the phoneme sequence's ability to act as a 
-            # crutch for predicting global mean/std, FORCING the network to rely on beta!
+            # STEP 1: ERASING THE SOURCE VOICE
             if self.training:
                 residual = F.dropout(residual, p=0.4, training=True)
                 
             residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
             
-            # STEP 2: INJECTING THE TARGET VOICE
-            # Repurpose the existing output_proj into a 96x96 AdaIN Mapping Network!
-            # (Solves the scalar alpha bottleneck without adding new state_dict parameters)
-            style_beta = attended_features
-            if hasattr(self, 'output_proj') and self.enable_output_projection:
-                style_beta = self.output_proj(attended_features)
-                
-            gamma = 1.0 + self.alpha * attended_features 
-            beta = self.alpha * style_beta
-
-            attended_features = residual_norm * gamma + beta
-
-        print(f"[cross_attn] after AdaIN fusion stats: mean={attended_features.mean():.4f}, "
-              f"std={attended_features.std():.4f}")
-
-        # The output projection was moved into the AdaIN block to map the speaker token!
-        # Do not re-project the already-fused features.
+            # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
+            # Instead of manually scaling alpha, we let a non-linear mapping 
+            # network decipher the spatial ECAPA token into formal mean/std channel statistics.
+            pooled_spk = speaker_features.mean(dim=1, keepdim=True) # [B, 1, 96]
+            style_stats = self.mapping_network(pooled_spk)          # [B, 1, 192]
+            
+            gamma, beta = style_stats.chunk(2, dim=-1)              # [B, 1, 96] each
+            
+            # Apply AdaIN: y = (x - mean)/std * gamma + beta
+            attended_features = residual_norm * (1.0 + gamma) + beta
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")
