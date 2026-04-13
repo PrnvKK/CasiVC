@@ -347,7 +347,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             if self.training:
                 residual = F.dropout(residual, p=0.4, training=True)
                 
-            # Removed InstanceNorm here to prevent amplifying rare phoneme channels into buzzing static noise.
+            # Removed InstanceNorm here to prevent amplifying background silence into "buzzing" static.
             
             # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
             pooled_spk = speaker_features.mean(dim=1, keepdim=True) # [B, 1, 96]
@@ -355,11 +355,19 @@ class PositionAgnosticCrossAttention(nn.Module):
             
             gamma, beta = style_stats.chunk(2, dim=-1)              # [B, 1, 96] each
             
-            # Bound gamma mathematically to be strictly positive to avoid Phase-Inversion
+            # Bound gamma mathematically to be strictly positive to avoid Phase-Inversion crashes
             scale = torch.exp(gamma)
             
-            # Apply FiLM / AdaIN directly to the residual (preserving true temporal variance).
-            # We ADD it to attended_features so we don't obliterate the cross attention output.
+            # DIAGNOSTIC: Verify mapping network is actually producing speaker-dependent values
+            print(f"[FiLM] gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}, "
+                  f"min={gamma.min():.4f}, max={gamma.max():.4f}")
+            print(f"[FiLM] scale (exp(gamma)): mean={scale.mean():.4f}, std={scale.std():.4f}, "
+                  f"min={scale.min():.4f}, max={scale.max():.4f}")
+            print(f"[FiLM] beta: mean={beta.mean():.4f}, std={beta.std():.4f}, "
+                  f"min={beta.min():.4f}, max={beta.max():.4f}")
+            
+            # Apply FiLM directly to the residual (preserving temporal variance).
+            # We ADD it so we don't destroy the output from the Multihead Attention.
             attended_features = attended_features + (residual * scale + beta)
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
