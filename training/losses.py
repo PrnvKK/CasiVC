@@ -256,50 +256,72 @@ class SpeakerIdentityLoss(nn.Module):
 # ------------------------------------------------------------------
 class MelSpectralStatsLoss(nn.Module):
     """
-    Penalizes differences in the global mean and standard deviation of Mel-spectrograms.
-    Forces the network to match the target speaker's time-invariant acoustic signature (timbre/EQ)
-    rather than just phoneme structures, strongly mitigating the source-leakage 'shortcut trap'.
+    DEPRECATED: Previously used as a proxy for speaker identity. Comparing mel stats
+    against the SOURCE speaker mel actively fights conversion. Kept for reference only.
     """
     def __init__(self):
         super().__init__()
 
     def forward(
         self,
-        pred: torch.Tensor,             # (B, n_mels, T)
-        target: torch.Tensor,           # (B, n_mels, T)
-        lengths: torch.Tensor = None,   # (B,) real frame counts
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        lengths: torch.Tensor = None,
     ) -> torch.Tensor:
         if pred.shape != target.shape:
             min_t = min(pred.size(-1), target.size(-1))
             pred   = pred[..., :min_t]
             target = target[..., :min_t]
             
-        if lengths is not None:
-            T = pred.size(-1)
-            mask = (torch.arange(T, device=pred.device)[None, :] < lengths[:, None])  # (B, T)
-            mask = mask.unsqueeze(1).float()  # (B, 1, T)
-            
-            valid_frames = lengths.view(-1, 1).float() # (B, 1)
-            valid_frames = valid_frames.clamp(min=1.0)
-            
-            pred_mean = (pred * mask).sum(dim=-1) / valid_frames
-            target_mean = (target * mask).sum(dim=-1) / valid_frames
-            
-            pred_var = (((pred - pred_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
-            target_var = (((target - target_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
-            
-            pred_std = torch.sqrt(pred_var + 1e-6)
-            target_std = torch.sqrt(target_var + 1e-6)
-        else:
-            pred_mean = pred.mean(dim=-1)
-            target_mean = target.mean(dim=-1)
-            pred_std = pred.std(dim=-1)
-            target_std = target.std(dim=-1)
+        pred_mean = pred.mean(dim=-1)
+        target_mean = target.mean(dim=-1)
+        pred_std = pred.std(dim=-1)
+        target_std = target.std(dim=-1)
             
         l1_mean = F.l1_loss(pred_mean, target_mean)
         l1_std = F.l1_loss(pred_std, target_std)
         
         return l1_mean + l1_std
+
+
+# ------------------------------------------------------------------
+# 3b. Speaker Embedding Mel Loss — mel-pool cosine distance
+# ------------------------------------------------------------------
+class SpeakerEmbeddingMelLoss(nn.Module):
+    """
+    Projects the predicted mel into speaker-embedding space, then computes
+    cosine distance against the cached TARGET speaker embedding.
+
+    Pipeline (no ECAPA / no vocoder / no HuBERT):
+      pred_mel (B, 80, T)  -- time-pool -->  (B, 80)  -- Linear -->  (B, 96)
+      cosine_dist against target_speaker_feats (B, 1, 96)
+
+    The projection is a tiny trainable layer (80 → 96) that learns to map
+    mel centroids into the ECAPA projection space. Gradient flows through
+    it and back into the decoder / mapping_network / cross_attn.
+
+    Neither ECAPA, HuBERT, nor the vocoder is touched.
+    """
+    def __init__(self, mel_dim: int = 80, spk_dim: int = 96) -> None:
+        super().__init__()
+        self.mel_to_spk = nn.Linear(mel_dim, spk_dim)
+        nn.init.xavier_uniform_(self.mel_to_spk.weight)
+        nn.init.zeros_(self.mel_to_spk.bias)
+
+    def forward(
+        self,
+        pred_mel: torch.Tensor,              # (B, 80, T)
+        target_speaker_feats: torch.Tensor,  # (B, 1, 96) from TARGET speaker cache
+    ) -> torch.Tensor:
+        # Pool predicted mel over time -> (B, 80)
+        pred_mel_mean = pred_mel.mean(dim=-1)                         # (B, 80)
+        pred_emb = self.mel_to_spk(pred_mel_mean)                     # (B, 96)
+        pred_emb = F.normalize(pred_emb, p=2, dim=-1)                 # (B, 96)
+
+        tgt_emb = F.normalize(target_speaker_feats.squeeze(1), p=2, dim=-1)  # (B, 96)
+
+        cosine_sim = F.cosine_similarity(pred_emb, tgt_emb, dim=-1)   # (B,)
+        return (1.0 - cosine_sim.mean())
 
 
 # ------------------------------------------------------------------
@@ -321,7 +343,8 @@ class VCGeneratorLoss(nn.Module):
     def __init__(
         self,
         cfg: TrainingConfig,
-        speaker_encoder: Optional[nn.Module] = None,
+        mel_encoder: Optional[nn.Module] = None,
+        speaker_encoder: Optional[nn.Module] = None,   # kept for API compat, unused
     ) -> None:
         """
         Initializes the loss aggregator.
@@ -334,54 +357,44 @@ class VCGeneratorLoss(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # --- Instantiate individual loss components ---
-
         # 1. Mel-spectrogram L1 reconstruction loss
-        self.mel_loss = MelSpectrogramLoss(weight_l1=0.7) # Using pure L1
+        self.mel_loss = MelSpectrogramLoss(weight_l1=0.7)
 
-        # 2. Multi-resolution STFT loss
+        # 2. Multi-resolution STFT loss (disabled in Colab path since pred_wave=None)
         self.stft_loss = MRSTFTLoss()
 
-        # 3. Speaker identity loss
-        self.speaker_loss: Optional[SpeakerIdentityLoss] = None
-        self.mel_stats_loss = MelSpectralStatsLoss()
-        
+        # 3. Speaker embedding cosine loss on mel-domain features
+        # A tiny trainable projection (80->96) maps mel centroids to speaker space.
+        # Neither ECAPA nor HuBERT are touched.
+        self.spk_emb_loss: Optional[SpeakerEmbeddingMelLoss] = None
         if hasattr(cfg, 'lambda_spk') and cfg.lambda_spk > 0:
-            if speaker_encoder is None:
-                print("Warning: lambda_spk > 0 but speaker_encoder is None. Using MelStatsLoss only.")
-            else:
-                self.speaker_loss = SpeakerIdentityLoss(speaker_encoder)
+            self.spk_emb_loss = SpeakerEmbeddingMelLoss(mel_dim=80, spk_dim=96)
         else:
-            print(
-                "Warning: `lambda_spk` is not defined or is 0. "
-                "Speaker Identity / Stats losses will be disabled."
-            )
+            print("Warning: lambda_spk is 0 or unset. Speaker loss disabled.")
 
 
     def forward(
         self,
-        pred_mel: torch.Tensor,             # (B, n_mel, T_mel)
-        gt_mel: torch.Tensor,               # (B, n_mel, T_mel)
-        pred_wave: torch.Tensor,            # (B, T_wav)
-        gt_wave: torch.Tensor,              # (B, T_wav)
-        gt_lengths: torch.Tensor = None,    # (B,) real mel frame counts (excludes padding)
+        pred_mel: torch.Tensor,              # (B, n_mel, T_mel)
+        gt_mel: torch.Tensor,                # (B, n_mel, T_mel)
+        pred_wave: torch.Tensor,             # (B, T_wav)  — None in Colab path
+        gt_wave: torch.Tensor,               # (B, T_wav)  — None in Colab path
+        gt_lengths: torch.Tensor = None,     # (B,) real mel frame counts
+        target_speaker_feats: torch.Tensor = None,  # (B, 1, 96) from TARGET speaker cache
+        is_cross_speaker: bool = False,      # True → only speaker loss, no mel L1
     ) -> LossOutputs:
-        """
-        Computes the weighted sum of all configured losses.
-        """
         outs = LossOutputs()
 
-        # --- Compute and weight each loss term ---
+        # --- Mel L1 loss: ONLY on same-speaker (self-recon) batches ---
+        if not is_cross_speaker:
+            if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
+                try:
+                    l_mel = self.mel_loss(pred_mel, gt_mel, lengths=gt_lengths)
+                    outs["mel"] = self.cfg.lambda_mel * l_mel
+                except Exception as exc:
+                    raise RuntimeError(f"Mel loss failed: {exc}") from exc
 
-        # Mel reconstruction loss
-        if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
-            try:
-                l_mel = self.mel_loss(pred_mel, gt_mel, lengths=gt_lengths)
-                outs["mel"] = self.cfg.lambda_mel * l_mel
-            except Exception as exc:
-                raise RuntimeError(f"Mel loss failed: {exc}") from exc
-
-        # Multi-resolution STFT loss
+        # --- STFT loss: disabled when pred_wave is None ---
         if hasattr(self.cfg, 'lambda_rec') and self.cfg.lambda_rec > 0 and pred_wave is not None and gt_wave is not None:
             try:
                 l_stft = self.stft_loss(pred_wave, gt_wave)
@@ -389,20 +402,17 @@ class VCGeneratorLoss(nn.Module):
             except Exception as exc:
                 raise RuntimeError(f"STFT loss failed: {exc}") from exc
 
-        # Speaker identity & Stats loss
-        if hasattr(self.cfg, 'lambda_spk') and self.cfg.lambda_spk > 0:
-            try:
-                # 1. Always compute the highly potent Mel Stats Loss
-                l_spk_stats = self.mel_stats_loss(pred_mel, gt_mel, lengths=gt_lengths)
-                outs["speaker"] = self.cfg.lambda_spk * l_spk_stats
-                
-                # 2. Add True Speaker Cosine Loss IF waveforms were generated (not OOMing)
-                if self.speaker_loss is not None and pred_wave is not None and gt_wave is not None:
-                    l_spk_wave = self.speaker_loss(pred_wave, gt_wave) 
-                    outs["speaker"] = outs["speaker"] + (self.cfg.lambda_spk * l_spk_wave)
-            except Exception as exc:
-                raise RuntimeError(f"Speaker/Stats loss failed: {exc}") from exc
-        
+        # --- Speaker embedding cosine loss: ONLY on cross-speaker batches ---
+        if is_cross_speaker and target_speaker_feats is not None:
+            if hasattr(self.cfg, 'lambda_spk') and self.cfg.lambda_spk > 0 and self.spk_emb_loss is not None:
+                try:
+                    l_spk = self.spk_emb_loss(pred_mel, target_speaker_feats)
+                    outs["speaker"] = self.cfg.lambda_spk * l_spk
+                    print(f"[CROSS_SPK_LOSS] cosine_dist={l_spk.item():.4f}, "
+                          f"weighted={outs['speaker'].item():.4f}")
+                except Exception as exc:
+                    raise RuntimeError(f"Speaker loss failed: {exc}") from exc
+
         return outs
 
 

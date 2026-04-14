@@ -343,32 +343,33 @@ class PositionAgnosticCrossAttention(nn.Module):
         if self.enable_residual:
             residual = self.residual_proj(content_features)
             
-            # STEP 1: ERASING THE SOURCE VOICE
+            # STEP 1: ERASE source timbre via bottleneck dropout (training only)
             if self.training:
                 residual = F.dropout(residual, p=0.4, training=True)
-                
-            # Removed InstanceNorm here to prevent amplifying background silence into "buzzing" static.
-            
-            # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
-            pooled_spk = speaker_features.mean(dim=1, keepdim=True) # [B, 1, 96]
-            style_stats = self.mapping_network(pooled_spk)          # [B, 1, 192]
-            
-            gamma, beta = style_stats.chunk(2, dim=-1)              # [B, 1, 96] each
-            
-            # Bound gamma mathematically to be strictly positive to avoid Phase-Inversion crashes
-            scale = torch.exp(gamma)
-            
-            # DIAGNOSTIC: Verify mapping network is actually producing speaker-dependent values
-            print(f"[FiLM] gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}, "
-                  f"min={gamma.min():.4f}, max={gamma.max():.4f}")
-            print(f"[FiLM] scale (exp(gamma)): mean={scale.mean():.4f}, std={scale.std():.4f}, "
-                  f"min={scale.min():.4f}, max={scale.max():.4f}")
-            print(f"[FiLM] beta: mean={beta.mean():.4f}, std={beta.std():.4f}, "
-                  f"min={beta.min():.4f}, max={beta.max():.4f}")
-            
-            # Apply FiLM directly to the residual (preserving temporal variance).
-            # We ADD it so we don't destroy the output from the Multihead Attention.
+
+            # NOTE: InstanceNorm is intentionally removed here.
+            # F.instance_norm over the time axis divides each channel by its
+            # temporal std. Sparse phoneme channels (mostly zero) have std~0,
+            # causing 1/std to explode silence into full-volume static — the
+            # "buzzing" artifact heard in all previous runs. Do not re-add it.
+
+            # STEP 2: INJECT target speaker via non-linear Mapping Network
+            pooled_spk = speaker_features.mean(dim=1, keepdim=True)  # [B, 1, 96]
+            style_stats = self.mapping_network(pooled_spk)             # [B, 1, 192]
+            gamma, beta = style_stats.chunk(2, dim=-1)                 # [B, 1, 96] each
+
+            # exp(gamma) keeps scale strictly positive (prevents phase inversion).
+            scale = torch.exp(gamma)                                   # [B, 1, 96]
+
+            print(f"[FiLM] gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}")
+            print(f"[FiLM] scale (exp(gamma)): mean={scale.mean():.4f}, std={scale.std():.4f}")
+            print(f"[FiLM] beta:  mean={beta.mean():.4f},  std={beta.std():.4f}")
+
+            # Additive fusion: preserve the cross-attention output AND add the
+            # speaker-styled residual on top. Overwriting (=) would discard the
+            # attention signal entirely — do not change += to =.
             attended_features = attended_features + (residual * scale + beta)
+
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")
