@@ -140,9 +140,8 @@ class Trainer:
         # ----------------------------------------------------------
         # 5. optimiser & scheduler
         # ----------------------------------------------------------
-        # loss_fn has a trainable mel_to_spk Linear(80->96) inside SpeakerEmbeddingMelLoss.
-        # It must be in the optimizer or its gradients are silently discarded.
-        all_params = list(self.model.parameters()) + list(self.loss_fn.parameters())
+        # BandStatsSpeakerLoss has NO trainable parameters — only model params needed.
+        all_params = list(self.model.parameters())
         self.optimizer = Adam(
             all_params,
             lr=self.train_cfg.learning_rate,
@@ -250,7 +249,6 @@ class Trainer:
                 "epoch": self.start_epoch,
                 "global_step": self.global_step,
                 "model_state": self.model.state_dict(),
-                "loss_fn_state": self.loss_fn.state_dict(),   # saves mel_to_spk projection
                 "vocoder_state": self.vocoder.state_dict(),
                 "optim_state": self.optimizer.state_dict(),
                 "sched_state": self.scheduler.state_dict(),
@@ -270,15 +268,11 @@ class Trainer:
         ckpt = torch.load(ckpt_path, map_location=self.device)
         self.model.load_state_dict(ckpt["model_state"], strict=False)
 
-        # Restore the trainable mel_to_spk projection inside loss_fn
-        if "loss_fn_state" in ckpt:
-            self.loss_fn.load_state_dict(ckpt["loss_fn_state"], strict=False)
-        
         try:
             self.optimizer.load_state_dict(ckpt["optim_state"])
             self.scheduler.load_state_dict(ckpt["sched_state"])
         except ValueError:
-            print("[Warning] Optimizer/Scheduler state mismatch (expected when adding new parameters). Continuing with fresh optimizer states for new weights.")
+            print("[Warning] Optimizer/Scheduler state mismatch. Continuing with fresh states.")
         self.start_epoch       = ckpt.get("epoch", 0)
         self.global_step       = ckpt.get("global_step", 0)
         self.best_val_loss     = ckpt.get("best_val_loss", float("inf"))
@@ -378,10 +372,17 @@ class Trainer:
             is_cross_speaker = (self.global_step % 2 == 1)
             target_speaker_feats = None
             speaker_feats_for_forward = batch.get("speaker_feats")   # default: source
+            target_gt_mel = None
+            target_gt_lengths = None
 
             if is_cross_speaker and batch.get("speaker_feats") is not None:
-                # Roll by 1: item i gets item (i+1 mod B)'s speaker feats
-                target_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
+                # Roll ALL target-speaker quantities by 1 in sync:
+                # item i receives item (i+1 mod B)'s speaker feats, gt_mel, and gt_lengths.
+                # gt_mel here is the SOURCE content mel — rolling it gives the TARGET's mel
+                # for use as the band-stats supervision target.
+                target_speaker_feats  = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
+                target_gt_mel         = torch.roll(gt_mel,                 shifts=1, dims=0)
+                target_gt_lengths     = torch.roll(gt_lengths,             shifts=1, dims=0)
                 speaker_feats_for_forward = target_speaker_feats   # condition on TARGET
                 print(f"[HYBRID] Cross-speaker | step={self.global_step} "
                       f"| speakers: {batch.get('speaker_id')}")
@@ -413,7 +414,8 @@ class Trainer:
             losses = self.loss_fn(
                 pred_mel, gt_mel, pred_wave, gt_wave_vocoded,
                 gt_lengths=gt_lengths,
-                target_speaker_feats=target_speaker_feats,
+                target_gt_mel=target_gt_mel,
+                target_gt_lengths=target_gt_lengths,
                 is_cross_speaker=is_cross_speaker,
             )
             
@@ -596,7 +598,7 @@ class Trainer:
                     print(f"speaker_proj grad: mean={speaker_grad.abs().mean():.6f}, "
                           f"max={speaker_grad.abs().max():.6f}")
                 
-                # Mapping network gradients (alpha scalar was removed — do NOT use alpha.grad)
+                # Mapping network gradients
                 mapping_grad_found = False
                 for name, param in self.model.cross_attn.mapping_network.named_parameters():
                     if param.grad is not None:
@@ -604,16 +606,7 @@ class Trainer:
                               f"max={param.grad.abs().max():.6f}")
                         mapping_grad_found = True
                 if not mapping_grad_found:
-                    print("mapping_network grad: None (no gradient yet)")
-
-                # mel_to_spk projection inside loss_fn (new trainable layer)
-                if hasattr(self.loss_fn, 'spk_emb_loss') and self.loss_fn.spk_emb_loss is not None:
-                    w = self.loss_fn.spk_emb_loss.mel_to_spk.weight
-                    if w.grad is not None:
-                        print(f"loss_fn.mel_to_spk grad: mean={w.grad.abs().mean():.6f}, "
-                              f"max={w.grad.abs().max():.6f}")
-                    else:
-                        print("loss_fn.mel_to_spk grad: None")
+                    print("mapping_network grad: None (no gradient flowing to mapping_network)")
 
             self.analyze_gradient_flow()
 
