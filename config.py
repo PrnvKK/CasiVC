@@ -104,6 +104,7 @@ class ModelConfig:
     mel_encoder_kernel_size: int = 5 
 
     mel_encoder_output_dim: int =  96
+    num_speaker_tokens: int = 8
     mel_encoder_hidden_dims: List[int] = field(default_factory=lambda: [96])
 
 
@@ -148,6 +149,10 @@ class TrainingConfig:
   lambda_mel: float = 5.0      # was 45 — prevents memorizing exact mels, allows generalization
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
   lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
+
+  # Regularization: mild — maximizes token utilization & prevents token collapse
+  lambda_entropy: float = 0.1    # maximize attention entropy (- entropy gradient)
+  lambda_diversity: float = 0.005 # penalize pairwise cosine similarity between speaker tokens
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0

@@ -335,6 +335,18 @@ class BandStatsSpeakerLoss(nn.Module):
             stats[band_name] = (band_mean, band_std)
         return stats
 
+    def _per_bin_stats(self, mel: torch.Tensor, lengths: torch.Tensor):
+        """Per-frequency-bin masked mean+std -> (B,80) each. 160 gradient terms vs 6."""
+        B, C, T = mel.shape
+        mask = (torch.arange(T, device=mel.device)[None, None, :]
+                < lengths[:, None, None].float())
+        n = lengths.float().clamp(min=1.0).view(B, 1)
+        masked   = mel * mask
+        bin_mean = masked.sum(dim=-1) / n
+        sq_mean  = (masked ** 2).sum(dim=-1) / n
+        bin_std  = (sq_mean - bin_mean ** 2).clamp(min=0.0).add(1e-6).sqrt()
+        return bin_mean, bin_std
+
     def forward(
         self,
         pred_mel: torch.Tensor,       # (B, 80, T_pred)
@@ -344,14 +356,15 @@ class BandStatsSpeakerLoss(nn.Module):
         src_gt_mel: torch.Tensor = None,  # (B, 80, T_src) optional: source mel for diagnostic
         src_lengths: torch.Tensor = None,
     ) -> torch.Tensor:
+        # Fix C: per-bin L1 on mean+std -> 160 gradient terms vs 6,
+        # matching the density of the mel-reconstruction loss.
+        pred_mean, pred_std = self._per_bin_stats(pred_mel, pred_lengths)
+        tgt_mean,  tgt_std  = self._per_bin_stats(target_gt_mel, tgt_lengths)
+        loss = F.l1_loss(pred_mean, tgt_mean) + F.l1_loss(pred_std, tgt_std)
+
+        # Keep 3-band stats for the D(pred,tgt)-D(pred,src) diagnostic only.
         pred_stats = self._masked_stats(pred_mel, pred_lengths)
         tgt_stats  = self._masked_stats(target_gt_mel, tgt_lengths)
-
-        loss = 0.0
-        for band in ("low", "mid", "high"):
-            p_mean, p_std = pred_stats[band]
-            t_mean, t_std = tgt_stats[band]
-            loss = loss + F.l1_loss(p_mean, t_mean) + F.l1_loss(p_std, t_std)
 
         # --- Diagnostic: D(pred,tgt) - D(pred,src) ---
         # Should trend negative: pred moving towards target, away from source

@@ -94,7 +94,7 @@ class MelEncoder(nn.Module):
         self,
         model_name: str = "speechbrain/spkrec-ecapa-voxceleb",
         output_dim: int = None,
-        num_speaker_tokens: int = 64,
+        num_speaker_tokens: int = None,
         device: str = None
     ):
         super().__init__()
@@ -103,7 +103,9 @@ class MelEncoder(nn.Module):
             raise ImportError("speechbrain is required. Install with: pip install speechbrain")
         
         self.output_dim = output_dim or model_config.mel_encoder_output_dim
-        self.num_speaker_tokens = 1  # Fix: Project into 1 token instead of 64 random tokens
+        self.num_speaker_tokens = num_speaker_tokens or getattr(model_config, "num_speaker_tokens", 8)
+        if self.num_speaker_tokens < 1:
+            raise ValueError(f"num_speaker_tokens must be >= 1, got {self.num_speaker_tokens}")
         self.model_name = model_name
         
         # Audio parameters
@@ -248,7 +250,7 @@ class MelEncoder(nn.Module):
             
             # ============ DEBUG: AFTER PROJECTION ============
             print(f"\n[AFTER PROJECTION (before reshape)]")
-            print(f"  Shape: {projected.shape}")  # Should be (B, 1*96 = 96)
+            print(f"  Shape: {projected.shape}")  # Should be (B, num_speaker_tokens*96)
             print(f"  Mean: {projected.mean().item():.4f}")
             print(f"  Std: {projected.std().item():.4f}")
             print(f"  Min: {projected.min().item():.4f}")
@@ -262,14 +264,14 @@ class MelEncoder(nn.Module):
             
             # ============ DEBUG: SPEAKER FEATURES (for cross-attention) ============
             print(f"\n[SPEAKER FEATURES - FINAL]")
-            print(f"  Shape: {speaker_features.shape}")  # Should be (B, 64, 96)
+            print(f"  Shape: {speaker_features.shape}")  # Should be (B, num_speaker_tokens, 96)
             print(f"  Mean: {speaker_features.mean().item():.4f}")
             print(f"  Std: {speaker_features.std().item():.4f}")
             print(f"  Min: {speaker_features.min().item():.4f}")
             print(f"  Max: {speaker_features.max().item():.4f}")
             
             # Token diversity (are tokens different from each other?)
-            token_means = speaker_features.mean(dim=-1)  # (B, 64) - mean of each token
+            token_means = speaker_features.mean(dim=-1)  # (B, num_speaker_tokens) - mean of each token
             token_diversity = token_means.std(dim=-1).mean().item()
             print(f"  Token diversity (std of token means): {token_diversity:.4f}")
             
@@ -279,7 +281,7 @@ class MelEncoder(nn.Module):
             print(f"  Active dims across tokens (std > 0.01): {active_dims_tokens}/96")
             
             # Check for collapsed tokens (all tokens identical)
-            token_pairwise_dist = torch.cdist(speaker_features[0], speaker_features[0], p=2)  # (64, 64)
+            token_pairwise_dist = torch.cdist(speaker_features[0], speaker_features[0], p=2)  # (num_tokens, num_tokens)
             avg_token_dist = token_pairwise_dist.mean().item()
             print(f"  Avg pairwise token distance (L2): {avg_token_dist:.4f}")
             
@@ -300,6 +302,18 @@ class MelEncoder(nn.Module):
         else:
             speaker_features = ecapa_embeddings
         
+        # Fix D: token diversity regularisation.
+        # Penalise high pairwise cosine-sim between tokens so each token
+        # specialises. Gradient flows through projection weights (ECAPA stays frozen).
+        if self.training and self.num_speaker_tokens > 1:
+            import torch.nn.functional as _F
+            _normed = _F.normalize(speaker_features.float(), dim=-1)
+            _sim = torch.bmm(_normed, _normed.transpose(1, 2))
+            _eye = torch.eye(self.num_speaker_tokens, device=_sim.device).unsqueeze(0)
+            self.last_diversity_loss = (_sim * (1.0 - _eye)).pow(2).mean()
+        else:
+            self.last_diversity_loss = None
+
         return speaker_features
 
     def forward(self, ref_audio: Union[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:

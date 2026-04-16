@@ -114,7 +114,11 @@ class Trainer:
         # ----------------------------------------------------------
         # 4. model, vocoder, loss fn
         # ----------------------------------------------------------
-        self.model: HubertVCModel = HubertVCModel(self.model_cfg).to(self.device)
+        self.model: HubertVCModel = HubertVCModel(
+            self.audio_cfg,
+            self.model_cfg,
+            self.train_cfg
+        ).to(self.device)
 
         for name, param in self.model.named_parameters():
             print(name, param.requires_grad)
@@ -421,6 +425,12 @@ class Trainer:
             
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()
+            last_entropy = getattr(self.model.cross_attn, 'last_entropy', None)
+            if last_entropy is not None and self.train_cfg.lambda_entropy > 0:
+                total = total + (-self.train_cfg.lambda_entropy * last_entropy)
+            last_div = getattr(self.model.mel_encoder, 'last_diversity_loss', None)
+            if last_div is not None and self.train_cfg.lambda_diversity > 0:
+                total = total + self.train_cfg.lambda_diversity * last_div
             
             print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
             f"raw_stft={losses.get('stft', 0):.4f}, "
@@ -688,6 +698,12 @@ class Trainer:
             losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded)
 
             total = losses.total()
+            last_entropy = getattr(self.model.cross_attn, 'last_entropy', None)
+            if last_entropy is not None and self.train_cfg.lambda_entropy > 0:
+                total = total + (-self.train_cfg.lambda_entropy * last_entropy)
+            last_div = getattr(self.model.mel_encoder, 'last_diversity_loss', None)
+            if last_div is not None and self.train_cfg.lambda_diversity > 0:
+                total = total + self.train_cfg.lambda_diversity * last_div
 
             for k in loss_accum:
                 loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
@@ -740,25 +756,23 @@ class Trainer:
                 content_audio_gpu = [content_audio.to(self.device)]
                 
                 with torch.inference_mode():
-                    # 1. ECAPA-TDNN Speaker Features
-                    speaker_feats = self.model.mel_encoder(ref_audio_gpu)[0] # [64, 96]
-                    
-                    # 2. HuBERT Content Features 
+                    # HuBERT Content Features (frozen, safe to cache permanently)
                     hubert_out = self.model.hubert(content_audio_gpu)
                     content_feats = self.model.hubert_proj(hubert_out)[0] # [T, 96]
                     
-                    # 3. GT Mel 
+                    # GT Mel
                     gt_mel = extract_mel_spectrogram(
                         content_audio, 
                         sample_rate=self.audio_cfg.sample_rate
                     )
                     
-                # Save to disk
+                # speaker_feats NOT cached: projection is trainable and caching its output
+                # would freeze those weights (no gradient ever reaches them). Save ref_audio.
                 torch.save({
                     'content_feats': content_feats.cpu(),
-                    'speaker_feats': speaker_feats.cpu(),
-                    'gt_mel': gt_mel.cpu(),
-                    'gt_wave': content_audio.cpu(),
+                    'ref_audio':     ref_audio.cpu(),
+                    'gt_mel':        gt_mel.cpu(),
+                    'gt_wave':       content_audio.cpu(),
                 }, cache_file)
                 
         print("✅ Precompution complete! Training will now run exponentially faster.\n")
