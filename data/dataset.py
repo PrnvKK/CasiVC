@@ -568,8 +568,15 @@ class VoiceConversionDataset(Dataset):
         if cache_file.exists():
             try:
                 cached = torch.load(cache_file, map_location='cpu')
+                speaker_feats = cached.get('speaker_feats')
+                expected_tokens = getattr(model_cfg, "num_speaker_tokens", 8)
+                if speaker_feats is not None and speaker_feats.dim() == 2 and speaker_feats.shape[0] != expected_tokens:
+                    raise ValueError(
+                        f"Cache token mismatch for {utterance_id}: "
+                        f"got {speaker_feats.shape[0]}, expected {expected_tokens}"
+                    )
                 return TrainingPair(
-                    ref_audio=None,
+                    ref_audio=cached.get('ref_audio'),
                     ref_mel=None, 
                     content_audio=cached['gt_wave'],
                     content_mel=cached['gt_mel'],
@@ -579,7 +586,7 @@ class VoiceConversionDataset(Dataset):
                     ref_duration=0.0,
                     content_duration=0.0,
                     content_feats=cached['content_feats'],
-                    speaker_feats=cached['speaker_feats']
+                    speaker_feats=None
                 )
             except Exception as e:
                 pass # Fall through to local processing if cache corrupted
@@ -685,6 +692,7 @@ def create_datasets(
 from config import AudioConfig, ModelConfig, TrainingConfig
 
 audio_cfg = AudioConfig()
+model_cfg = ModelConfig()
 
 def _pad_2d(tensors: List[torch.Tensor]) -> torch.Tensor:
     """Pads a list of 2-D tensors (C, T) on the time axis to max-T."""
