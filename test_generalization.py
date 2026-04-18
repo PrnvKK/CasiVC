@@ -5,17 +5,43 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import torchaudio
+from speechbrain.pretrained import EncoderClassifier
 
-from config import AudioConfig, ModelConfig, TrainingConfig
+from config import AudioConfig, ModelConfig, TrainingConfig, DataConfig
 from data.audio_utils import extract_mel_spectrogram, load_audio, split_utterance_for_training
 from models.hubertvc_model import HubertVCModel
 from inference import load_vocoder
+from data.dataset import VoiceConversionDataset
+import numpy as np
+import random
 
 BANDS = {
     "low": (0, 20),
     "mid": (20, 60),
     "high": (60, 80),
 }
+
+
+def _load_eval_speaker_encoder(device: torch.device):
+    print("[SPK_EVAL] Loading independent SpeechBrain ECAPA...")
+    spk_eval = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        run_opts={"device": str(device)},
+        savedir="pretrained_models/spkrec-ecapa-voxceleb-eval",
+    )
+    spk_eval.eval()
+    return spk_eval
+
+
+def _extract_eval_embedding(spk_eval, wave: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if wave.dim() == 1:
+        wave = wave.unsqueeze(0)
+    wave = wave.detach().to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        emb = spk_eval.encode_batch(wave)
+    if emb.dim() == 3:
+        emb = emb.squeeze(1)
+    return F.normalize(emb, p=2, dim=-1)
 
 
 def _band_signature(mel: torch.Tensor):
@@ -85,16 +111,18 @@ def _print_band_metric(tag: str, pred_mel: torch.Tensor, src_sig, tgt_sig):
 
 
 def _print_speaker_similarity(
-    model: HubertVCModel,
+    spk_eval,
     converted_wave: torch.Tensor,
     src_ref_wave: torch.Tensor,
     tgt_ref_wave: torch.Tensor,
     tag: str,
+    device: torch.device,
+    sample_rate: float,
 ):
     with torch.no_grad():
-        emb_conv = model.mel_encoder(converted_wave.unsqueeze(0)).mean(dim=1)
-        emb_src = model.mel_encoder(src_ref_wave.unsqueeze(0)).mean(dim=1)
-        emb_tgt = model.mel_encoder(tgt_ref_wave.unsqueeze(0)).mean(dim=1)
+        emb_conv = _extract_eval_embedding(spk_eval, converted_wave, device)
+        emb_src = _extract_eval_embedding(spk_eval, src_ref_wave, device)
+        emb_tgt = _extract_eval_embedding(spk_eval, tgt_ref_wave, device)
 
         cos_tgt = F.cosine_similarity(emb_conv, emb_tgt, dim=-1).item()
         cos_src = F.cosine_similarity(emb_conv, emb_src, dim=-1).item()
@@ -103,6 +131,28 @@ def _print_speaker_similarity(
             f"cos(conv,source)={cos_src:.4f} "
             f"delta={cos_tgt - cos_src:.4f}"
         )
+
+        # F0 Diagnostics
+        try:
+            # compute_kaldi_pitch returns [..., 2] where index 0 is pitch (Hz), index 1 is NCCF.
+            conv = converted_wave.detach().cpu().float().unsqueeze(0)
+            src = src_ref_wave.detach().cpu().float().unsqueeze(0)
+            tgt = tgt_ref_wave.detach().cpu().float().unsqueeze(0)
+            sr = float(sample_rate)
+            p_conv = torchaudio.functional.compute_kaldi_pitch(conv, sr)[..., 0]
+            p_src = torchaudio.functional.compute_kaldi_pitch(src, sr)[..., 0]
+            p_tgt = torchaudio.functional.compute_kaldi_pitch(tgt, sr)[..., 0]
+
+            conv_voiced = p_conv[p_conv > 0]
+            src_voiced = p_src[p_src > 0]
+            tgt_voiced = p_tgt[p_tgt > 0]
+
+            f0_conv = conv_voiced.mean().item() if conv_voiced.numel() > 0 else float("nan")
+            f0_src = src_voiced.mean().item() if src_voiced.numel() > 0 else float("nan")
+            f0_tgt = tgt_voiced.mean().item() if tgt_voiced.numel() > 0 else float("nan")
+            print(f"[PITCH:{tag}] F0(conv)={f0_conv:.1f}Hz | F0(src)={f0_src:.1f}Hz | F0(tgt)={f0_tgt:.1f}Hz")
+        except Exception as e:
+            print(f"[PITCH:{tag}] ERROR: {e}")
 
 
 def test_generalization(checkpoint_path: str, output_dir: str):
@@ -120,6 +170,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("\n[1] Loading Vocoder...")
     vocoder = load_vocoder(None, device=str(device))
     vocoder.eval()
+    spk_eval = _load_eval_speaker_encoder(device)
 
     utt_path_A = "/content/LibriTTS/dev-clean/2428/83705/2428_83705_000000_000001.wav"
     utt_path_B = "/content/LibriTTS/dev-clean/1988/148538/1988_148538_000002_000000.wav"
@@ -261,7 +312,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         _print_cross_attention_debug(model, "A_to_B")
         _print_band_metric("A_to_B", pred_mel_AB, src_sig_A, tgt_sig_B)
         wave_AB_dev = vocoder(pred_mel_AB).squeeze(0).squeeze(0)
-        _print_speaker_similarity(model, wave_AB_dev, ref_A.to(device), ref_B.to(device), tag="A_to_B")
+        _print_speaker_similarity(spk_eval, wave_AB_dev, ref_A.to(device), ref_B.to(device), tag="A_to_B", device=device, sample_rate=audio_cfg.sample_rate)
         wave_AB = wave_AB_dev.cpu()
         torchaudio.save(os.path.join(output_dir, "07_cross_AtoB.wav"), wave_AB.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_AB.shape}, mean={pred_mel_AB.mean():.4f}")
@@ -272,7 +323,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         _print_cross_attention_debug(model, "B_to_A")
         _print_band_metric("B_to_A", pred_mel_BA, src_sig_B, tgt_sig_A)
         wave_BA_dev = vocoder(pred_mel_BA).squeeze(0).squeeze(0)
-        _print_speaker_similarity(model, wave_BA_dev, ref_B.to(device), ref_A.to(device), tag="B_to_A")
+        _print_speaker_similarity(spk_eval, wave_BA_dev, ref_B.to(device), ref_A.to(device), tag="B_to_A", device=device, sample_rate=audio_cfg.sample_rate)
         wave_BA = wave_BA_dev.cpu()
         torchaudio.save(os.path.join(output_dir, "08_cross_BtoA.wav"), wave_BA.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}")
@@ -290,9 +341,114 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("=" * 60)
 
 
+def test_generalization_N_pairs(checkpoint_path: str, N: int):
+    print("=" * 60)
+    print(f"RUNNING {N}-UTTERANCE RANDOM PAIR TEST")
+    print("=" * 60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    audio_cfg = AudioConfig()
+    model_cfg = ModelConfig()
+    train_cfg = TrainingConfig()
+    data_cfg = DataConfig()
+
+    print("[1] Loading Dataset index...")
+    dataset = VoiceConversionDataset(split="val", audio_config=audio_cfg, data_config=data_cfg, training_config=train_cfg)
+    
+    print(f"[2] Loading Model from {checkpoint_path}...")
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint not found.")
+        return
+
+    model = HubertVCModel(audio_cfg, model_cfg, train_cfg).to(device)
+    model.eval()
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(ckpt.get("model_state", ckpt))
+    
+    vocoder = load_vocoder(None, device=str(device))
+    vocoder.eval()
+    spk_eval = _load_eval_speaker_encoder(device)
+
+    all_sim_deltas = []
+    all_band_metrics = []
+
+    valid_utts = list(dataset.valid_utterances)
+    random.shuffle(valid_utts)
+    
+    pairs = []
+    while len(pairs) < N and len(valid_utts) >= 2:
+        src_info = valid_utts.pop()
+        src_spk = src_info[0]
+
+        match_idx = None
+        for i in range(len(valid_utts) - 1, -1, -1):
+            if valid_utts[i][0] != src_spk:
+                match_idx = i
+                break
+
+        if match_idx is None:
+            continue
+
+        tgt_info = valid_utts.pop(match_idx)
+        pairs.append((src_info, tgt_info))
+
+    if len(pairs) == 0:
+        print("[WARN] Could not sample cross-speaker pairs from validation set.")
+        return
+
+    print(f"[3] Running over {len(pairs)} randomized pairs...")
+    for idx, (src_info, tgt_info) in enumerate(pairs):
+        src_spk, src_path = src_info
+        tgt_spk, tgt_path = tgt_info
+        
+        full_audio_src = load_audio(src_path, sample_rate=audio_cfg.sample_rate).to(device)
+        full_audio_tgt = load_audio(tgt_path, sample_rate=audio_cfg.sample_rate).to(device)
+
+        ref_src, content_src = split_utterance_for_training(full_audio_src, (1.0, 2.0), audio_cfg.sample_rate, 0.5, True)
+        ref_tgt, _ = split_utterance_for_training(full_audio_tgt, (1.0, 2.0), audio_cfg.sample_rate, 0.5, True)
+
+        with torch.no_grad():
+            pred_mel_cross, _, _ = model(ref_tgt.unsqueeze(0), [content_src])
+            wave_cross = vocoder(pred_mel_cross).squeeze(0).squeeze(0)
+
+            # Metrics
+            emb_conv = _extract_eval_embedding(spk_eval, wave_cross, device)
+            emb_src = _extract_eval_embedding(spk_eval, ref_src, device)
+            emb_tgt = _extract_eval_embedding(spk_eval, ref_tgt, device)
+            cos_tgt = F.cosine_similarity(emb_conv, emb_tgt, dim=-1).item()
+            cos_src = F.cosine_similarity(emb_conv, emb_src, dim=-1).item()
+            sim_delta = cos_tgt - cos_src
+            all_sim_deltas.append(sim_delta)
+
+            # Band
+            gt_mel_src = extract_mel_spectrogram(content_src, audio_cfg.sample_rate)
+            ref_mel_tgt = extract_mel_spectrogram(ref_tgt, audio_cfg.sample_rate)
+            sig_pred = _band_signature(pred_mel_cross.cpu())
+            sig_src = _band_signature(gt_mel_src.cpu())
+            sig_tgt = _band_signature(ref_mel_tgt.cpu())
+            d_pred_tgt = _band_distance(sig_pred, sig_tgt)
+            d_pred_src = _band_distance(sig_pred, sig_src)
+            band_metric = d_pred_tgt - d_pred_src
+            all_band_metrics.append(band_metric)
+
+        print(f"  [{idx+1}/{len(pairs)}] SPK_SIM delta={sim_delta:+.4f} | BAND_METRIC={band_metric:+.4f}")
+
+    print("\n" + "=" * 40)
+    print("RESULTS SUMMARY (N PAIRS CROSS):")
+    print("=" * 40)
+    print(f"  SPK_SIM delta: mean={np.mean(all_sim_deltas):+.4f}, std={np.std(all_sim_deltas):.4f}")
+    print(f"  BAND_METRIC  : mean={np.mean(all_band_metrics):+.4f}, std={np.std(all_band_metrics):.4f}")
+    print("=" * 40)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, default="checkpoints/last.ckpt", help="Path to your trained checkpoint")
     parser.add_argument("--output_dir", type=str, default="generalization_test", help="Folder to save output audio files")
+    parser.add_argument("--n_pairs", type=int, default=0, help="If >0, runs N random combinations for bulk metrics.")
     args = parser.parse_args()
-    test_generalization(args.checkpoint, args.output_dir)
+    
+    if args.n_pairs > 0:
+        test_generalization_N_pairs(args.checkpoint, args.n_pairs)
+    else:
+        test_generalization(args.checkpoint, args.output_dir)
