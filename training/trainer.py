@@ -345,8 +345,10 @@ class Trainer:
     # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
-        num_batches = 0
+        loss_accum_self = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        loss_accum_cross = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        num_self = 0
+        num_cross = 0
 
         pbar = tqdm(self.train_loader, desc=f"Train | epoch {self.start_epoch}", leave=False)
         for batch in pbar:
@@ -441,7 +443,7 @@ class Trainer:
             f"actual_total={total:.4f}")
             
             # 🔍 ENHANCED SIGNAL AUDIT (Run on first batch of session + periodically)
-            if num_batches == 0 and (self.global_step == 0 or self.global_step % 100 == 0):
+            if (num_self + num_cross) == 0 and (self.global_step == 0 or self.global_step % 100 == 0):
                 print("\n" + "█"*60)
                 print(f"🕵️  DEEP SIGNAL AUDIT | Step {self.global_step}")
                 print("█"*60)
@@ -633,9 +635,14 @@ class Trainer:
             self.scaler.update()
 
             # accumulate losses
-            for k in loss_accum:
-                loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
-            num_batches += 1
+            accum = loss_accum_cross if is_cross_speaker else loss_accum_self
+            for k in accum:
+                accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
+
+            if is_cross_speaker:
+                num_cross += 1
+            else:
+                num_self += 1
 
             pbar.set_postfix(
                 mel=f"{losses.get('mel', torch.tensor(0.)).item():.3f}",
@@ -653,10 +660,14 @@ class Trainer:
 
             self.global_step += 1
 
-        for k in loss_accum:
-            loss_accum[k] /= max(1, num_batches)
+        for k in loss_accum_self:
+            if num_self > 0: loss_accum_self[k] /= num_self
+            if num_cross > 0: loss_accum_cross[k] /= num_cross
 
-        return loss_accum
+        combined = {k: (loss_accum_self[k] + loss_accum_cross[k]) / 2.0 for k in loss_accum_self}
+        combined["self_mel"] = loss_accum_self["mel"]
+        combined["cross_spk"] = loss_accum_cross["speaker"]
+        return combined
 
 
     # ==============================================================
@@ -666,8 +677,11 @@ class Trainer:
     def _validate(self) -> dict:
         self.model.eval()
         self.vocoder.eval()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
-        num_batches = 0
+        loss_accum_self = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        loss_accum_cross = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        num_self = 0
+        num_cross = 0
+        val_step = 0
 
         for batch in tqdm(self.val_loader, desc="Valid", leave=False):
 
@@ -687,7 +701,7 @@ class Trainer:
             gt_lengths = batch["gt_lengths"].to(self.device)
 
             # Mirror training: alternate cross-speaker evaluation
-            is_cross_speaker = (num_batches % 2 == 1)
+            is_cross_speaker = (val_step % 2 == 1)
             speaker_feats_for_forward = batch.get("speaker_feats")
             target_gt_mel = None
             target_gt_lengths = None
@@ -738,14 +752,24 @@ class Trainer:
             if last_div is not None and self.train_cfg.lambda_diversity > 0:
                 total = total + self.train_cfg.lambda_diversity * last_div
 
-            for k in loss_accum:
-                loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
-            num_batches += 1
+            accum = loss_accum_cross if is_cross_speaker else loss_accum_self
+            for k in accum:
+                accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
 
-        for k in loss_accum:
-            loss_accum[k] /= max(1, num_batches)
+            if is_cross_speaker:
+                num_cross += 1
+            else:
+                num_self += 1
+            val_step += 1
 
-        return loss_accum
+        for k in loss_accum_self:
+            if num_self > 0: loss_accum_self[k] /= num_self
+            if num_cross > 0: loss_accum_cross[k] /= num_cross
+
+        combined = {k: (loss_accum_self[k] + loss_accum_cross[k]) / 2.0 for k in loss_accum_self}
+        combined["self_mel"] = loss_accum_self["mel"]
+        combined["cross_spk"] = loss_accum_cross["speaker"]
+        return combined
 
 
     # ==============================================================
@@ -825,10 +849,10 @@ class Trainer:
             val_loss   = self._validate()
 
             print(
-                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | total={train_loss['total']:.3f}"
+                f"[epoch {epoch:03d}] train:   self_mel={train_loss['self_mel']:.3f} | stft={train_loss['stft']:.3f} | cross_spk={train_loss['cross_spk']:.3f} | total={train_loss['total']:.3f}"
             )
             print(
-                f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | total={val_loss['total']:.3f}"
+                f"                 val:     self_mel={val_loss['self_mel']:.3f} | stft={val_loss['stft']:.3f} | cross_spk={val_loss['cross_spk']:.3f} | total={val_loss['total']:.3f}"
             )
 
 

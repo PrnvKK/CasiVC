@@ -358,7 +358,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             
             # STEP 1: ERASE source timbre via bottleneck dropout (training only)
             if self.training:
-                residual = F.dropout(residual, p=0.4, training=True)
+                residual = F.dropout(residual, p=0.2, training=True)
 
             # NOTE: InstanceNorm is intentionally removed here.
             # F.instance_norm over the time axis divides each channel by its
