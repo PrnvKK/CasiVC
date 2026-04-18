@@ -151,7 +151,7 @@ class TrainingConfig:
   lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
 
   # Regularization: mild — maximizes token utilization & prevents token collapse
-  lambda_entropy: float = 0.1    # maximize attention entropy (- entropy gradient)
+  lambda_entropy: float = 0.03    # maximize attention entropy (- entropy gradient)
   lambda_diversity: float = 0.005 # penalize pairwise cosine similarity between speaker tokens
 
   # Set unused loss weights to zero

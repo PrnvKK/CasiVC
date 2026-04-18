@@ -333,16 +333,16 @@ class Trainer:
                     param_type = "bias" if "bias" in name else "weight"
                     
                     print(f"[{component_name:<22s} ({param_type:^6s})] \t"
-                          f"| Grad Mean Abs: {grad_mean_abs:.2e} \t"
-                          f"| Grad Max Abs: {grad_max_abs:.2e}")
-                          
+                        f"| Grad Mean Abs: {grad_mean_abs:.2e} \t"
+                        f"| Grad Max Abs: {grad_max_abs:.2e}")
+                        
         print("="*60 + "\n")
 
 
 
-      # ==============================================================
-      #  Training step / epoch
-      # ==============================================================
+    # ==============================================================
+    #  Training step / epoch
+    # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
         loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
@@ -379,18 +379,22 @@ class Trainer:
             target_gt_mel = None
             target_gt_lengths = None
 
-            if is_cross_speaker and batch.get("speaker_feats") is not None:
-                # Roll ALL target-speaker quantities by 1 in sync:
-                # item i receives item (i+1 mod B)'s speaker feats, gt_mel, and gt_lengths.
-                # gt_mel here is the SOURCE content mel — rolling it gives the TARGET's mel
-                # for use as the band-stats supervision target.
-                target_speaker_feats  = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
-                target_gt_mel         = torch.roll(gt_mel,                 shifts=1, dims=0)
-                target_gt_lengths     = torch.roll(gt_lengths,             shifts=1, dims=0)
-                speaker_feats_for_forward = target_speaker_feats   # condition on TARGET
+            can_cross = (batch.get("speaker_feats") is not None) or (ref_audio is not None)
+
+            if is_cross_speaker and can_cross:
+                target_gt_mel     = torch.roll(gt_mel,     shifts=1, dims=0)
+                target_gt_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
+                
+                if batch.get("speaker_feats") is not None:
+                    target_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
+                    speaker_feats_for_forward = target_speaker_feats
+                if ref_audio is not None:
+                    ref_audio = torch.roll(ref_audio, shifts=1, dims=0)
+                    
                 print(f"[HYBRID] Cross-speaker | step={self.global_step} "
-                      f"| speakers: {batch.get('speaker_id')}")
+                    f"| speakers: {batch.get('speaker_id')}")
             else:
+                is_cross_speaker = False
                 print(f"[HYBRID] Self-recon    | step={self.global_step}")
 
             # Forward pass — conditioned on target speaker on cross-speaker steps
@@ -471,11 +475,11 @@ class Trainer:
                 print(f"\n[3] DIAGNOSIS:")
                 print(f"    Mean L1 Error: {l1_err:.4f}")
                 if abs(gt_mel.mean()) > 2.0 and abs(pred_mel.mean()) < 0.5:
-                     print("    🚨 ALERT: Target looks like Unnormalized Log-Mel (negative offset), Pred looks Zero-Centered.")
+                    print("    🚨 ALERT: Target looks like Unnormalized Log-Mel (negative offset), Pred looks Zero-Centered.")
                 elif l1_err > 2.0:
-                     print("    ⚠️  WARNING: Massive scale mismatch detected.")
+                    print("    ⚠️  WARNING: Massive scale mismatch detected.")
                 else:
-                     print("    ✅ Scales look roughly compatible.")
+                    print("    ✅ Scales look roughly compatible.")
                 print("█"*60 + "\n")
 
                 with torch.no_grad():
@@ -600,20 +604,20 @@ class Trainer:
                 if self.model.cross_attn.content_proj.weight.grad is not None:
                     content_grad = self.model.cross_attn.content_proj.weight.grad
                     print(f"content_proj grad: mean={content_grad.abs().mean():.6f}, "
-                          f"max={content_grad.abs().max():.6f}")
+                        f"max={content_grad.abs().max():.6f}")
                 
                 # Speaker projection gradients
                 if self.model.cross_attn.speaker_proj.weight.grad is not None:
                     speaker_grad = self.model.cross_attn.speaker_proj.weight.grad
                     print(f"speaker_proj grad: mean={speaker_grad.abs().mean():.6f}, "
-                          f"max={speaker_grad.abs().max():.6f}")
+                        f"max={speaker_grad.abs().max():.6f}")
                 
                 # Mapping network gradients
                 mapping_grad_found = False
                 for name, param in self.model.cross_attn.mapping_network.named_parameters():
                     if param.grad is not None:
                         print(f"mapping_network.{name} grad: mean={param.grad.abs().mean():.6f}, "
-                              f"max={param.grad.abs().max():.6f}")
+                            f"max={param.grad.abs().max():.6f}")
                         mapping_grad_found = True
                 if not mapping_grad_found:
                     print("mapping_network grad: None (no gradient flowing to mapping_network)")
@@ -680,22 +684,51 @@ class Trainer:
                 
             gt_mel = batch["gt_mel"].to(self.device)
             gt_wave = batch["gt_wave"].to(self.device)
+            gt_lengths = batch["gt_lengths"].to(self.device)
+
+            # Mirror training: alternate cross-speaker evaluation
+            is_cross_speaker = (num_batches % 2 == 1)
+            speaker_feats_for_forward = batch.get("speaker_feats")
+            target_gt_mel = None
+            target_gt_lengths = None
+
+            can_cross = (batch.get("speaker_feats") is not None) or (ref_audio is not None)
+
+            if is_cross_speaker and can_cross:
+                target_gt_mel     = torch.roll(gt_mel,     shifts=1, dims=0)
+                target_gt_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
+                
+                if batch.get("speaker_feats") is not None:
+                    target_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
+                    speaker_feats_for_forward = target_speaker_feats
+                if ref_audio is not None:
+                    ref_audio = torch.roll(ref_audio, shifts=1, dims=0)
+            else:
+                is_cross_speaker = False
 
             # Forward pass - NOW USES ref_audio and optionally precomputed features
             pred_mel, _, _ = self.model(
                 ref_audio=ref_audio,
                 content_audio=content_audio,
-                gt_mels=None,
+                gt_mels=gt_mel,  # mirrored identically to train pass
                 compute_losses=False,
                 return_aux=False,
-                precomputed_speaker_feats=batch.get("speaker_feats"),
+                precomputed_speaker_feats=speaker_feats_for_forward,
                 precomputed_content_feats=batch.get("content_feats")
             )
             pred_wave = None
 
             # Same-domain STFT ground truth
             gt_wave_vocoded = None
-            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded)
+            pred_mel = pred_mel.to(torch.float32)
+            
+            losses = self.loss_fn(
+                pred_mel, gt_mel, pred_wave, gt_wave_vocoded,
+                gt_lengths=gt_lengths,
+                target_gt_mel=target_gt_mel,
+                target_gt_lengths=target_gt_lengths,
+                is_cross_speaker=is_cross_speaker,
+            )
 
             total = losses.total()
             last_entropy = getattr(self.model.cross_attn, 'last_entropy', None)
