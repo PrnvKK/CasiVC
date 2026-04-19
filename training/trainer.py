@@ -410,15 +410,34 @@ class Trainer:
                 precomputed_content_feats=batch.get("content_feats")
             )
 
-            pred_wave = None
-            gt_wave_vocoded = None
+            pred_mel = pred_mel.to(torch.float32)
+            if hasattr(self.train_cfg, 'lambda_rec') and self.train_cfg.lambda_rec > 0.0:
+                max_len = pred_mel.size(-1)
+                # OPTIMIZATION: Reduce frames to exactly 32 (VITS standard) 
+                # This is exactly 8192 samples, perfectly supporting a 2048 STFT
+                slice_len = min(32, max_len)
+                start_idx = random.randint(0, max_len - slice_len) if max_len > slice_len else 0
+                
+                # OPTIMIZATION: Slicing the batch dimension. Backpropagating 32 samples 
+                # through a frozen vocoder destroys steps/sec. We apply STFT constraint 
+                # to a random sub-batch of 8, which provides plenty of gradient signal.
+                sub_batch_size = min(8, pred_mel.size(0))
+                b_indices = torch.randperm(pred_mel.size(0))[:sub_batch_size]
+
+                pred_mel_slice = pred_mel[b_indices, :, start_idx:start_idx+slice_len]
+                gt_mel_slice = gt_mel[b_indices, :, start_idx:start_idx+slice_len]
+
+                with torch.no_grad():
+                    gt_wave_vocoded = self.vocoder(gt_mel_slice.float()).squeeze(1)
+                pred_wave = self.vocoder(pred_mel_slice).squeeze(1)
+            else:
+                pred_wave = None
+                gt_wave_vocoded = None
 
             current_epoch = self.start_epoch
-            stft_weight = 0.0
+            stft_weight = getattr(self.train_cfg, 'lambda_rec', 0.0)
             mode_str = "Cross-Spk" if is_cross_speaker else "Self-Recon"
             pbar.set_description(f"Train | ep {current_epoch} | {mode_str}")
-
-            pred_mel = pred_mel.to(torch.float32)
 
             # Calculate Losses
             losses = self.loss_fn(
@@ -730,11 +749,21 @@ class Trainer:
                 precomputed_speaker_feats=speaker_feats_for_forward,
                 precomputed_content_feats=batch.get("content_feats")
             )
-            pred_wave = None
-
-            # Same-domain STFT ground truth
-            gt_wave_vocoded = None
             pred_mel = pred_mel.to(torch.float32)
+            if hasattr(self.train_cfg, 'lambda_rec') and self.train_cfg.lambda_rec > 0.0:
+                max_len = pred_mel.size(-1)
+                slice_len = min(60, max_len)
+                start_idx = (max_len - slice_len) // 2 if max_len > slice_len else 0
+                
+                pred_mel_slice = pred_mel[:, :, start_idx:start_idx+slice_len]
+                gt_mel_slice = gt_mel[:, :, start_idx:start_idx+slice_len]
+
+                with torch.no_grad():
+                    gt_wave_vocoded = self.vocoder(gt_mel_slice.float()).squeeze(1)
+                    pred_wave = self.vocoder(pred_mel_slice).squeeze(1)
+            else:
+                pred_wave = None
+                gt_wave_vocoded = None
             
             losses = self.loss_fn(
                 pred_mel, gt_mel, pred_wave, gt_wave_vocoded,
