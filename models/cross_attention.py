@@ -72,6 +72,13 @@ class PositionAgnosticCrossAttention(nn.Module):
         #self.alpha = nn.Parameter(torch.tensor(0.1))
         self.alpha = nn.Parameter(torch.tensor(2.0))
 
+        # Learnable temperature for attention sharpening.
+        # T < 1.0 sharpens: small score differences become steep Softmax drops,
+        # forcing the model to pick 2-3 dominant speaker tokens per frame.
+        # Initialized at 0.6 based on log analysis: current entropy ~1.67 / max 2.08
+        # is too uniform (80% of max). T=0.6 targets entropy ~1.0-1.3 (3-4 active tokens).
+        self.temperature = nn.Parameter(torch.tensor(0.6))
+
         # Multi-head attention (speaker features already at correct dimension)
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=self.d_model,
@@ -300,9 +307,20 @@ class PositionAgnosticCrossAttention(nn.Module):
         print(f"[cross_attn] keys stats: mean={keys.mean():.4f}, std={keys.std():.4f}")
 
         # ------------------------------------------------------------------
+        # Temperature scaling: sharpen attention to prevent token averaging.
+        # Pre-scaling Q and K by 1/sqrt(T) is equivalent to dividing the
+        # internal QK^T dot product by T (since MHA divides by sqrt(d_k)).
+        # At T=0.6, effective sharpening = 1/0.6 = 1.67x, pulling entropy
+        # from ~1.67 down toward ~1.0 without collapsing to argmax.
+        # ------------------------------------------------------------------
+        inv_sqrt_temp = 1.0 / math.sqrt(self.temperature)
+        print(f"[cross_attn] temperature={self.temperature.item():.4f}, "
+              f"sharpening factor={1.0/self.temperature.item():.2f}x")
+
+        # ------------------------------------------------------------------
         # Raw attention scores (diagnostic only)
         # ------------------------------------------------------------------
-        scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(queries * inv_sqrt_temp, (keys * inv_sqrt_temp).transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         print(f"[cross_attn] attention scores shape: {scores.shape}")
         print(f"[cross_attn] attention scores stats: mean={scores.mean():.4f}, "
@@ -321,8 +339,8 @@ class PositionAgnosticCrossAttention(nn.Module):
         # MultiheadAttention
         # ------------------------------------------------------------------
         attended_features, attention_weights = self.multihead_attn(
-            query=queries,
-            key=keys,
+            query=queries * inv_sqrt_temp,
+            key=keys * inv_sqrt_temp,
             value=values,
             need_weights=True,
             average_attn_weights=True
@@ -373,8 +391,11 @@ class PositionAgnosticCrossAttention(nn.Module):
             style_stats = self.mapping_network(attended_features)      # [B, T, 192]
             gamma, beta = style_stats.chunk(2, dim=-1)                 # [B, T, 96] each
 
-            # exp(gamma) strictly positive. Zero-init final layer => exp(0)=1 at epoch 0.
-            scale = torch.exp(gamma)                                   # [B, T, 96]
+            # BOUNDED FiLM: tanh(gamma) ∈ (-1, 1) → scale ∈ (0, 2).
+            # Zero-init final layer → gamma≈0 → tanh(0)=0 → scale=1.0 at epoch 0 (identity).
+            # This replaces the unbounded exp(gamma) which caused p90 scale values of 4.6x
+            # and produced the robotic buzzing artifact by saturating downstream activations.
+            scale = 1.0 + torch.tanh(gamma)                            # [B, T, 96] in [0, 2]
 
             scale_quantiles = torch.quantile(
                 scale.detach().flatten(),
@@ -382,7 +403,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             )
 
             print(f"[FiLM] gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}")
-            print(f"[FiLM] scale (exp(gamma)): mean={scale.mean():.4f}, std={scale.std():.4f}")
+            print(f"[FiLM] scale (1+tanh(gamma)): mean={scale.mean():.4f}, std={scale.std():.4f}")
             print(f"[FiLM] scale percentiles p10/p50/p90: "
                   f"{scale_quantiles[0]:.4f}/{scale_quantiles[1]:.4f}/{scale_quantiles[2]:.4f}")
             print(f"[FiLM] beta:  mean={beta.mean():.4f},  std={beta.std():.4f}")

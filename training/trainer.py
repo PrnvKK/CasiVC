@@ -417,7 +417,7 @@ class Trainer:
                 # This is exactly 8192 samples, perfectly supporting a 2048 STFT
                 slice_len = min(32, max_len)
                 start_idx = random.randint(0, max_len - slice_len) if max_len > slice_len else 0
-                
+                    
                 # OPTIMIZATION: Slicing the batch dimension. Backpropagating 32 samples 
                 # through a frozen vocoder destroys steps/sec. We apply STFT constraint 
                 # to a random sub-batch of 8, which provides plenty of gradient signal.
@@ -606,7 +606,8 @@ class Trainer:
 
                 print("=" * 100 + "\n")
 
-            torch.autograd.set_detect_anomaly(True)  
+            # ── anomaly detection DISABLED (10-20× slowdown) ──
+            # Use the NaN hooks registered in __init__ instead.
 
             self.scaler.scale(total).backward()
             vocoder_has_grad = False
@@ -643,7 +644,9 @@ class Trainer:
                 if not mapping_grad_found:
                     print("mapping_network grad: None (no gradient flowing to mapping_network)")
 
-            self.analyze_gradient_flow()
+            # ── gradient flow analysis: once per epoch (expensive) ──
+            if (num_self + num_cross) == 0:
+                self.analyze_gradient_flow()
 
             all_params = list(self.model.parameters()) + list(self.vocoder.parameters())
 
