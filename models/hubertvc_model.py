@@ -120,7 +120,9 @@ class HubertVCModel(nn.Module):
         for p in self.hubert.parameters():
             p.requires_grad = False
 
-        self.mel_encoder = MelEncoder(num_speaker_tokens=self.m_cfg.num_speaker_tokens)
+        #self.mel_encoder = MelEncoder()
+
+        self.mel_encoder = MelEncoder()
 
         self.cross_attn = PositionAgnosticCrossAttention(enable_residual=True)
 
@@ -217,8 +219,8 @@ class HubertVCModel(nn.Module):
     gt_mels: Optional[List[torch.Tensor] | torch.Tensor] = None,
     compute_losses: bool = False,
     return_aux: bool = False,
-        precomputed_speaker_feats: Optional[torch.Tensor] = None,
-        precomputed_content_feats: Optional[torch.Tensor] = None,
+    precomputed_speaker_feats: Optional[torch.Tensor] = None,
+    precomputed_content_feats: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor] | None, Dict[str, Any] | None]:
         """
         Parameters
@@ -229,7 +231,7 @@ class HubertVCModel(nn.Module):
         gt_mels       : optional ground-truth mels for reconstruction loss
         compute_losses: if True, returns {"mel": …}
         return_aux    : if True, returns dict with intermediate tensors
-        precomputed_speaker_feats: Optional precomputed ECAPA features [B, num_tokens, 96]
+        precomputed_speaker_feats: Optional precomputed ECAPA features [B, 64, 96]
         precomputed_content_feats: Optional precomputed HuBERT features [B, T, 96]
 
         Returns
@@ -259,7 +261,7 @@ class HubertVCModel(nn.Module):
                     raise ValueError(f"ref_audio tensor must be 1D or 2D, got {ref_audio.dim()}D")
             B = len(ref_audio)
             
-            speaker_feats = self.mel_encoder(ref_audio)  # [B, num_tokens, 96]
+            speaker_feats = self.mel_encoder(ref_audio)  # [B, 64, 96]
             
             print(f"[ECAPA-TDNN] Speaker feats shape: {speaker_feats.shape}")
             print(f"Speaker feats (96D): μ={speaker_feats.mean():.4f}, σ={speaker_feats.std():.4f}")
@@ -303,7 +305,7 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         
         # Process entire batch at once - each item uses its OWN speaker conditioning
-        # content_feats: [B, T, 96], speaker_feats: [B, num_tokens, 96]
+        # content_feats: [B, T, 96], speaker_feats: [B, 64, 96]
         fused_features = self.cross_attn(
             content_feats,  # [B, T, 96]
             speaker_feats   # [B, 64, 96]

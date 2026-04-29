@@ -112,9 +112,6 @@ class PositionAgnosticCrossAttention(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(self.d_model, self.d_model * 2)
         )
-
-        # Exposed diagnostics for inference scripts (e.g., generalization_test.py)
-        self.last_debug: Dict[str, Any] = {}
         
         # Initialize parameters
         self._init_parameters()
@@ -148,9 +145,6 @@ class PositionAgnosticCrossAttention(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
-        # Zero-init final layer: identity FiLM at init (gamma=0 -> exp(0)=1, beta=0)
-        nn.init.zeros_(self.mapping_network[-1].weight)
-        nn.init.zeros_(self.mapping_network[-1].bias)
 
 
     
@@ -165,7 +159,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             'num_heads': self.num_heads,
             'head_dim': self.head_dim,
             'output_dim': self.d_model,  # Alias for clarity
-            'speaker_tokens': getattr(model_config, 'num_speaker_tokens', 'dynamic'),
+            'speaker_tokens': 64,  # Fixed from mel encoder
             'attention_dim': self.d_model
         }
 
@@ -173,7 +167,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         """Get information for module integration."""
         return {
             'expected_content_shape': f"(batch, time, {self.content_dim})",
-            'expected_speaker_shape': f"(batch, num_tokens, {self.speaker_dim})",
+            'expected_speaker_shape': f"(batch, 64, {self.speaker_dim})",
             'output_shape': f"(batch, time, {self.d_model})",
             'parameter_count': self.get_parameter_count()['total']
         }
@@ -336,13 +330,6 @@ class PositionAgnosticCrossAttention(nn.Module):
         print(f"[cross_attn] attention_weights stats: mean={attention_weights.mean():.4f}, "
               f"std={attention_weights.std():.4f}")
 
-        # Store entropy for aux loss (gradient-enabled during training)
-        real_entropy = -(attention_weights * (attention_weights + 1e-9).log()).sum(-1).mean()
-        if self.training:
-            self.last_entropy = real_entropy
-        else:
-            self.last_entropy = real_entropy.detach()
-
         # ------------------------------------------------------------------
         # Dropout
         # ------------------------------------------------------------------
@@ -356,57 +343,22 @@ class PositionAgnosticCrossAttention(nn.Module):
         if self.enable_residual:
             residual = self.residual_proj(content_features)
             
-            # STEP 1: ERASE source timbre via bottleneck dropout (training only)
+            # STEP 1: ERASING THE SOURCE VOICE
             if self.training:
-                residual = F.dropout(residual, p=0.2, training=True)
-
-            # NOTE: InstanceNorm is intentionally removed here.
-            # F.instance_norm over the time axis divides each channel by its
-            # temporal std. Sparse phoneme channels (mostly zero) have std~0,
-            # causing 1/std to explode silence into full-volume static — the
-            # "buzzing" artifact heard in all previous runs. Do not re-add it.
-
-            # STEP 2: Frame-wise FiLM.
-            # attended_features[t] = sum_k alpha_{t,k}*V_k: the per-frame
-            # attention-weighted speaker context. Using it (not mean-pooled tokens)
-            # lets gamma/beta vary per content frame -> frequency-selective modulation.
-            style_stats = self.mapping_network(attended_features)      # [B, T, 192]
-            gamma, beta = style_stats.chunk(2, dim=-1)                 # [B, T, 96] each
-
-            # exp(gamma) strictly positive. Zero-init final layer => exp(0)=1 at epoch 0.
-            scale = torch.exp(gamma)                                   # [B, T, 96]
-
-            scale_quantiles = torch.quantile(
-                scale.detach().flatten(),
-                torch.tensor([0.1, 0.5, 0.9], device=scale.device)
-            )
-
-            print(f"[FiLM] gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}")
-            print(f"[FiLM] scale (exp(gamma)): mean={scale.mean():.4f}, std={scale.std():.4f}")
-            print(f"[FiLM] scale percentiles p10/p50/p90: "
-                  f"{scale_quantiles[0]:.4f}/{scale_quantiles[1]:.4f}/{scale_quantiles[2]:.4f}")
-            print(f"[FiLM] beta:  mean={beta.mean():.4f},  std={beta.std():.4f}")
-
-            # Additive fusion: preserve the cross-attention output AND add the
-            # speaker-styled residual on top. Overwriting (=) would discard the
-            # attention signal entirely — do not change += to =.
-            attended_features = attended_features + (residual * scale + beta)
-        else:
-            scale = None
-
-        # Save diagnostics for external scripts after each forward pass.
-        token_usage = attention_weights.detach().mean(dim=(0, 1)).cpu()  # (num_tokens,)
-        self.last_debug = {
-            "attention_entropy": float(entropy.detach().item()),
-            "attention_std": float(attention_weights.detach().std().item()),
-            "num_tokens": int(speaker_features.shape[1]),
-            "token_usage": token_usage.tolist(),
-            "film_scale_mean": float(scale.detach().mean().item()) if scale is not None else None,
-            "film_scale_std": float(scale.detach().std().item()) if scale is not None else None,
-            "film_scale_p10": float(scale_quantiles[0].item()) if scale is not None else None,
-            "film_scale_p50": float(scale_quantiles[1].item()) if scale is not None else None,
-            "film_scale_p90": float(scale_quantiles[2].item()) if scale is not None else None,
-        }
+                residual = F.dropout(residual, p=0.4, training=True)
+                
+            residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
+            
+            # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
+            # Instead of manually scaling alpha, we let a non-linear mapping 
+            # network decipher the spatial ECAPA token into formal mean/std channel statistics.
+            pooled_spk = speaker_features.mean(dim=1, keepdim=True) # [B, 1, 96]
+            style_stats = self.mapping_network(pooled_spk)          # [B, 1, 192]
+            
+            gamma, beta = style_stats.chunk(2, dim=-1)              # [B, 1, 96] each
+            
+            # Apply AdaIN: y = (x - mean)/std * gamma + beta
+            attended_features = residual_norm * (1.0 + gamma) + beta
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")

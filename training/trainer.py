@@ -114,11 +114,7 @@ class Trainer:
         # ----------------------------------------------------------
         # 4. model, vocoder, loss fn
         # ----------------------------------------------------------
-        self.model: HubertVCModel = HubertVCModel(
-            self.audio_cfg,
-            self.model_cfg,
-            self.train_cfg
-        ).to(self.device)
+        self.model: HubertVCModel = HubertVCModel(self.model_cfg).to(self.device)
 
         for name, param in self.model.named_parameters():
             print(name, param.requires_grad)
@@ -139,12 +135,11 @@ class Trainer:
         for p in self.speaker_encoder.parameters():
             p.requires_grad = False
 
-        self.loss_fn = VCGeneratorLoss(self.train_cfg).to(self.device)
+        self.loss_fn = VCGeneratorLoss(self.train_cfg, self.speaker_encoder).to(self.device)
 
         # ----------------------------------------------------------
         # 5. optimiser & scheduler
         # ----------------------------------------------------------
-        # BandStatsSpeakerLoss has NO trainable parameters — only model params needed.
         all_params = list(self.model.parameters())
         self.optimizer = Adam(
             all_params,
@@ -253,10 +248,10 @@ class Trainer:
                 "epoch": self.start_epoch,
                 "global_step": self.global_step,
                 "model_state": self.model.state_dict(),
-                "vocoder_state": self.vocoder.state_dict(),
+                "vocoder_state": self.vocoder.state_dict(),  # ADD vocoder state
                 "optim_state": self.optimizer.state_dict(),
                 "sched_state": self.scheduler.state_dict(),
-                "scaler_state": self.scaler.state_dict(),
+                "scaler_state": self.scaler.state_dict(),    # ADD scaler state
                 "best_val_loss": self.best_val_loss,
                 "no_improve_epochs": self.no_improve_epochs,
                 "config": self._collect_config(),
@@ -271,19 +266,23 @@ class Trainer:
             raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=self.device)
         self.model.load_state_dict(ckpt["model_state"], strict=False)
-
+        
         try:
             self.optimizer.load_state_dict(ckpt["optim_state"])
             self.scheduler.load_state_dict(ckpt["sched_state"])
         except ValueError:
-            print("[Warning] Optimizer/Scheduler state mismatch. Continuing with fresh states.")
+            print("[Warning] Optimizer/Scheduler state mismatch (expected when adding new parameters). Continuing with fresh optimizer states for new weights.")
         self.start_epoch       = ckpt.get("epoch", 0)
         self.global_step       = ckpt.get("global_step", 0)
         self.best_val_loss     = ckpt.get("best_val_loss", float("inf"))
         self.no_improve_epochs = ckpt.get("no_improve_epochs", 0)
 
+        # ADD vocoder state loading with backward compatibility
         if "vocoder_state" in ckpt:
             self.vocoder.load_state_dict(ckpt["vocoder_state"])
+        self.optimizer.load_state_dict(ckpt["optim_state"])
+        self.scheduler.load_state_dict(ckpt["sched_state"])
+        # ADD scaler state loading with backward compatibility
         if "scaler_state" in ckpt:
             self.scaler.load_state_dict(ckpt["scaler_state"])
 
@@ -333,22 +332,20 @@ class Trainer:
                     param_type = "bias" if "bias" in name else "weight"
                     
                     print(f"[{component_name:<22s} ({param_type:^6s})] \t"
-                        f"| Grad Mean Abs: {grad_mean_abs:.2e} \t"
-                        f"| Grad Max Abs: {grad_max_abs:.2e}")
-                        
+                          f"| Grad Mean Abs: {grad_mean_abs:.2e} \t"
+                          f"| Grad Max Abs: {grad_max_abs:.2e}")
+                          
         print("="*60 + "\n")
 
 
 
-    # ==============================================================
-    #  Training step / epoch
-    # ==============================================================
+      # ==============================================================
+      #  Training step / epoch
+      # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum_self = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
-        loss_accum_cross = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
-        num_self = 0
-        num_cross = 0
+        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        num_batches = 0
 
         pbar = tqdm(self.train_loader, desc=f"Train | epoch {self.start_epoch}", leave=False)
         for batch in pbar:
@@ -370,80 +367,53 @@ class Trainer:
             gt_wave = batch["gt_wave"].to(self.device)
             gt_lengths = batch["gt_lengths"].to(self.device)    # (B,) real mel frame counts
 
-            # ------------------------------------------------------------------
-            # HYBRID TRAINING: decide conditioning BEFORE forward pass
-            # P0 fix: model must be conditioned on TARGET speaker on cross steps
-            # Correct math: L_spk( f(content, s_tgt), s_tgt )
-            # ------------------------------------------------------------------
-            is_cross_speaker = (self.global_step % 2 == 1)
-            target_speaker_feats = None
-            speaker_feats_for_forward = batch.get("speaker_feats")   # default: source
-            target_gt_mel = None
-            target_gt_lengths = None
-
-            can_cross = (batch.get("speaker_feats") is not None) or (ref_audio is not None)
-
-            if is_cross_speaker and can_cross:
-                target_gt_mel     = torch.roll(gt_mel,     shifts=1, dims=0)
-                target_gt_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
-                
-                if batch.get("speaker_feats") is not None:
-                    target_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
-                    speaker_feats_for_forward = target_speaker_feats
-                if ref_audio is not None:
-                    ref_audio = torch.roll(ref_audio, shifts=1, dims=0)
-                    
-                print(f"[HYBRID] Cross-speaker | step={self.global_step} "
-                    f"| speakers: {batch.get('speaker_id')}")
-            else:
-                is_cross_speaker = False
-                print(f"[HYBRID] Self-recon    | step={self.global_step}")
-
-            # Forward pass — conditioned on target speaker on cross-speaker steps
+            # Forward pass - NOW USES ref_audio and optionally precomputed features
             pred_mel, _, _ = self.model(
                 ref_audio=ref_audio,
                 content_audio=content_audio,
                 gt_mels=gt_mel,
                 compute_losses=False,
                 return_aux=False,
-                precomputed_speaker_feats=speaker_feats_for_forward,
+                precomputed_speaker_feats=batch.get("speaker_feats"),
                 precomputed_content_feats=batch.get("content_feats")
             )
 
+            # 🔍 TEMPORAL ALIGNMENT CHECK (print once)
+            if self.global_step == 0 and num_batches == 0:
+                print("\n" + "="*60)
+                print("⏱️ TEMPORAL ALIGNMENT CHECK & UTTERANCE INFO")
+                print("="*60)
+                print(f"Training on utterance: {batch.get('utterance_id', ['Unknown'])[0]}")
+                print(f"Speaker ID: {batch.get('speaker_id', ['Unknown'])[0]}")
+                print(f"Predicted mel shape: {pred_mel.shape}")   # (B, 80, T_pred)
+                print(f"Target mel shape:    {gt_mel.shape}")     # (B, 80, T_gt)")
+                print("="*60 + "\n")
+
+            # We skip HiFi-GAN forward pass entirely to prevent VRAM OOM on Colab.
+            # STFT and Speaker losses are disabled for training.
             pred_wave = None
             gt_wave_vocoded = None
 
             current_epoch = self.start_epoch
-            stft_weight = 0.0
-            mode_str = "Cross-Spk" if is_cross_speaker else "Self-Recon"
-            pbar.set_description(f"Train | ep {current_epoch} | {mode_str}")
+            stft_weight = 0.0 # Disabled STFT loss optimization completely
+            
+            pbar.set_description(f"Train | ep {current_epoch} | Mel-Only")
 
             pred_mel = pred_mel.to(torch.float32)
 
             # Calculate Losses
-            losses = self.loss_fn(
-                pred_mel, gt_mel, pred_wave, gt_wave_vocoded,
-                gt_lengths=gt_lengths,
-                target_gt_mel=target_gt_mel,
-                target_gt_lengths=target_gt_lengths,
-                is_cross_speaker=is_cross_speaker,
-            )
+            # mel_loss gets computed with gradients. 
+            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths)
             
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()
-            last_entropy = getattr(self.model.cross_attn, 'last_entropy', None)
-            if last_entropy is not None and self.train_cfg.lambda_entropy > 0:
-                total = total + (-self.train_cfg.lambda_entropy * last_entropy)
-            last_div = getattr(self.model.mel_encoder, 'last_diversity_loss', None)
-            if last_div is not None and self.train_cfg.lambda_diversity > 0:
-                total = total + self.train_cfg.lambda_diversity * last_div
             
             print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
             f"raw_stft={losses.get('stft', 0):.4f}, "
             f"actual_total={total:.4f}")
             
             # 🔍 ENHANCED SIGNAL AUDIT (Run on first batch of session + periodically)
-            if (num_self + num_cross) == 0 and (self.global_step == 0 or self.global_step % 100 == 0):
+            if num_batches == 0 and (self.global_step == 0 or self.global_step % 100 == 0):
                 print("\n" + "█"*60)
                 print(f"🕵️  DEEP SIGNAL AUDIT | Step {self.global_step}")
                 print("█"*60)
@@ -477,11 +447,11 @@ class Trainer:
                 print(f"\n[3] DIAGNOSIS:")
                 print(f"    Mean L1 Error: {l1_err:.4f}")
                 if abs(gt_mel.mean()) > 2.0 and abs(pred_mel.mean()) < 0.5:
-                    print("    🚨 ALERT: Target looks like Unnormalized Log-Mel (negative offset), Pred looks Zero-Centered.")
+                     print("    🚨 ALERT: Target looks like Unnormalized Log-Mel (negative offset), Pred looks Zero-Centered.")
                 elif l1_err > 2.0:
-                    print("    ⚠️  WARNING: Massive scale mismatch detected.")
+                     print("    ⚠️  WARNING: Massive scale mismatch detected.")
                 else:
-                    print("    ✅ Scales look roughly compatible.")
+                     print("    ✅ Scales look roughly compatible.")
                 print("█"*60 + "\n")
 
                 with torch.no_grad():
@@ -606,23 +576,18 @@ class Trainer:
                 if self.model.cross_attn.content_proj.weight.grad is not None:
                     content_grad = self.model.cross_attn.content_proj.weight.grad
                     print(f"content_proj grad: mean={content_grad.abs().mean():.6f}, "
-                        f"max={content_grad.abs().max():.6f}")
+                          f"max={content_grad.abs().max():.6f}")
                 
                 # Speaker projection gradients
                 if self.model.cross_attn.speaker_proj.weight.grad is not None:
                     speaker_grad = self.model.cross_attn.speaker_proj.weight.grad
                     print(f"speaker_proj grad: mean={speaker_grad.abs().mean():.6f}, "
-                        f"max={speaker_grad.abs().max():.6f}")
+                          f"max={speaker_grad.abs().max():.6f}")
                 
-                # Mapping network gradients
-                mapping_grad_found = False
-                for name, param in self.model.cross_attn.mapping_network.named_parameters():
-                    if param.grad is not None:
-                        print(f"mapping_network.{name} grad: mean={param.grad.abs().mean():.6f}, "
-                            f"max={param.grad.abs().max():.6f}")
-                        mapping_grad_found = True
-                if not mapping_grad_found:
-                    print("mapping_network grad: None (no gradient flowing to mapping_network)")
+                # Alpha gradient (we know this one works)
+                print(f"alpha grad: {self.model.cross_attn.alpha.grad.item():.6f}")
+
+
 
             self.analyze_gradient_flow()
 
@@ -635,14 +600,9 @@ class Trainer:
             self.scaler.update()
 
             # accumulate losses
-            accum = loss_accum_cross if is_cross_speaker else loss_accum_self
-            for k in accum:
-                accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
-
-            if is_cross_speaker:
-                num_cross += 1
-            else:
-                num_self += 1
+            for k in loss_accum:
+                loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
+            num_batches += 1
 
             pbar.set_postfix(
                 mel=f"{losses.get('mel', torch.tensor(0.)).item():.3f}",
@@ -660,14 +620,10 @@ class Trainer:
 
             self.global_step += 1
 
-        for k in loss_accum_self:
-            if num_self > 0: loss_accum_self[k] /= num_self
-            if num_cross > 0: loss_accum_cross[k] /= num_cross
+        for k in loss_accum:
+            loss_accum[k] /= max(1, num_batches)
 
-        combined = {k: (loss_accum_self[k] + loss_accum_cross[k]) / 2.0 for k in loss_accum_self}
-        combined["self_mel"] = loss_accum_self["mel"]
-        combined["cross_spk"] = loss_accum_cross["speaker"]
-        return combined
+        return loss_accum
 
 
     # ==============================================================
@@ -677,11 +633,8 @@ class Trainer:
     def _validate(self) -> dict:
         self.model.eval()
         self.vocoder.eval()
-        loss_accum_self = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
-        loss_accum_cross = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
-        num_self = 0
-        num_cross = 0
-        val_step = 0
+        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        num_batches = 0
 
         for batch in tqdm(self.val_loader, desc="Valid", leave=False):
 
@@ -698,78 +651,33 @@ class Trainer:
                 
             gt_mel = batch["gt_mel"].to(self.device)
             gt_wave = batch["gt_wave"].to(self.device)
-            gt_lengths = batch["gt_lengths"].to(self.device)
-
-            # Mirror training: alternate cross-speaker evaluation
-            is_cross_speaker = (val_step % 2 == 1)
-            speaker_feats_for_forward = batch.get("speaker_feats")
-            target_gt_mel = None
-            target_gt_lengths = None
-
-            can_cross = (batch.get("speaker_feats") is not None) or (ref_audio is not None)
-
-            if is_cross_speaker and can_cross:
-                target_gt_mel     = torch.roll(gt_mel,     shifts=1, dims=0)
-                target_gt_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
-                
-                if batch.get("speaker_feats") is not None:
-                    target_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
-                    speaker_feats_for_forward = target_speaker_feats
-                if ref_audio is not None:
-                    ref_audio = torch.roll(ref_audio, shifts=1, dims=0)
-            else:
-                is_cross_speaker = False
 
             # Forward pass - NOW USES ref_audio and optionally precomputed features
             pred_mel, _, _ = self.model(
                 ref_audio=ref_audio,
                 content_audio=content_audio,
-                gt_mels=gt_mel,  # mirrored identically to train pass
+                gt_mels=None,
                 compute_losses=False,
                 return_aux=False,
-                precomputed_speaker_feats=speaker_feats_for_forward,
+                precomputed_speaker_feats=batch.get("speaker_feats"),
                 precomputed_content_feats=batch.get("content_feats")
             )
             pred_wave = None
 
             # Same-domain STFT ground truth
             gt_wave_vocoded = None
-            pred_mel = pred_mel.to(torch.float32)
-            
-            losses = self.loss_fn(
-                pred_mel, gt_mel, pred_wave, gt_wave_vocoded,
-                gt_lengths=gt_lengths,
-                target_gt_mel=target_gt_mel,
-                target_gt_lengths=target_gt_lengths,
-                is_cross_speaker=is_cross_speaker,
-            )
+            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded)
 
             total = losses.total()
-            last_entropy = getattr(self.model.cross_attn, 'last_entropy', None)
-            if last_entropy is not None and self.train_cfg.lambda_entropy > 0:
-                total = total + (-self.train_cfg.lambda_entropy * last_entropy)
-            last_div = getattr(self.model.mel_encoder, 'last_diversity_loss', None)
-            if last_div is not None and self.train_cfg.lambda_diversity > 0:
-                total = total + self.train_cfg.lambda_diversity * last_div
 
-            accum = loss_accum_cross if is_cross_speaker else loss_accum_self
-            for k in accum:
-                accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
+            for k in loss_accum:
+                loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
+            num_batches += 1
 
-            if is_cross_speaker:
-                num_cross += 1
-            else:
-                num_self += 1
-            val_step += 1
+        for k in loss_accum:
+            loss_accum[k] /= max(1, num_batches)
 
-        for k in loss_accum_self:
-            if num_self > 0: loss_accum_self[k] /= num_self
-            if num_cross > 0: loss_accum_cross[k] /= num_cross
-
-        combined = {k: (loss_accum_self[k] + loss_accum_cross[k]) / 2.0 for k in loss_accum_self}
-        combined["self_mel"] = loss_accum_self["mel"]
-        combined["cross_spk"] = loss_accum_cross["speaker"]
-        return combined
+        return loss_accum
 
 
     # ==============================================================
@@ -813,23 +721,25 @@ class Trainer:
                 content_audio_gpu = [content_audio.to(self.device)]
                 
                 with torch.inference_mode():
-                    # HuBERT Content Features (frozen, safe to cache permanently)
+                    # 1. ECAPA-TDNN Speaker Features
+                    speaker_feats = self.model.mel_encoder(ref_audio_gpu)[0] # [64, 96]
+                    
+                    # 2. HuBERT Content Features 
                     hubert_out = self.model.hubert(content_audio_gpu)
                     content_feats = self.model.hubert_proj(hubert_out)[0] # [T, 96]
                     
-                    # GT Mel
+                    # 3. GT Mel 
                     gt_mel = extract_mel_spectrogram(
                         content_audio, 
                         sample_rate=self.audio_cfg.sample_rate
                     )
                     
-                # speaker_feats NOT cached: projection is trainable and caching its output
-                # would freeze those weights (no gradient ever reaches them). Save ref_audio.
+                # Save to disk
                 torch.save({
                     'content_feats': content_feats.cpu(),
-                    'ref_audio':     ref_audio.cpu(),
-                    'gt_mel':        gt_mel.cpu(),
-                    'gt_wave':       content_audio.cpu(),
+                    'speaker_feats': speaker_feats.cpu(),
+                    'gt_mel': gt_mel.cpu(),
+                    'gt_wave': content_audio.cpu(),
                 }, cache_file)
                 
         print("✅ Precompution complete! Training will now run exponentially faster.\n")
@@ -849,10 +759,10 @@ class Trainer:
             val_loss   = self._validate()
 
             print(
-                f"[epoch {epoch:03d}] train:   self_mel={train_loss['self_mel']:.3f} | stft={train_loss['stft']:.3f} | cross_spk={train_loss['cross_spk']:.3f} | total={train_loss['total']:.3f}"
+                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | total={train_loss['total']:.3f}"
             )
             print(
-                f"                 val:     self_mel={val_loss['self_mel']:.3f} | stft={val_loss['stft']:.3f} | cross_spk={val_loss['cross_spk']:.3f} | total={val_loss['total']:.3f}"
+                f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | total={val_loss['total']:.3f}"
             )
 
 

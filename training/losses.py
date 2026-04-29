@@ -256,133 +256,50 @@ class SpeakerIdentityLoss(nn.Module):
 # ------------------------------------------------------------------
 class MelSpectralStatsLoss(nn.Module):
     """
-    DEPRECATED: Previously used as a proxy for speaker identity. Comparing mel stats
-    against the SOURCE speaker mel actively fights conversion. Kept for reference only.
+    Penalizes differences in the global mean and standard deviation of Mel-spectrograms.
+    Forces the network to match the target speaker's time-invariant acoustic signature (timbre/EQ)
+    rather than just phoneme structures, strongly mitigating the source-leakage 'shortcut trap'.
     """
     def __init__(self):
         super().__init__()
 
     def forward(
         self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        lengths: torch.Tensor = None,
+        pred: torch.Tensor,             # (B, n_mels, T)
+        target: torch.Tensor,           # (B, n_mels, T)
+        lengths: torch.Tensor = None,   # (B,) real frame counts
     ) -> torch.Tensor:
         if pred.shape != target.shape:
             min_t = min(pred.size(-1), target.size(-1))
             pred   = pred[..., :min_t]
             target = target[..., :min_t]
             
-        pred_mean = pred.mean(dim=-1)
-        target_mean = target.mean(dim=-1)
-        pred_std = pred.std(dim=-1)
-        target_std = target.std(dim=-1)
+        if lengths is not None:
+            T = pred.size(-1)
+            mask = (torch.arange(T, device=pred.device)[None, :] < lengths[:, None])  # (B, T)
+            mask = mask.unsqueeze(1).float()  # (B, 1, T)
+            
+            valid_frames = lengths.view(-1, 1).float() # (B, 1)
+            valid_frames = valid_frames.clamp(min=1.0)
+            
+            pred_mean = (pred * mask).sum(dim=-1) / valid_frames
+            target_mean = (target * mask).sum(dim=-1) / valid_frames
+            
+            pred_var = (((pred - pred_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
+            target_var = (((target - target_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
+            
+            pred_std = torch.sqrt(pred_var + 1e-6)
+            target_std = torch.sqrt(target_var + 1e-6)
+        else:
+            pred_mean = pred.mean(dim=-1)
+            target_mean = target.mean(dim=-1)
+            pred_std = pred.std(dim=-1)
+            target_std = target.std(dim=-1)
             
         l1_mean = F.l1_loss(pred_mean, target_mean)
         l1_std = F.l1_loss(pred_std, target_std)
         
         return l1_mean + l1_std
-
-
-# ------------------------------------------------------------------
-# 3b. Band-Stats Speaker Loss  — direct per-band mel statistics L1
-# ------------------------------------------------------------------
-class BandStatsSpeakerLoss(nn.Module):
-    """
-    Compares per-frequency-band mean and std of the PREDICTED mel against
-    the TARGET speaker's ground-truth mel statistics.
-
-    No trainable layers. Gradient flows directly through the comparison
-    of mel statistics back into the decoder and mapping network.
-
-    Three perceptually-motivated bands (for 80 mel-band log-mel):
-      Low  [0 :20]: captures F0 / pitch region (80-400 Hz) — primary gender cue
-      Mid  [20:60]: captures formants/resonance  (400-3000 Hz)
-      High [60:80]: captures breathiness/sibilance (3000-8000 Hz)
-
-    Uses gt_lengths mask so padding silence does not corrupt the statistics.
-    """
-    LOW  = (0,  20)
-    MID  = (20, 60)
-    HIGH = (60, 80)
-
-    def _masked_stats(self, mel: torch.Tensor, lengths: torch.Tensor):
-        """
-        Compute per-band mean and std, ignoring padded frames.
-        mel:     (B, 80, T)
-        lengths: (B,)  real frame counts
-        Returns: dict of band -> (mean (B, band_size), std (B, band_size))
-        """
-        B, C, T = mel.shape
-        # Build (B, 1, T) mask of real frames
-        mask = (torch.arange(T, device=mel.device)[None, None, :]
-                < lengths[:, None, None].float())       # (B, 1, T)
-        n = lengths.float().clamp(min=1.0).unsqueeze(-1)  # (B, 1)
-
-        stats = {}
-        for band_name, (lo, hi) in [("low", self.LOW), ("mid", self.MID), ("high", self.HIGH)]:
-            band = mel[:, lo:hi, :]                     # (B, band_size, T)
-            band_mask = mask.expand_as(band)            # (B, band_size, T)
-
-            masked = band * band_mask
-            band_mean = masked.sum(dim=-1) / n          # (B, band_size)
-
-            # Variance via E[X^2] - E[X]^2, masked
-            sq_mean = (masked ** 2).sum(dim=-1) / n     # (B, band_size)
-            band_var = (sq_mean - band_mean ** 2).clamp(min=0.0)
-            band_std = torch.sqrt(band_var + 1e-6)      # (B, band_size)
-
-            stats[band_name] = (band_mean, band_std)
-        return stats
-
-    def _per_bin_stats(self, mel: torch.Tensor, lengths: torch.Tensor):
-        """Per-frequency-bin masked mean+std -> (B,80) each. 160 gradient terms vs 6."""
-        B, C, T = mel.shape
-        mask = (torch.arange(T, device=mel.device)[None, None, :]
-                < lengths[:, None, None].float())
-        n = lengths.float().clamp(min=1.0).view(B, 1)
-        masked   = mel * mask
-        bin_mean = masked.sum(dim=-1) / n
-        sq_mean  = (masked ** 2).sum(dim=-1) / n
-        bin_std  = (sq_mean - bin_mean ** 2).clamp(min=0.0).add(1e-6).sqrt()
-        return bin_mean, bin_std
-
-    def forward(
-        self,
-        pred_mel: torch.Tensor,       # (B, 80, T_pred)
-        target_gt_mel: torch.Tensor,  # (B, 80, T_tgt)  — rolled TARGET speaker gt mel
-        pred_lengths: torch.Tensor,   # (B,) real frames in pred_mel
-        tgt_lengths: torch.Tensor,    # (B,) real frames in target_gt_mel
-        src_gt_mel: torch.Tensor = None,  # (B, 80, T_src) optional: source mel for diagnostic
-        src_lengths: torch.Tensor = None,
-    ) -> torch.Tensor:
-        # Fix C: per-bin L1 on mean+std -> 160 gradient terms vs 6,
-        # matching the density of the mel-reconstruction loss.
-        pred_mean, pred_std = self._per_bin_stats(pred_mel, pred_lengths)
-        tgt_mean,  tgt_std  = self._per_bin_stats(target_gt_mel, tgt_lengths)
-        loss = F.l1_loss(pred_mean, tgt_mean) + F.l1_loss(pred_std, tgt_std)
-
-        # Keep 3-band stats for the D(pred,tgt)-D(pred,src) diagnostic only.
-        pred_stats = self._masked_stats(pred_mel, pred_lengths)
-        tgt_stats  = self._masked_stats(target_gt_mel, tgt_lengths)
-
-        # --- Diagnostic: D(pred,tgt) - D(pred,src) ---
-        # Should trend negative: pred moving towards target, away from source
-        if src_gt_mel is not None and src_lengths is not None:
-            src_stats = self._masked_stats(src_gt_mel, src_lengths)
-            d_pred_tgt = 0.0
-            d_pred_src = 0.0
-            for band in ("low", "mid", "high"):
-                p_mean, p_std = pred_stats[band]
-                t_mean, t_std = tgt_stats[band]
-                s_mean, s_std = src_stats[band]
-                d_pred_tgt += (F.l1_loss(p_mean, t_mean) + F.l1_loss(p_std, t_std)).item()
-                d_pred_src += (F.l1_loss(p_mean, s_mean) + F.l1_loss(p_std, s_std)).item()
-            conversion_metric = d_pred_tgt - d_pred_src
-            print(f"[BAND_STATS] D(pred,tgt)={d_pred_tgt:.4f} D(pred,src)={d_pred_src:.4f} "
-                  f"metric={conversion_metric:.4f} ({'✅ towards target' if conversion_metric < 0 else '❌ towards source'})")
-
-        return loss
 
 
 # ------------------------------------------------------------------
@@ -404,8 +321,7 @@ class VCGeneratorLoss(nn.Module):
     def __init__(
         self,
         cfg: TrainingConfig,
-        mel_encoder: Optional[nn.Module] = None,
-        speaker_encoder: Optional[nn.Module] = None,   # kept for API compat, unused
+        speaker_encoder: Optional[nn.Module] = None,
     ) -> None:
         """
         Initializes the loss aggregator.
@@ -418,43 +334,54 @@ class VCGeneratorLoss(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # 1. Mel-spectrogram L1 reconstruction loss
-        self.mel_loss = MelSpectrogramLoss(weight_l1=0.7)
+        # --- Instantiate individual loss components ---
 
-        # 2. Multi-resolution STFT loss (disabled in Colab path since pred_wave=None)
+        # 1. Mel-spectrogram L1 reconstruction loss
+        self.mel_loss = MelSpectrogramLoss(weight_l1=0.7) # Using pure L1
+
+        # 2. Multi-resolution STFT loss
         self.stft_loss = MRSTFTLoss()
 
-        # 3. Band-stats speaker loss — no trainable params, direct gradient path
-        self.spk_emb_loss: Optional[BandStatsSpeakerLoss] = None
+        # 3. Speaker identity loss
+        self.speaker_loss: Optional[SpeakerIdentityLoss] = None
+        self.mel_stats_loss = MelSpectralStatsLoss()
+        
         if hasattr(cfg, 'lambda_spk') and cfg.lambda_spk > 0:
-            self.spk_emb_loss = BandStatsSpeakerLoss()
+            if speaker_encoder is None:
+                print("Warning: lambda_spk > 0 but speaker_encoder is None. Using MelStatsLoss only.")
+            else:
+                self.speaker_loss = SpeakerIdentityLoss(speaker_encoder)
         else:
-            print("Warning: lambda_spk is 0 or unset. Speaker loss disabled.")
+            print(
+                "Warning: `lambda_spk` is not defined or is 0. "
+                "Speaker Identity / Stats losses will be disabled."
+            )
 
 
     def forward(
         self,
-        pred_mel: torch.Tensor,              # (B, n_mel, T_mel)
-        gt_mel: torch.Tensor,                # (B, n_mel, T_mel)  — source speaker gt mel
-        pred_wave: torch.Tensor,             # (B, T_wav)  — None in Colab path
-        gt_wave: torch.Tensor,               # (B, T_wav)  — None in Colab path
-        gt_lengths: torch.Tensor = None,     # (B,) real mel frame counts for pred + src
-        target_gt_mel: torch.Tensor = None,  # (B, n_mel, T_tgt) — TARGET speaker gt mel (rolled)
-        target_gt_lengths: torch.Tensor = None, # (B,) real frame counts for target_gt_mel
-        is_cross_speaker: bool = False,      # True → only speaker loss, no mel L1
+        pred_mel: torch.Tensor,             # (B, n_mel, T_mel)
+        gt_mel: torch.Tensor,               # (B, n_mel, T_mel)
+        pred_wave: torch.Tensor,            # (B, T_wav)
+        gt_wave: torch.Tensor,              # (B, T_wav)
+        gt_lengths: torch.Tensor = None,    # (B,) real mel frame counts (excludes padding)
     ) -> LossOutputs:
+        """
+        Computes the weighted sum of all configured losses.
+        """
         outs = LossOutputs()
 
-        # --- Mel L1 loss: ONLY on same-speaker (self-recon) batches ---
-        if not is_cross_speaker:
-            if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
-                try:
-                    l_mel = self.mel_loss(pred_mel, gt_mel, lengths=gt_lengths)
-                    outs["mel"] = self.cfg.lambda_mel * l_mel
-                except Exception as exc:
-                    raise RuntimeError(f"Mel loss failed: {exc}") from exc
+        # --- Compute and weight each loss term ---
 
-        # --- STFT loss: disabled when pred_wave is None ---
+        # Mel reconstruction loss
+        if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
+            try:
+                l_mel = self.mel_loss(pred_mel, gt_mel, lengths=gt_lengths)
+                outs["mel"] = self.cfg.lambda_mel * l_mel
+            except Exception as exc:
+                raise RuntimeError(f"Mel loss failed: {exc}") from exc
+
+        # Multi-resolution STFT loss
         if hasattr(self.cfg, 'lambda_rec') and self.cfg.lambda_rec > 0 and pred_wave is not None and gt_wave is not None:
             try:
                 l_stft = self.stft_loss(pred_wave, gt_wave)
@@ -462,26 +389,20 @@ class VCGeneratorLoss(nn.Module):
             except Exception as exc:
                 raise RuntimeError(f"STFT loss failed: {exc}") from exc
 
-        # --- Band-stats speaker loss: ONLY on cross-speaker batches ---
-        # Compares per-band (low/mid/high) mean and std of pred_mel
-        # against the TARGET speaker's actual gt mel statistics (masked, no padding).
-        if is_cross_speaker and target_gt_mel is not None and self.spk_emb_loss is not None:
-            if hasattr(self.cfg, 'lambda_spk') and self.cfg.lambda_spk > 0:
-                try:
-                    # pred_lengths: use gt_lengths (same content length as prediction)
-                    # src_gt_mel:   gt_mel is the SOURCE speaker mel — for diagnostic only
-                    l_spk = self.spk_emb_loss(
-                        pred_mel=pred_mel,
-                        target_gt_mel=target_gt_mel,
-                        pred_lengths=gt_lengths,
-                        tgt_lengths=target_gt_lengths,
-                        src_gt_mel=gt_mel,
-                        src_lengths=gt_lengths,
-                    )
-                    outs["speaker"] = self.cfg.lambda_spk * l_spk
-                except Exception as exc:
-                    raise RuntimeError(f"Speaker loss failed: {exc}") from exc
-
+        # Speaker identity & Stats loss
+        if hasattr(self.cfg, 'lambda_spk') and self.cfg.lambda_spk > 0:
+            try:
+                # 1. Always compute the highly potent Mel Stats Loss
+                l_spk_stats = self.mel_stats_loss(pred_mel, gt_mel, lengths=gt_lengths)
+                outs["speaker"] = self.cfg.lambda_spk * l_spk_stats
+                
+                # 2. Add True Speaker Cosine Loss IF waveforms were generated (not OOMing)
+                if self.speaker_loss is not None and pred_wave is not None and gt_wave is not None:
+                    l_spk_wave = self.speaker_loss(pred_wave, gt_wave) 
+                    outs["speaker"] = outs["speaker"] + (self.cfg.lambda_spk * l_spk_wave)
+            except Exception as exc:
+                raise RuntimeError(f"Speaker/Stats loss failed: {exc}") from exc
+        
         return outs
 
 
