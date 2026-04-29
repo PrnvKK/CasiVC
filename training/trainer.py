@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -411,6 +412,69 @@ class Trainer:
             print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
             f"raw_stft={losses.get('stft', 0):.4f}, "
             f"actual_total={total:.4f}")
+            
+            # =========================================================================
+            # CROSS-PAIR TRAINING: Mel Spectral Stats only (no L1 on cross pairs)
+            # =========================================================================
+            # Mathematically safe because Mel Stats matches per-band spectral shape
+            # without penalizing phoneme mismatch: ∂L_stats/∂γ encourages stronger γ.
+            # Reuses precomputed content/speaker features — no HuBERT/ECAPA re-run.
+            cross_pair_prob = getattr(self.train_cfg, 'cross_pair_prob', 0.0)
+            cross_stats_weight = getattr(self.train_cfg, 'cross_pair_stats_weight', 1.0)
+            
+            if cross_pair_prob > 0:
+                speaker_ids = batch.get("speaker_id", [])
+                B = len(speaker_ids)
+                
+                # Build mask: cross-pair only for different-speaker neighbours
+                cross_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
+                if B >= 2:
+                    for i in range(B):
+                        j = (i + 1) % B
+                        if speaker_ids[i] != speaker_ids[j]:
+                            cross_mask[i] = True
+                
+                valid_pairs = cross_mask.sum().item()
+                
+                if valid_pairs > 0 and random.random() < cross_pair_prob:
+                    # Roll speaker features and targets by 1
+                    rolled_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
+                    rolled_gt_mel = torch.roll(gt_mel, shifts=1, dims=0)
+                    rolled_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
+                    
+                    # Forward pass with rolled speaker (content unchanged)
+                    pred_cross, _, _ = self.model(
+                        ref_audio=None,
+                        content_audio=None,
+                        gt_mels=None,
+                        compute_losses=False,
+                        return_aux=False,
+                        precomputed_speaker_feats=rolled_speaker_feats,
+                        precomputed_content_feats=batch.get("content_feats")
+                    )
+                    pred_cross = pred_cross.to(torch.float32)
+                    
+                    # Cross-pair loss: Mel Spectral Stats ONLY (no L1)
+                    # Uses independent pred/target lengths to avoid paddding corruption
+                    cross_loss_tensor = self.loss_fn.mel_stats_loss(
+                        pred_cross,
+                        rolled_gt_mel,
+                        pred_lengths=gt_lengths,        # content speaker's length
+                        target_lengths=rolled_lengths    # target speaker's length
+                    )
+                    
+                    # Average over valid cross-pairs only
+                    cross_loss = cross_loss_tensor * cross_stats_weight
+                    total = total + cross_loss
+                    
+                    if num_batches == 0:
+                        rolled_ids = [speaker_ids[(i+1) % B] for i in range(B)]
+                        print(f"[CROSS-PAIR] prob={cross_pair_prob}, weight={cross_stats_weight}")
+                        print(f"[CROSS-PAIR] Active: {valid_pairs}/{B} items cross-paired (mask={cross_mask.tolist()})")
+                        print(f"[CROSS-PAIR] speakers: {speaker_ids} → {rolled_ids}")
+                        print(f"[CROSS-PAIR] self_loss={losses.total():.4f}, cross_stats_loss={cross_loss_tensor.item():.4f}, "
+                              f"weighted_cross={cross_loss.item():.4f}")
+                        print(f"[CROSS-PAIR] total (self + cross) = {total:.4f}")
             
             # 🔍 ENHANCED SIGNAL AUDIT (Run on first batch of session + periodically)
             if num_batches == 0 and (self.global_step == 0 or self.global_step % 100 == 0):

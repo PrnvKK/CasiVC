@@ -761,6 +761,10 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
         ref_durs.append(pair.ref_duration)
         content_durs.append(pair.content_duration)
     
+    # ---- SPEAKER DIVERSITY CHECK ----
+    unique_speakers = len(set(speaker_ids))
+    print(f"[COLLATE] Batch has {unique_speakers} unique speakers (need ≥2 for cross-pair training)")
+    
     # ---- COMPUTE LENGTHS BEFORE PADDING -----------------------------
     ref_audio_lengths = torch.tensor([a.size(0) for a in ref_audios if a is not None], dtype=torch.long)  # NEW
     ref_lengths = torch.tensor([m.size(1) for m in ref_mels if m is not None], dtype=torch.long)

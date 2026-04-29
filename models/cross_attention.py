@@ -107,9 +107,13 @@ class PositionAgnosticCrossAttention(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(self.dropout_rate)
         
+        # LayerNorm before mapping network — normalizes attended_features input
+        # so the mapping network sees stable, zero-mean unit-variance features
+        self.film_norm = nn.LayerNorm(self.d_model)
+
         # AdaIN Mapping Network
-        # Converts the abstract target speaker token into independent scale (gamma) 
-        # and shift (beta) statistics per channel.
+        # Converts attention-weighted speaker features into per-frame
+        # scale (gamma) and shift (beta) statistics per channel.
         self.mapping_network = nn.Sequential(
             nn.Linear(self.d_model, self.d_model),
             nn.LeakyReLU(0.2),
@@ -358,17 +362,28 @@ class PositionAgnosticCrossAttention(nn.Module):
             residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
             
             # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
-            # Instead of manually scaling alpha, we let a non-linear mapping 
-            # network decipher the spatial ECAPA token into formal mean/std channel statistics.
-            pooled_spk = speaker_features.mean(dim=1, keepdim=True) # [B, 1, 96]
-            style_stats = self.mapping_network(pooled_spk)          # [B, 1, 192]
+            # Route attention-weighted features (not pooled speaker tokens) through
+            # the mapping network. This produces per-frame gamma/beta that varies
+            # with which speaker tokens each frame attends to — enabling dynamic,
+            # phoneme-aware timbre modulation instead of a static global EQ shift.
+            style_stats = self.mapping_network(self.film_norm(attended_features))  # [B, T, 192]
             
-            gamma, beta = style_stats.chunk(2, dim=-1)              # [B, 1, 96] each
+            gamma, beta = style_stats.chunk(2, dim=-1)                              # [B, T, 96] each
             
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
             print(f"[cross_attn] FiLM gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}, "
                   f"min={gamma.min():.4f}, max={gamma.max():.4f}")
+            gamma_temporal_std = gamma.std(dim=1).mean()  # std across time → per-frame variation
+            print(f"[cross_attn] FiLM gamma temporal std: {gamma_temporal_std:.4f} "
+                  f"(>0.01 = per-frame modulation active)")
+            # Per-channel variance: are a few mel bins being modulated 10× more than others?
+            gamma_per_channel_std = gamma.std(dim=1)  # [B, 96] — temporal std per mel channel
+            top3_vals, top3_idx = gamma_per_channel_std.topk(min(3, gamma_per_channel_std.size(-1)))
+            print(f"[cross_attn] FiLM gamma per-channel std: mean={gamma_per_channel_std.mean():.4f}, "
+                  f"max={gamma_per_channel_std.max():.4f}, min={gamma_per_channel_std.min():.4f}")
+            print(f"[cross_attn] FiLM gamma top-3 volatile channels: "
+                  f"{list(zip(top3_idx[0].tolist(), [f'{v:.4f}' for v in top3_vals[0].tolist()]))}")
             attended_features = attended_features + (residual_norm * (1.0 + gamma) + beta)
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")

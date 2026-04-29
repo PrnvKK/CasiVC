@@ -149,6 +149,10 @@ class TrainingConfig:
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
   lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
 
+  # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
+  cross_pair_prob: float = 0.25          # probability of applying cross-pair in a batch
+  cross_pair_stats_weight: float = 2.0   # weight multiplier for cross-pair Mel Stats loss
+
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
   lambda_adv: float = 0.0
