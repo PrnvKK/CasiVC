@@ -72,6 +72,9 @@ class PositionAgnosticCrossAttention(nn.Module):
         #self.alpha = nn.Parameter(torch.tensor(0.1))
         self.alpha = nn.Parameter(torch.tensor(2.0))
 
+        # Learnable attention temperature (softplus-constrained, starts ≈0.5 for moderate sharpening)
+        self.raw_temperature = nn.Parameter(torch.tensor(-0.432))  # F.softplus(-0.432) ≈ 0.5
+
         # Multi-head attention (speaker features already at correct dimension)
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=self.d_model,
@@ -312,10 +315,15 @@ class PositionAgnosticCrossAttention(nn.Module):
               f"(uniform≈{math.log(attn_probs.shape[-1]):.2f})")
 
         # ------------------------------------------------------------------
-        # MultiheadAttention
+        # MultiheadAttention (with Learnable Temperature Scaling)
         # ------------------------------------------------------------------
+        temperature = F.softplus(self.raw_temperature) + 0.01  # learnable, starts ≈0.5, ensures >0.01
+        queries_scaled = queries / temperature
+        
+        print(f"[cross_attn] attention temperature: {temperature.item():.4f}")
+        
         attended_features, attention_weights = self.multihead_attn(
-            query=queries,
+            query=queries_scaled,
             key=keys,
             value=values,
             need_weights=True,
@@ -358,7 +366,10 @@ class PositionAgnosticCrossAttention(nn.Module):
             gamma, beta = style_stats.chunk(2, dim=-1)              # [B, 1, 96] each
             
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
-            attended_features = residual_norm * (1.0 + gamma) + beta
+            # ADD to attended_features instead of overwriting!
+            print(f"[cross_attn] FiLM gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}, "
+                  f"min={gamma.min():.4f}, max={gamma.max():.4f}")
+            attended_features = attended_features + (residual_norm * (1.0 + gamma) + beta)
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")

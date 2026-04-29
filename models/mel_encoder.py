@@ -103,7 +103,7 @@ class MelEncoder(nn.Module):
             raise ImportError("speechbrain is required. Install with: pip install speechbrain")
         
         self.output_dim = output_dim or model_config.mel_encoder_output_dim
-        self.num_speaker_tokens = 1  # Fix: Project into 1 token instead of 64 random tokens
+        self.num_speaker_tokens = 8  # Fix: Project into 8 tokens to enable multi-token attention
         self.model_name = model_name
         
         # Audio parameters
