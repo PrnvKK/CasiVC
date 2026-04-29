@@ -584,10 +584,7 @@ class Trainer:
                     print(f"speaker_proj grad: mean={speaker_grad.abs().mean():.6f}, "
                           f"max={speaker_grad.abs().max():.6f}")
                 
-                # Alpha gradient (we know this one works)
-                print(f"alpha grad: {self.model.cross_attn.alpha.grad.item():.6f}")
-
-
+                # Alpha was replaced by the AdaIN Mapping Network
 
             self.analyze_gradient_flow()
 

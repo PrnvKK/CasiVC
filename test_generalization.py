@@ -77,10 +77,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model = HubertVCModel(audio_cfg, model_cfg, train_cfg).to(device)
     model.eval()
     ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt.get("model_state", ckpt))
+    model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
     print("✅ Model loaded.")
-    print(f"[DEBUG] Trained alpha value: {model.cross_attn.alpha.item():.6f}")
-
     # ── Speaker Space Diagnostic ─────────────────────────────────────────
     print("\n[SPEAKER SPACE DIAGNOSTIC]")
     with torch.no_grad():
