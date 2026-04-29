@@ -265,28 +265,36 @@ class MelSpectralStatsLoss(nn.Module):
 
     def forward(
         self,
-        pred: torch.Tensor,             # (B, n_mels, T)
-        target: torch.Tensor,           # (B, n_mels, T)
-        lengths: torch.Tensor = None,   # (B,) real frame counts
+        pred: torch.Tensor,             # (B, n_mels, T1)
+        target: torch.Tensor,           # (B, n_mels, T2)
+        lengths: torch.Tensor = None,   # (B,) (legacy: applies to both if provided)
+        pred_lengths: torch.Tensor = None, # (B,)
+        target_lengths: torch.Tensor = None, # (B,)
     ) -> torch.Tensor:
+        if pred_lengths is None and lengths is not None:
+            pred_lengths = lengths
+        if target_lengths is None and lengths is not None:
+            target_lengths = lengths
         if pred.shape != target.shape:
             min_t = min(pred.size(-1), target.size(-1))
             pred   = pred[..., :min_t]
             target = target[..., :min_t]
             
-        if lengths is not None:
-            T = pred.size(-1)
-            mask = (torch.arange(T, device=pred.device)[None, :] < lengths[:, None])  # (B, T)
-            mask = mask.unsqueeze(1).float()  # (B, 1, T)
+        if pred_lengths is not None and target_lengths is not None:
+            T_pred = pred.size(-1)
+            T_target = target.size(-1)
             
-            valid_frames = lengths.view(-1, 1).float() # (B, 1)
-            valid_frames = valid_frames.clamp(min=1.0)
+            mask_pred = (torch.arange(T_pred, device=pred.device)[None, :] < pred_lengths[:, None]).unsqueeze(1).float()
+            mask_target = (torch.arange(T_target, device=target.device)[None, :] < target_lengths[:, None]).unsqueeze(1).float()
             
-            pred_mean = (pred * mask).sum(dim=-1) / valid_frames
-            target_mean = (target * mask).sum(dim=-1) / valid_frames
+            valid_pred = pred_lengths.view(-1, 1).float().clamp(min=1.0)
+            valid_target = target_lengths.view(-1, 1).float().clamp(min=1.0)
             
-            pred_var = (((pred - pred_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
-            target_var = (((target - target_mean.unsqueeze(-1)) ** 2) * mask).sum(dim=-1) / valid_frames
+            pred_mean = (pred * mask_pred).sum(dim=-1) / valid_pred
+            target_mean = (target * mask_target).sum(dim=-1) / valid_target
+            
+            pred_var = (((pred - pred_mean.unsqueeze(-1)) ** 2) * mask_pred).sum(dim=-1) / valid_pred
+            target_var = (((target - target_mean.unsqueeze(-1)) ** 2) * mask_target).sum(dim=-1) / valid_target
             
             pred_std = torch.sqrt(pred_var + 1e-6)
             target_std = torch.sqrt(target_var + 1e-6)
