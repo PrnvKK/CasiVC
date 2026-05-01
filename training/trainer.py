@@ -435,6 +435,7 @@ class Trainer:
                             cross_mask[i] = True
                 
                 valid_pairs = cross_mask.sum().item()
+                print(f"[CROSS-PAIR-CHECK] prob={cross_pair_prob}, B={B}, valid={valid_pairs}")
                 
                 if valid_pairs > 0 and random.random() < cross_pair_prob:
                     # Roll speaker features and targets by 1
