@@ -312,7 +312,7 @@ class MobileNetDecoder(nn.Module):
             print(f"✅ {tag:16s}  mean={x.mean():7.4f}  std={x.std():7.4f}")
 
     
-    def forward(self, fused: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
+    def forward(self, fused: torch.Tensor, return_intermediate: bool = False) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
 
         # Validate input
         if fused.ndim != 3:
@@ -328,6 +328,7 @@ class MobileNetDecoder(nn.Module):
         
         # REMOVE old upsample_first logic entirely
         
+        should_return_feats = return_intermediate or self.return_feats
         intermediate: List[torch.Tensor] = []
 
         # Process blocks (upsampling now happens inside blocks)
@@ -337,7 +338,7 @@ class MobileNetDecoder(nn.Module):
           x = blk(x)  # Block now handles its own upsampling
           self._check(x, f"block {i}")
           
-          if self.return_feats:
+          if should_return_feats:
               intermediate.append(x)
           
         
@@ -346,7 +347,7 @@ class MobileNetDecoder(nn.Module):
         mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
         self._check(mel, "mel_proj")
         
-        if self.return_feats:
+        if should_return_feats:
             return mel, intermediate
         return mel
     

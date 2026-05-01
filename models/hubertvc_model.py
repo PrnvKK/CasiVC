@@ -102,6 +102,7 @@ class HubertVCModel(nn.Module):
         audio_cfg: AudioConfig | None = None,
         model_cfg: ModelConfig | None = None,
         training_cfg: TrainingConfig | None = None,
+        num_speakers: Optional[int] = None,
     ):
         super().__init__()
         self.a_cfg = audio_cfg or a_cfg
@@ -145,9 +146,10 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         # Since online VQ suffered from Codebook Collapse on random
         # initialization, we use a continuous bottleneck instead. 
-        # Squeezing 96D to 12D is enough to pass 40 phonemes, but 
-        # too thin to pass high-dimensional Timbre & Pitch characteristics.
-        self.ib_dim = 12
+        # Squeezing 96D to 32D strips high-level speaker identity while
+        # preserving enough capacity for spectral texture (harmonics, formant
+        # bandwidth, fricative noise) that 12D choked off.
+        self.ib_dim = 32
         self.info_bottleneck = nn.Sequential(
             nn.Linear(self.m_cfg.cross_attention_dim, self.ib_dim),
             nn.LayerNorm(self.ib_dim),
@@ -157,6 +159,15 @@ class HubertVCModel(nn.Module):
         )
 
         self.decoder = MobileNetDecoder(config=m_cfg, return_feats=False)    
+
+        # Speaker classifier head - per-frame Conv1d at decoder bottleneck
+        if num_speakers is not None and num_speakers > 0:
+            self.speaker_classifier = nn.Conv1d(192, num_speakers, kernel_size=1)
+            nn.init.xavier_uniform_(self.speaker_classifier.weight)
+            nn.init.zeros_(self.speaker_classifier.bias)
+            print(f"[HubertVCModel] Speaker classifier: Conv1d(192, {num_speakers}, k=1) → {num_speakers * 193:,} params")
+        else:
+            self.speaker_classifier = None
 
         # 2. Sanity-check overall parameter budget
         trainables = sum(p.numel() for p in self.parameters()
@@ -219,6 +230,7 @@ class HubertVCModel(nn.Module):
     gt_mels: Optional[List[torch.Tensor] | torch.Tensor] = None,
     compute_losses: bool = False,
     return_aux: bool = False,
+    return_bottleneck: bool = False,
     precomputed_speaker_feats: Optional[torch.Tensor] = None,
     precomputed_content_feats: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor] | None, Dict[str, Any] | None]:
@@ -329,7 +341,10 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         # Force FP32 for decoder to avoid NaN gradients
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            pred_mel = self.decoder(resampled_features.float())  # [B, 80, T_hubert]
+            if return_bottleneck and self.speaker_classifier is not None:
+                pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True)
+            else:
+                pred_mel = self.decoder(resampled_features.float())  # [B, 80, T_hubert]
 
             # Upsample output from HuBERT rate → mel rate (deterministic, clean interpolation)
             if gt_mels is not None:
@@ -396,6 +411,17 @@ class HubertVCModel(nn.Module):
               "content_length": fused_features.size(0),
           }
 
+        # Classifier head: per-frame speaker ID logits from decoder bottleneck
+        if return_bottleneck and self.speaker_classifier is not None:
+            bottleneck = intermediate[2]  # Block 2 output: [B, 192, T]
+            # Temporal smooth before classification: 3-frame AvgPool (~30ms)
+            # prevents per-frame CE gradient from injecting high-frequency jitter
+            bottleneck = F.avg_pool1d(bottleneck, kernel_size=3, stride=1, padding=1)
+            classifier_logits = self.speaker_classifier(bottleneck)  # [B, num_speakers, T]
+            if aux is None:
+                aux = {}
+            aux["classifier_logits"] = classifier_logits
+            aux["bottleneck"] = bottleneck
         
         return pred_mel, loss_dict, aux
 

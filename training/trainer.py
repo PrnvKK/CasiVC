@@ -59,7 +59,7 @@ from data.dataset import (
 )
 from data.audio_utils import extract_mel_spectrogram
 from models.hubertvc_model import HubertVCModel
-from training.losses import VCGeneratorLoss
+from training.losses import VCGeneratorLoss, SpeakerClassifierLoss
 from inference import load_vocoder, load_speaker_encoder  # thin wrapper to HiFi-GAN
 from models.mobilenet_decoder import MobileNetDecoder
 
@@ -115,7 +115,8 @@ class Trainer:
         # ----------------------------------------------------------
         # 4. model, vocoder, loss fn
         # ----------------------------------------------------------
-        self.model: HubertVCModel = HubertVCModel(self.model_cfg).to(self.device)
+        num_speakers = len(self.train_dataset.speaker_to_idx)
+        self.model: HubertVCModel = HubertVCModel(self.model_cfg, num_speakers=num_speakers).to(self.device)
 
         for name, param in self.model.named_parameters():
             print(name, param.requires_grad)
@@ -137,6 +138,7 @@ class Trainer:
             p.requires_grad = False
 
         self.loss_fn = VCGeneratorLoss(self.train_cfg, self.speaker_encoder).to(self.device)
+        self.classifier_loss_fn = SpeakerClassifierLoss().to(self.device)
 
         # ----------------------------------------------------------
         # 5. optimiser & scheduler
@@ -186,7 +188,9 @@ class Trainer:
         """Register forward hooks to detect NaN/Inf in decoder blocks"""
         def make_hook(module_name):
             def hook_fn(module, input, output):
-                if torch.isnan(output).any() or torch.isinf(output).any():
+                # Decoder can return (mel, intermediate) tuple when return_intermediate=True
+                check = output[0] if isinstance(output, tuple) else output
+                if torch.isnan(check).any() or torch.isinf(check).any():
                     print(f"❌ NaN/Inf detected in {module_name}")
                     raise RuntimeError(f"Numerical instability in {module_name}")
             return hook_fn
@@ -345,7 +349,7 @@ class Trainer:
       # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "total": 0.0}
         num_batches = 0
 
         pbar = tqdm(self.train_loader, desc=f"Train | epoch {self.start_epoch}", leave=False)
@@ -369,12 +373,16 @@ class Trainer:
             gt_lengths = batch["gt_lengths"].to(self.device)    # (B,) real mel frame counts
 
             # Forward pass - NOW USES ref_audio and optionally precomputed features
-            pred_mel, _, _ = self.model(
+            classifier_weight = getattr(self.train_cfg, 'classifier_weight', 0.0)
+            need_bottleneck = classifier_weight > 0 and self.model.speaker_classifier is not None
+            
+            pred_mel, _, aux = self.model(
                 ref_audio=ref_audio,
                 content_audio=content_audio,
                 gt_mels=gt_mel,
                 compute_losses=False,
-                return_aux=False,
+                return_aux=need_bottleneck,
+                return_bottleneck=need_bottleneck,
                 precomputed_speaker_feats=batch.get("speaker_feats"),
                 precomputed_content_feats=batch.get("content_feats")
             )
@@ -408,6 +416,26 @@ class Trainer:
             
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()
+            
+            # --- Speaker classifier CE loss (self-pair, per-frame, no dilution) ---
+            if need_bottleneck and aux is not None and "classifier_logits" in aux:
+                logits_self = aux["classifier_logits"]  # [B, N, T]
+                target_idx = batch["target_speaker_idx"].to(self.device)  # [B]
+                T = logits_self.size(-1)
+                target_expanded = target_idx.unsqueeze(1).expand(-1, T)  # [B, T]
+                ce_loss_self = self.classifier_loss_fn(logits_self, target_expanded)
+                total = total + classifier_weight * ce_loss_self
+                loss_accum["classifier"] += ce_loss_self.item()
+                
+                if num_batches == 0:
+                    with torch.no_grad():
+                        logit_entropy = - (logits_self.softmax(dim=1) * torch.log_softmax(logits_self, dim=1)).sum(dim=1).mean().item()
+                        _, predicted = logits_self.max(dim=1)  # [B, T]
+                        accuracy = (predicted == target_expanded).float().mean().item()
+                        print(f"[CLASSIFIER] weight={classifier_weight}, logit_entropy={logit_entropy:.4f}, self_accuracy={accuracy:.4f}")
+                        # Top-3 predicted speakers (first frame of first sample)
+                        top3_vals, top3_idx = logits_self[0, :, 0].topk(min(3, logits_self.size(1)))
+                        print(f"[CLASSIFIER] frame-0 top3 indices: {top3_idx.tolist()}, values: {[f'{v:.3f}' for v in top3_vals.tolist()]}")
             
             print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
             f"raw_stft={losses.get('stft', 0):.4f}, "
@@ -444,12 +472,13 @@ class Trainer:
                     rolled_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
                     
                     # Forward pass with rolled speaker (content unchanged)
-                    pred_cross, _, _ = self.model(
+                    pred_cross, _, aux_cross = self.model(
                         ref_audio=None,
                         content_audio=None,
                         gt_mels=None,
                         compute_losses=False,
-                        return_aux=False,
+                        return_aux=need_bottleneck,
+                        return_bottleneck=need_bottleneck,
                         precomputed_speaker_feats=rolled_speaker_feats,
                         precomputed_content_feats=batch.get("content_feats")
                     )
@@ -467,6 +496,15 @@ class Trainer:
                     # Average over valid cross-pairs only
                     cross_loss = cross_loss_tensor * cross_stats_weight
                     total = total + cross_loss
+                    
+                    # --- Classifier CE on cross-pair (target = rolled speaker) ---
+                    if need_bottleneck and aux_cross is not None and "classifier_logits" in aux_cross:
+                        logits_cross = aux_cross["classifier_logits"]  # [B, N, T]
+                        target_idx_rolled = torch.roll(batch["target_speaker_idx"], shifts=1, dims=0).to(self.device)
+                        T_cross = logits_cross.size(-1)
+                        target_cross_expanded = target_idx_rolled.unsqueeze(1).expand(-1, T_cross)
+                        ce_loss_cross = self.classifier_loss_fn(logits_cross, target_cross_expanded)
+                        total = total + classifier_weight * ce_loss_cross
                     
                     if num_batches == 0:
                         rolled_ids = [speaker_ids[(i+1) % B] for i in range(B)]
@@ -666,13 +704,16 @@ class Trainer:
                 loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
             num_batches += 1
 
-            pbar.set_postfix(
-                mel=f"{losses.get('mel', torch.tensor(0.)).item():.3f}",
-                stft=f"{losses.get('stft', torch.tensor(0.)).item():.3f}",
-                spk=f"{losses.get('speaker', torch.tensor(0.)).item():.3f}",
-                tot=f"{total.item():.3f}",
-                lr=f"{self.scheduler.get_last_lr()[0]:.2e}",
-            )
+            postfix = {
+                "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                "mel": f"{losses.get('mel', torch.tensor(0.)).item():.3f}",
+                "stft": f"{losses.get('stft', torch.tensor(0.)).item():.3f}",
+                "spk": f"{losses.get('speaker', torch.tensor(0.)).item():.3f}",
+                "tot": f"{total.item():.3f}",
+            }
+            if need_bottleneck:
+                postfix["cls"] = f"{ce_loss_self.item():.3f}"
+            pbar.set_postfix(**postfix)
 
             if (
                 self.train_cfg.save_every_steps > 0
@@ -821,7 +862,7 @@ class Trainer:
             val_loss   = self._validate()
 
             print(
-                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | total={train_loss['total']:.3f}"
+                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | cls={train_loss.get('classifier', 0.0):.3f} | total={train_loss['total']:.3f}"
             )
             print(
                 f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | total={val_loss['total']:.3f}"
