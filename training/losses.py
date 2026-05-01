@@ -311,6 +311,30 @@ class MelSpectralStatsLoss(nn.Module):
 
 
 # ------------------------------------------------------------------
+# 3c. Speaker Classifier Loss - per-frame CE on decoder bottleneck
+# ------------------------------------------------------------------
+class SpeakerClassifierLoss(nn.Module):
+    """
+    Per-frame cross-entropy loss applied to decoder bottleneck features.
+    
+    Uses Conv1d(kernel=1) classifier → no GAP, no 1/T dilution.
+    Each frame receives an independent speaker identity gradient.
+    
+    Args:
+        logits: [B, num_speakers, T] from Conv1d classifier
+        target_indices: [B, T] expanded from batch["target_speaker_idx"]
+    Returns:
+        scalar cross-entropy loss
+    """
+    def forward(
+        self,
+        logits: torch.Tensor,           # [B, num_speakers, T]
+        target_indices: torch.Tensor,   # [B, T]
+    ) -> torch.Tensor:
+        return F.cross_entropy(logits, target_indices)
+
+
+# ------------------------------------------------------------------
 # 4. Aggregator – easy extension point for new terms
 # ------------------------------------------------------------------
 class VCGeneratorLoss(nn.Module):

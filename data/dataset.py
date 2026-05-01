@@ -45,6 +45,7 @@ class TrainingPair:
     utterance_id: str              # Unique utterance identifier
     ref_duration: float            # Reference segment duration (seconds)
     content_duration: float        # Content segment duration (seconds)
+    speaker_idx: int = -1          # Integer index for speaker classifier CE loss
     content_feats: Optional[torch.Tensor] = None # Added for precomputed HuBERT
     speaker_feats: Optional[torch.Tensor] = None # Added for precomputed ECAPA
 
@@ -313,6 +314,14 @@ class VoiceConversionDataset(Dataset):
         self.speakers = self._discover_speakers()
         self.split_speakers = self._split_speakers()
         
+        # Build speaker-to-index mapping for classifier head
+        all_speakers = set()
+        for split_speakers_list in self.split_speakers.values():
+            all_speakers.update(split_speakers_list)
+        self.speaker_to_idx = {spk: i for i, spk in enumerate(sorted(all_speakers))}
+        self.num_speakers = len(self.speaker_to_idx)
+        print(f"  Speaker vocab: {self.num_speakers} total speakers across all splits")
+        
         # Get utterances for current split
         self.utterances = self._get_split_utterances()
 
@@ -568,6 +577,7 @@ class VoiceConversionDataset(Dataset):
         if cache_file.exists():
             try:
                 cached = torch.load(cache_file, map_location='cpu')
+                speaker_idx = self.speaker_to_idx.get(speaker_id, -1)
                 return TrainingPair(
                     ref_audio=None,
                     ref_mel=None, 
@@ -576,6 +586,7 @@ class VoiceConversionDataset(Dataset):
                     alignment_quality=1.0,
                     speaker_id=speaker_id,
                     utterance_id=utterance_id,
+                    speaker_idx=speaker_idx,
                     ref_duration=0.0,
                     content_duration=0.0,
                     content_feats=cached['content_feats'],
@@ -591,6 +602,7 @@ class VoiceConversionDataset(Dataset):
 
         ref_audio, ref_mel, content_audio, _, alignment_quality = result  # UNPACK ref_audio
 
+        speaker_idx = self.speaker_to_idx.get(speaker_id, -1)
         training_pair = TrainingPair(
             ref_audio=ref_audio,      # ADD THIS
             ref_mel=ref_mel,
@@ -599,6 +611,7 @@ class VoiceConversionDataset(Dataset):
             alignment_quality=alignment_quality,
             speaker_id=speaker_id,
             utterance_id=utterance_id,
+            speaker_idx=speaker_idx,
             ref_duration=ref_mel.shape[1] * self.audio_config.frame_shift_reference / 1000.0,
             content_duration=len(content_audio) / self.audio_config.sample_rate
         )
@@ -744,6 +757,7 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
     speaker_feats_list = []
     alignment_qualities = []
     speaker_ids = []
+    speaker_indices = []
     utterance_ids = []
     ref_durs = []
     content_durs = []
@@ -757,6 +771,7 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
         speaker_feats_list.append(pair.speaker_feats)
         alignment_qualities.append(pair.alignment_quality)
         speaker_ids.append(pair.speaker_id)
+        speaker_indices.append(pair.speaker_idx)
         utterance_ids.append(pair.utterance_id)
         ref_durs.append(pair.ref_duration)
         content_durs.append(pair.content_duration)
@@ -838,6 +853,7 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
         "content_mel":       content_mels,             # list – untouched (usually None)
         "alignment_quality": torch.tensor(alignment_qualities, dtype=torch.float32),
         "speaker_id":        speaker_ids,              # list of speaker IDs
+        "target_speaker_idx":torch.tensor(speaker_indices, dtype=torch.long),  # (B,) integer indices for CE loss
         "utterance_id":      utterance_ids,            # list of utterance IDs
         "ref_duration":      torch.tensor(ref_durs, dtype=torch.float32),
         "content_duration":  torch.tensor(content_durs, dtype=torch.float32),

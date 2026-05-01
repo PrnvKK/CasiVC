@@ -153,6 +153,9 @@ class TrainingConfig:
   cross_pair_prob: float = 0.25          # probability of applying cross-pair in a batch
   cross_pair_stats_weight: float = 2.0   # weight multiplier for cross-pair Mel Stats loss
 
+  # Speaker classifier head at decoder bottleneck
+  classifier_weight: float = 0.1         # weight for per-frame CE loss on target speaker ID
+
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
   lambda_adv: float = 0.0
