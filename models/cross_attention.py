@@ -103,7 +103,6 @@ class PositionAgnosticCrossAttention(nn.Module):
         
         # Layer normalization
         self.layer_norm = nn.LayerNorm(self.d_model)
-        self.key_norm = nn.LayerNorm(self.d_model)
         
         # Dropout
         self.dropout = nn.Dropout(self.dropout_rate)
@@ -273,7 +272,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         # Projection
         # ------------------------------------------------------------------
         queries = self.content_proj(content_features)
-        keys    = self.key_norm(self.speaker_proj(speaker_features))
+        keys    = self.speaker_proj(speaker_features)
         values  = self.speaker_val_proj(speaker_features)  # separate projection
 
         # Check query diversity (debug — always use first batch item only)
@@ -342,6 +341,12 @@ class PositionAgnosticCrossAttention(nn.Module):
 
         print(f"[cross_attn] attended_features shape: {attended_features.shape}")
         print(f"[cross_attn] attended_features stats: mean={attended_features.mean():.4f}, "
+              f"std={attended_features.std():.4f}")
+
+        # LayerNorm prevents magnitude collapse: regardless of attention softness,
+        # the mapping network sees unit-variance features → speaker differences are preserved
+        attended_features = self.layer_norm(attended_features)
+        print(f"[cross_attn] attended_features AFTER LayerNorm: mean={attended_features.mean():.4f}, "
               f"std={attended_features.std():.4f}")
 
         print(f"[cross_attn] attention_weights shape: {attention_weights.shape}")
