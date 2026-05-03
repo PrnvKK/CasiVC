@@ -70,7 +70,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         self.head_dim = self.d_model // self.num_heads
 
         #self.alpha = nn.Parameter(torch.tensor(0.1))
-        self.alpha = nn.Parameter(torch.tensor(2.0))
+        self.alpha = nn.Parameter(torch.tensor(0.5))   # conservative: content preservation > speaker injection
 
         # Learnable attention temperature (softplus-constrained, starts ≈0.5 for moderate sharpening)
         self.raw_temperature = nn.Parameter(torch.tensor(-0.432))  # F.softplus(-0.432) ≈ 0.5
@@ -397,7 +397,10 @@ class PositionAgnosticCrossAttention(nn.Module):
                   f"max={gamma_per_channel_std.max():.4f}, min={gamma_per_channel_std.min():.4f}")
             print(f"[cross_attn] FiLM gamma top-3 volatile channels: "
                   f"{list(zip(top3_idx[0].tolist(), [f'{v:.4f}' for v in top3_vals[0].tolist()]))}")
-            attended_features = self.alpha * attended_features + (residual_norm * (1.0 + gamma) + beta)
+            # Clamp gamma to prevent content inversion: (1+gamma) stays in [-0.5, +2.5]
+            # instead of [-2, +4]. Content remains audible, speaker modulation is bounded.
+            gamma_clamped = torch.clamp(gamma, -1.5, 1.5)
+            attended_features = self.alpha * attended_features + (residual_norm * (1.0 + gamma_clamped) + beta)
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")
