@@ -234,6 +234,9 @@ class MobileNetDecoder(nn.Module):
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
+        # Learnable per-band gain to prevent variance compression
+        self.mel_gain = nn.Parameter(torch.ones(80))
+
 
     # ---------------------------------------------------------------------- #
     #  Forward                                                               #
@@ -344,6 +347,12 @@ class MobileNetDecoder(nn.Module):
         
         # Mel projection
         mel = self.mel_proj(x)
+        
+        # Apply per-band gain before clamping
+        mel = mel * self.mel_gain.view(1, -1, 1)
+        
+        print(f"✅ mel_gain        mean={self.mel_gain.mean().item():7.4f}  std={self.mel_gain.std().item():7.4f}")
+        
         mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
         self._check(mel, "mel_proj")
         

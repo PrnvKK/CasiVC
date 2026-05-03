@@ -434,6 +434,25 @@ class VCGeneratorLoss(nn.Module):
                     outs["speaker"] = outs["speaker"] + (self.cfg.lambda_spk * l_spk_wave)
             except Exception as exc:
                 raise RuntimeError(f"Speaker/Stats loss failed: {exc}") from exc
+                
+        min_t_var = min(pred_mel.size(-1), gt_mel.size(-1))
+        pred_mel_var = pred_mel[..., :min_t_var]
+        gt_mel_var = gt_mel[..., :min_t_var]
+        
+        if hasattr(self.cfg, 'lambda_var') and self.cfg.lambda_var > 0:
+            var_loss = F.l1_loss(pred_mel_var.std(dim=-1), gt_mel_var.std(dim=-1))
+            outs["var"] = self.cfg.lambda_var * var_loss
+            
+        if hasattr(self.cfg, 'lambda_var_local') and self.cfg.lambda_var_local > 0:
+            window = getattr(self.cfg, 'var_window_size', 5)
+            # Unfold creates overlapping windows of size `window` along the time dimension (dim=-1)
+            if pred_mel_var.size(-1) >= window:
+                pred_windows = pred_mel_var.unfold(-1, window, 1)  # [B, 80, T-w+1, w]
+                gt_windows = gt_mel_var.unfold(-1, window, 1)
+                pred_local_std = pred_windows.std(dim=-1)       # [B, 80, T-w+1]
+                gt_local_std = gt_windows.std(dim=-1)
+                var_local_loss = F.l1_loss(pred_local_std, gt_local_std)
+                outs["var"] = outs.get("var", 0.0) + self.cfg.lambda_var_local * var_local_loss
         
         return outs
 

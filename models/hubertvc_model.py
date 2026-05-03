@@ -318,10 +318,16 @@ class HubertVCModel(nn.Module):
         
         # Process entire batch at once - each item uses its OWN speaker conditioning
         # content_feats: [B, T, 96], speaker_feats: [B, 64, 96]
-        fused_features = self.cross_attn(
+        cross_attn_out = self.cross_attn(
             content_feats,  # [B, T, 96]
-            speaker_feats   # [B, 64, 96]
+            speaker_feats,  # [B, 64, 96]
+            return_aux=return_aux,
         )
+        cross_attn_aux: Dict[str, Any] | None = None
+        if return_aux:
+            fused_features, cross_attn_aux = cross_attn_out
+        else:
+            fused_features = cross_attn_out
         # fused_features: [B, T, 96]
 
         # Decoder runs at Mel frame rate (proper 1.25x interpolation via Conv1D)
@@ -341,7 +347,8 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         # Force FP32 for decoder to avoid NaN gradients
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            if return_bottleneck and self.speaker_classifier is not None:
+            if return_bottleneck:
+                # Always request intermediate features when bottleneck is needed
                 pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True)
             else:
                 pred_mel = self.decoder(resampled_features.float())  # [B, 80, T_hubert]
@@ -410,18 +417,23 @@ class HubertVCModel(nn.Module):
               "speaker_tokens": speaker_feats,
               "content_length": fused_features.size(0),
           }
+            if cross_attn_aux is not None:
+                aux["cross_attn"] = cross_attn_aux
 
-        # Classifier head: per-frame speaker ID logits from decoder bottleneck
-        if return_bottleneck and self.speaker_classifier is not None:
-            bottleneck = intermediate[2]  # Block 2 output: [B, 192, T]
-            # Temporal smooth before classification: 3-frame AvgPool (~30ms)
-            # prevents per-frame CE gradient from injecting high-frequency jitter
-            bottleneck = F.avg_pool1d(bottleneck, kernel_size=3, stride=1, padding=1)
-            classifier_logits = self.speaker_classifier(bottleneck)  # [B, num_speakers, T]
+        # Classifier head + bottleneck diagnostics
+        if return_bottleneck:
+            bottleneck_raw = intermediate[2]  # Block 2 output: [B, 192, T]
             if aux is None:
                 aux = {}
-            aux["classifier_logits"] = classifier_logits
-            aux["bottleneck"] = bottleneck
+            aux["block2_std"] = bottleneck_raw.std().item()  # global std before smoothing
+            
+            if self.speaker_classifier is not None:
+                # Temporal smooth before classification: 3-frame AvgPool (~30ms)
+                # prevents per-frame CE gradient from injecting high-frequency jitter
+                bottleneck = F.avg_pool1d(bottleneck_raw, kernel_size=3, stride=1, padding=1)
+                classifier_logits = self.speaker_classifier(bottleneck)  # [B, num_speakers, T]
+                aux["classifier_logits"] = classifier_logits
+                aux["bottleneck"] = bottleneck
         
         return pred_mel, loss_dict, aux
 
