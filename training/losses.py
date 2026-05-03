@@ -11,7 +11,7 @@
 # ------------------------------------------------------------------
 
 from __future__ import annotations
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Any
 
 import torch
 import torch.nn.functional as F

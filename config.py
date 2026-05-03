@@ -147,9 +147,9 @@ class TrainingConfig:
 
   lambda_mel: float = 5.0      # was 45 — prevents memorizing exact mels, allows generalization
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
-  lambda_spk: float = 6.0      # was 1.0 — generalizes well, reward it more
-  lambda_var: float = 10.0     # direct variance loss
-  lambda_var_local: float = 3.0 # local windowed variance loss
+  lambda_spk: float = 15.0     # speaker identity MUST dominate — prevents average-voice collapse
+  lambda_var: float = 2.0      # global band-wise variance (stable spectral richness)
+  lambda_var_local: float = 1.0 # local windowed variance (frame-to-frame sharpness)
   var_window_size: int = 5      # size of sliding window
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
