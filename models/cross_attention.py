@@ -103,6 +103,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         
         # Layer normalization
         self.layer_norm = nn.LayerNorm(self.d_model)
+        self.key_norm = nn.LayerNorm(self.d_model)
         
         # Dropout
         self.dropout = nn.Dropout(self.dropout_rate)
@@ -238,9 +239,14 @@ class PositionAgnosticCrossAttention(nn.Module):
         
         return content_features, speaker_features
     
-    def forward(self, content_features, speaker_features, return_attention=False):
+    def forward(self, content_features, speaker_features, return_attention=False, return_aux=False):
         """
         Forward pass of position-agnostic cross-attention.
+
+        Args:
+            return_attention: if True, return (attended_features, attention_weights)
+            return_aux: if True, return (attended_features, aux_dict) with diagnostic
+                        metrics (gamma, entropy, temperature, etc.)
         """
         print("\n" + "=" * 80)
         print("[cross_attn] >>> ENTERING CROSS ATTENTION FORWARD <<<")
@@ -267,7 +273,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         # Projection
         # ------------------------------------------------------------------
         queries = self.content_proj(content_features)
-        keys    = self.speaker_proj(speaker_features)
+        keys    = self.key_norm(self.speaker_proj(speaker_features))
         values  = self.speaker_val_proj(speaker_features)  # separate projection
 
         # Check query diversity (debug — always use first batch item only)
@@ -352,6 +358,8 @@ class PositionAgnosticCrossAttention(nn.Module):
         # ------------------------------------------------------------------
         # AdaIN-style Fusion
         # ------------------------------------------------------------------
+        gamma = None
+        gamma_temporal_std = None
         if self.enable_residual:
             residual = self.residual_proj(content_features)
             
@@ -384,7 +392,7 @@ class PositionAgnosticCrossAttention(nn.Module):
                   f"max={gamma_per_channel_std.max():.4f}, min={gamma_per_channel_std.min():.4f}")
             print(f"[cross_attn] FiLM gamma top-3 volatile channels: "
                   f"{list(zip(top3_idx[0].tolist(), [f'{v:.4f}' for v in top3_vals[0].tolist()]))}")
-            attended_features = attended_features + (residual_norm * (1.0 + gamma) + beta)
+            attended_features = self.alpha * attended_features + (residual_norm * (1.0 + gamma) + beta)
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")
@@ -394,6 +402,15 @@ class PositionAgnosticCrossAttention(nn.Module):
         else:
             print(f"[cross_attn] alpha grad: None")
 
+        if return_aux:
+            aux = {
+                "attention_weights": attention_weights.detach(),
+                "entropy": entropy.detach(),
+                "temperature": temperature.detach(),
+                "gamma": gamma.detach() if gamma is not None else None,
+                "gamma_temporal_std": gamma_temporal_std.detach() if gamma_temporal_std is not None else None,
+            }
+            return attended_features, aux
         if return_attention:
             return attended_features, attention_weights
         return attended_features

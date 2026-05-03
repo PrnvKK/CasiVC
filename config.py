@@ -147,10 +147,13 @@ class TrainingConfig:
 
   lambda_mel: float = 5.0      # was 45 — prevents memorizing exact mels, allows generalization
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
-  lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
+  lambda_spk: float = 6.0      # was 1.0 — generalizes well, reward it more
+  lambda_var: float = 10.0     # direct variance loss
+  lambda_var_local: float = 3.0 # local windowed variance loss
+  var_window_size: int = 5      # size of sliding window
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
-  cross_pair_prob: float = 0.25          # probability of applying cross-pair in a batch
+  cross_pair_prob: float = 0.50          # probability of applying cross-pair in a batch
   cross_pair_stats_weight: float = 2.0   # weight multiplier for cross-pair Mel Stats loss
 
   # Speaker classifier head at decoder bottleneck
