@@ -434,7 +434,36 @@ class VCGeneratorLoss(nn.Module):
                     outs["speaker"] = outs["speaker"] + (self.cfg.lambda_spk * l_spk_wave)
             except Exception as exc:
                 raise RuntimeError(f"Speaker/Stats loss failed: {exc}") from exc
-        
+
+        # Mel variance loss — penalizes compressed dynamic range (pred σ ≈ 1.3 vs GT σ ≥ 2.5)
+        if hasattr(self.cfg, 'lambda_var') and self.cfg.lambda_var > 0:
+            try:
+                if gt_lengths is not None:
+                    B, N = pred_mel.shape[0], pred_mel.shape[1]
+                    # Align time dimensions: decoder may produce 1-2 fewer frames than GT
+                    T_common = min(pred_mel.size(-1), gt_mel.size(-1))
+                    pred_aligned = pred_mel[:, :, :T_common]
+                    gt_aligned = gt_mel[:, :, :T_common]
+                    lengths = gt_lengths.clamp(max=T_common)
+                    mask = (torch.arange(T_common, device=pred_mel.device)[None, None, :] < lengths[:, None, None]).float()
+                    valid_counts = lengths.float().clamp(min=1.0)  # [B]
+                    # Masked mean per band
+                    pred_mean = (pred_aligned * mask).sum(dim=-1) / valid_counts[:, None]
+                    tgt_mean = (gt_aligned * mask).sum(dim=-1) / valid_counts[:, None]
+                    # Masked variance per band
+                    pred_sq = ((pred_aligned - pred_mean[:, :, None]) ** 2) * mask
+                    tgt_sq = ((gt_aligned - tgt_mean[:, :, None]) ** 2) * mask
+                    pred_std = torch.sqrt(pred_sq.sum(dim=-1) / valid_counts[:, None] + 1e-8)
+                    tgt_std = torch.sqrt(tgt_sq.sum(dim=-1) / valid_counts[:, None] + 1e-8)
+                else:
+                    T_common = min(pred_mel.size(-1), gt_mel.size(-1))
+                    pred_std = pred_mel[:, :, :T_common].std(dim=-1)  # [B, 80]
+                    tgt_std = gt_mel[:, :, :T_common].std(dim=-1)
+                l_var = F.l1_loss(pred_std, tgt_std)
+                outs["var"] = self.cfg.lambda_var * l_var
+            except Exception as exc:
+                raise RuntimeError(f"Variance loss failed: {exc}") from exc
+
         return outs
 
 

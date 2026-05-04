@@ -130,7 +130,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         nn.init.xavier_uniform_(self.content_proj.weight, gain=1.0)
         nn.init.zeros_(self.content_proj.bias)
 
-        nn.init.xavier_uniform_(self.speaker_proj.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.speaker_proj.weight, gain=1.0)
         nn.init.zeros_(self.speaker_proj.bias)
 
         nn.init.xavier_uniform_(self.speaker_val_proj.weight, gain=1.0)
@@ -313,6 +313,7 @@ class PositionAgnosticCrossAttention(nn.Module):
 
         attn_probs = F.softmax(scores, dim=-1)
         entropy = -(attn_probs * torch.log(attn_probs + 1e-9)).sum(-1).mean()
+        self._cached_entropy = entropy  # trainer accesses this for entropy hinge loss
 
         print(f"[cross_attn] attention probs std: {attn_probs.std():.4f}")
         print(f"[cross_attn] attention entropy: {entropy:.4f} "
@@ -362,11 +363,11 @@ class PositionAgnosticCrossAttention(nn.Module):
             residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
             
             # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
-            # Route attention-weighted features (not pooled speaker tokens) through
-            # the mapping network. This produces per-frame gamma/beta that varies
-            # with which speaker tokens each frame attends to — enabling dynamic,
-            # phoneme-aware timbre modulation instead of a static global EQ shift.
-            style_stats = self.mapping_network(self.film_norm(attended_features))  # [B, T, 192]
+            # film_norm REMOVED: LayerNorm was amplifying attended_features (std≈0.15) by ~6-7x
+            # into unit-variance noise, feeding the mapping network amplified random routing signal.
+            # Without film_norm, mapping network sees true attended magnitude — lower but honest.
+            # Mapping network weights will re-calibrate over a few epochs to the new input scale.
+            style_stats = self.mapping_network(attended_features)  # [B, T, 192]
             
             gamma, beta = style_stats.chunk(2, dim=-1)                              # [B, T, 96] each
             

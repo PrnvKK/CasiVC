@@ -349,7 +349,7 @@ class Trainer:
       # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "total": 0.0}
+        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0}
         num_batches = 0
 
         pbar = tqdm(self.train_loader, desc=f"Train | epoch {self.start_epoch}", leave=False)
@@ -416,6 +416,16 @@ class Trainer:
             
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()
+
+            # --- Entropy hinge: penalizes attention > 1.2 (uniform=2.08). One-sided — no cost if sharp. ---
+            lambda_entropy = getattr(self.train_cfg, 'lambda_entropy', 0.0)
+            if lambda_entropy > 0 and hasattr(self.model.cross_attn, '_cached_entropy'):
+                entropy_val = self.model.cross_attn._cached_entropy
+                entropy_hinge = torch.clamp(entropy_val - 1.2, min=0.0)
+                total = total + lambda_entropy * entropy_hinge
+                loss_accum["entropy"] += entropy_hinge.item()
+                if num_batches == 0:
+                    print(f"[ENTROPY_HINGE] raw_entropy={entropy_val.item():.4f}, hinge={entropy_hinge.item():.4f}, weighted={lambda_entropy * entropy_hinge.item():.4f}")
             
             # --- Speaker classifier CE loss (self-pair, per-frame, no dilution) ---
             if need_bottleneck and aux is not None and "classifier_logits" in aux:
@@ -709,6 +719,7 @@ class Trainer:
                 "mel": f"{losses.get('mel', torch.tensor(0.)).item():.3f}",
                 "stft": f"{losses.get('stft', torch.tensor(0.)).item():.3f}",
                 "spk": f"{losses.get('speaker', torch.tensor(0.)).item():.3f}",
+                "var": f"{losses.get('var', torch.tensor(0.)).item():.3f}",
                 "tot": f"{total.item():.3f}",
             }
             if need_bottleneck:
@@ -736,7 +747,7 @@ class Trainer:
     def _validate(self) -> dict:
         self.model.eval()
         self.vocoder.eval()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "total": 0.0}
+        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "var": 0.0, "total": 0.0}
         num_batches = 0
 
         for batch in tqdm(self.val_loader, desc="Valid", leave=False):
@@ -754,6 +765,7 @@ class Trainer:
                 
             gt_mel = batch["gt_mel"].to(self.device)
             gt_wave = batch["gt_wave"].to(self.device)
+            gt_lengths = batch["gt_lengths"].to(self.device) if batch.get("gt_lengths") is not None else None
 
             # Forward pass - NOW USES ref_audio and optionally precomputed features
             pred_mel, _, _ = self.model(
@@ -769,7 +781,7 @@ class Trainer:
 
             # Same-domain STFT ground truth
             gt_wave_vocoded = None
-            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded)
+            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths)
 
             total = losses.total()
 
@@ -862,10 +874,10 @@ class Trainer:
             val_loss   = self._validate()
 
             print(
-                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | cls={train_loss.get('classifier', 0.0):.3f} | total={train_loss['total']:.3f}"
+                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | var={train_loss.get('var', 0.0):.3f} | cls={train_loss.get('classifier', 0.0):.3f} | total={train_loss['total']:.3f}"
             )
             print(
-                f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | total={val_loss['total']:.3f}"
+                f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | var={val_loss.get('var', 0.0):.3f} | total={val_loss['total']:.3f}"
             )
 
 
