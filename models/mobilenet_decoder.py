@@ -234,6 +234,10 @@ class MobileNetDecoder(nn.Module):
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
+        # raw_per_band_scale removed: proven identifiable with mel_proj Conv1d weights.
+        # 6400 W params absorb any scale the 80 scale params try to set → scale stays frozen at init.
+        # Replaced by residual mel_proj in forward (Option B).
+
 
     # ---------------------------------------------------------------------- #
     #  Forward                                                               #
@@ -342,8 +346,13 @@ class MobileNetDecoder(nn.Module):
               intermediate.append(x)
           
         
-        # Mel projection
-        mel = self.mel_proj(x)
+        # Residual mel_proj (Option B): mel = x + mel_proj(x)
+        # Identity path structurally preserves block 3 std (~2.0-2.3) at init.
+        # mel_proj learns residual corrections only. Bias=-4.5 shifts mean to log-mel range.
+        # Block3 out: [B,80,T] → mel_proj: Conv1d(80,80,k=1) → [B,80,T] → residual sum.
+        mel = x + self.mel_proj(x)
+        print(f"[decoder] residual_mel: pre-clamp mean={mel.mean():.4f}, std={mel.std():.4f}")
+
         mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
         self._check(mel, "mel_proj")
         
