@@ -426,6 +426,7 @@ class Trainer:
                 loss_accum["entropy"] += entropy_hinge.item()
                 if num_batches == 0:
                     print(f"[ENTROPY_HINGE] raw_entropy={entropy_val.item():.4f}, hinge={entropy_hinge.item():.4f}, weighted={lambda_entropy * entropy_hinge.item():.4f}")
+
             
             # --- Speaker classifier CE loss (self-pair, per-frame, no dilution) ---
             if need_bottleneck and aux is not None and "classifier_logits" in aux:
@@ -874,7 +875,7 @@ class Trainer:
             val_loss   = self._validate()
 
             print(
-                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | var={train_loss.get('var', 0.0):.3f} | cls={train_loss.get('classifier', 0.0):.3f} | total={train_loss['total']:.3f}"
+                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | var={train_loss.get('var', 0.0):.3f} | cls={train_loss.get('classifier', 0.0):.3f} | ent_h={train_loss.get('entropy', 0.0):.3f} | gam_h={train_loss.get('gamma', 0.0):.3f} | total={train_loss['total']:.3f}"
             )
             print(
                 f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | var={val_loss.get('var', 0.0):.3f} | total={val_loss['total']:.3f}"

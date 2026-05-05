@@ -107,9 +107,18 @@ class PositionAgnosticCrossAttention(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(self.dropout_rate)
         
-        # LayerNorm before mapping network — normalizes attended_features input
-        # so the mapping network sees stable, zero-mean unit-variance features
-        self.film_norm = nn.LayerNorm(self.d_model)
+        # LayerNorm before mapping network — KEPT for reference but NO LONGER CALLED in forward.
+        # film_norm was removed in Phase 2 because it amplified attended_features (~0.15 std)
+        # by ~6-7x into unit-variance noise when Q-K spaces were orthogonal.
+        self.film_norm = nn.LayerNorm(self.d_model)  # retained in state_dict for compat
+
+        # Learnable FiLM output scale — compensates for film_norm removal.
+        # Without film_norm, mapping network sees attended_features std≈0.15-0.22 instead of
+        # std≈1.0, so its outputs are proportionally smaller. This scalar scales gamma/beta
+        # back to meaningful modulation range WITHOUT reintroducing normalization noise.
+        # Softplus reparameterization: scale = softplus(raw) + 0.5, always > 0.5
+        # Init: softplus(1.3) ≈ 1.5 + 0.5 = 2.0 — conservative start, learns upward if needed.
+        self.raw_film_scale = nn.Parameter(torch.tensor(1.3))
 
         # AdaIN Mapping Network
         # Converts attention-weighted speaker features into per-frame
@@ -370,12 +379,26 @@ class PositionAgnosticCrossAttention(nn.Module):
             style_stats = self.mapping_network(attended_features)  # [B, T, 192]
             
             gamma, beta = style_stats.chunk(2, dim=-1)                              # [B, T, 96] each
-            
+
+            # Apply learnable FiLM output scale (compensates for film_norm removal)
+            film_scale = F.softplus(self.raw_film_scale) + 0.5  # always > 0.5, starts ≈2.0
+            gamma = gamma * film_scale
+            beta  = beta  * film_scale
+
+            # β DC removal: subtract per-channel temporal mean to zero the speaker-specific
+            # mel mean offset. Proven cause: B→B and B→A share identical content but their
+            # mel mean differs by +1.0 unit (B→B mean=−3.245, B→A mean=−4.244) — only β
+            # can produce this shift since residual_norm is zero-mean. dim=1 removes the
+            # temporal DC [B,1,96] while preserving per-frame variation (the AC component).
+            beta = beta - beta.mean(dim=1, keepdim=True)
+
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
+            print(f"[cross_attn] FiLM scale: {film_scale.item():.4f}")
             print(f"[cross_attn] FiLM gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}, "
                   f"min={gamma.min():.4f}, max={gamma.max():.4f}")
             gamma_temporal_std = gamma.std(dim=1).mean()  # std across time → per-frame variation
+            self._cached_gamma_std = gamma_temporal_std   # retained for external monitoring
             print(f"[cross_attn] FiLM gamma temporal std: {gamma_temporal_std:.4f} "
                   f"(>0.01 = per-frame modulation active)")
             # Per-channel variance: are a few mel bins being modulated 10× more than others?
