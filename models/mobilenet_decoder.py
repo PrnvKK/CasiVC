@@ -234,9 +234,9 @@ class MobileNetDecoder(nn.Module):
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
-        # raw_per_band_scale removed: proven identifiable with mel_proj Conv1d weights.
-        # 6400 W params absorb any scale the 80 scale params try to set → scale stays frozen at init.
-        # Replaced by residual mel_proj in forward (Option B).
+        # Option A: Mean-Decoupled Deviation Scaling
+        # Initializes softplus(1.0) ≈ 1.31 to structurally amplify deviations.
+        self.output_scale = nn.Parameter(torch.ones(80))
 
 
     # ---------------------------------------------------------------------- #
@@ -346,12 +346,16 @@ class MobileNetDecoder(nn.Module):
               intermediate.append(x)
           
         
-        # Residual mel_proj (Option B): mel = x + mel_proj(x)
-        # Identity path structurally preserves block 3 std (~2.0-2.3) at init.
-        # mel_proj learns residual corrections only. Bias=-4.5 shifts mean to log-mel range.
-        # Block3 out: [B,80,T] → mel_proj: Conv1d(80,80,k=1) → [B,80,T] → residual sum.
-        mel = x + self.mel_proj(x)
-        print(f"[decoder] residual_mel: pre-clamp mean={mel.mean():.4f}, std={mel.std():.4f}")
+        # Option A: Mean-Decoupled Deviation Scaling
+        # The L1 loss penalizes variance. By decoupling the mean from the deviations,
+        # the gradient for 'output_scale' consistently points upwards, resisting the L1 collapse.
+        mel_raw = self.mel_proj(x)
+        mel_mean = mel_raw.mean(dim=-1, keepdim=True)
+        
+        scale = F.softplus(self.output_scale).view(1, -1, 1)
+        mel = mel_mean + (mel_raw - mel_mean) * scale
+        
+        print(f"[decoder] option_a_mel: pre-clamp mean={mel.mean():.4f}, std={mel.std():.4f}, scale_mean={scale.mean():.4f}, scale_min={scale.min():.4f}, scale_max={scale.max():.4f}")
 
         mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
         self._check(mel, "mel_proj")
