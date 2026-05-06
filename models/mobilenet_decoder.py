@@ -346,16 +346,20 @@ class MobileNetDecoder(nn.Module):
               intermediate.append(x)
           
         
-        # Option A: Mean-Decoupled Deviation Scaling
-        # The L1 loss penalizes variance. By decoupling the mean from the deviations,
-        # the gradient for 'output_scale' consistently points upwards, resisting the L1 collapse.
+        # Option C: Forced Variance Normalization
+        # By normalizing the raw deviations to a standard deviation of 1.0 before scaling, 
+        # we completely prevent the network from overfitting the amplitude via convolution weights.
+        # This mathematically forces the learnable 'output_scale' to be the sole driver of variance.
         mel_raw = self.mel_proj(x)
         mel_mean = mel_raw.mean(dim=-1, keepdim=True)
+        mel_std = mel_raw.std(dim=-1, keepdim=True) + 1e-6
+        
+        mel_norm = (mel_raw - mel_mean) / mel_std
         
         scale = F.softplus(self.output_scale).view(1, -1, 1)
-        mel = mel_mean + (mel_raw - mel_mean) * scale
+        mel = mel_mean + mel_norm * scale
         
-        print(f"[decoder] option_a_mel: pre-clamp mean={mel.mean():.4f}, std={mel.std():.4f}, scale_mean={scale.mean():.4f}, scale_min={scale.min():.4f}, scale_max={scale.max():.4f}")
+        print(f"[decoder] option_c_mel: pre-clamp mean={mel.mean():.4f}, std={mel.std():.4f}, scale_mean={scale.mean():.4f}, scale_min={scale.min():.4f}, scale_max={scale.max():.4f}")
 
         mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
         self._check(mel, "mel_proj")
