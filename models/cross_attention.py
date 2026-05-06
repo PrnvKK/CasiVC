@@ -72,8 +72,8 @@ class PositionAgnosticCrossAttention(nn.Module):
         #self.alpha = nn.Parameter(torch.tensor(0.1))
         self.alpha = nn.Parameter(torch.tensor(2.0))
 
-        # Learnable attention temperature (softplus-constrained, starts ≈0.7 for softer attention)
-        self.raw_temperature = nn.Parameter(torch.tensor(0.0))  # F.softplus(0.0) ≈ 0.69
+        # Learnable attention temperature (softplus-constrained, starts ≈0.35 for sharper attention)
+        self.raw_temperature = nn.Parameter(torch.tensor(-0.9))  # F.softplus(-0.9) ≈ 0.34
 
         # Multi-head attention (speaker features already at correct dimension)
         self.multihead_attn = nn.MultiheadAttention(

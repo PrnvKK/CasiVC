@@ -417,11 +417,11 @@ class Trainer:
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()
 
-            # --- Entropy hinge: penalizes attention < 1.5 (uniform=2.08). One-sided — prevents collapse. ---
+            # --- Entropy hinge: penalizes attention outside [1.0, 1.5] (uniform=2.08). Two-sided pocket. ---
             lambda_entropy = getattr(self.train_cfg, 'lambda_entropy', 0.0)
             if lambda_entropy > 0 and hasattr(self.model.cross_attn, '_cached_entropy'):
                 entropy_val = self.model.cross_attn._cached_entropy
-                entropy_hinge = torch.clamp(1.5 - entropy_val, min=0.0)
+                entropy_hinge = torch.clamp(1.0 - entropy_val, min=0.0) + torch.clamp(entropy_val - 1.5, min=0.0)
                 total = total + lambda_entropy * entropy_hinge
                 loss_accum["entropy"] += entropy_hinge.item()
                 if num_batches == 0:
