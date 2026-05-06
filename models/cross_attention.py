@@ -72,8 +72,8 @@ class PositionAgnosticCrossAttention(nn.Module):
         #self.alpha = nn.Parameter(torch.tensor(0.1))
         self.alpha = nn.Parameter(torch.tensor(2.0))
 
-        # Learnable attention temperature (softplus-constrained, starts ≈0.5 for moderate sharpening)
-        self.raw_temperature = nn.Parameter(torch.tensor(-0.432))  # F.softplus(-0.432) ≈ 0.5
+        # Learnable attention temperature (softplus-constrained, starts ≈0.7 for softer attention)
+        self.raw_temperature = nn.Parameter(torch.tensor(0.0))  # F.softplus(0.0) ≈ 0.69
 
         # Multi-head attention (speaker features already at correct dimension)
         self.multihead_attn = nn.MultiheadAttention(
@@ -309,7 +309,6 @@ class PositionAgnosticCrossAttention(nn.Module):
         print(f"[cross_attn] queries stats: mean={queries.mean():.4f}, std={queries.std():.4f}")
         print(f"[cross_attn] keys stats: mean={keys.mean():.4f}, std={keys.std():.4f}")
 
-        # ------------------------------------------------------------------
         # Raw attention scores (diagnostic only)
         # ------------------------------------------------------------------
         scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -319,14 +318,6 @@ class PositionAgnosticCrossAttention(nn.Module):
               f"std={scores.std():.4f}, "
               f"min={scores.min():.4f}, "
               f"max={scores.max():.4f}")
-
-        attn_probs = F.softmax(scores, dim=-1)
-        entropy = -(attn_probs * torch.log(attn_probs + 1e-9)).sum(-1).mean()
-        self._cached_entropy = entropy  # trainer accesses this for entropy hinge loss
-
-        print(f"[cross_attn] attention probs std: {attn_probs.std():.4f}")
-        print(f"[cross_attn] attention entropy: {entropy:.4f} "
-              f"(uniform≈{math.log(attn_probs.shape[-1]):.2f})")
 
         # ------------------------------------------------------------------
         # MultiheadAttention (with Learnable Temperature Scaling)
@@ -348,9 +339,16 @@ class PositionAgnosticCrossAttention(nn.Module):
         print(f"[cross_attn] attended_features stats: mean={attended_features.mean():.4f}, "
               f"std={attended_features.std():.4f}")
 
+        # Compute entropy ON THE SCALED ATTENTION WEIGHTS so gradients flow to temperature!
+        entropy = -(attention_weights * torch.log(attention_weights + 1e-9)).sum(-1).mean()
+        self._cached_entropy = entropy  # trainer accesses this for entropy hinge loss
+
         print(f"[cross_attn] attention_weights shape: {attention_weights.shape}")
         print(f"[cross_attn] attention_weights stats: mean={attention_weights.mean():.4f}, "
               f"std={attention_weights.std():.4f}")
+        print(f"[cross_attn] attention probs std: {attention_weights.std():.4f}")
+        print(f"[cross_attn] attention entropy: {entropy:.4f} "
+              f"(uniform≈{math.log(attention_weights.shape[-1]):.2f})")
 
         # ------------------------------------------------------------------
         # Dropout

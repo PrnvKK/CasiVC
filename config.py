@@ -148,7 +148,7 @@ class TrainingConfig:
   lambda_mel: float = 5.0      # was 45 — prevents memorizing exact mels, allows generalization
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
   lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
-  lambda_var: float = 4.0       # Raised from 2.5 — 4:5 ratio vs lambda_mel gives var loss a real chance; 30ep data shows 35-49% mel std deficit at 2.5
+  lambda_var: float = 15.0     # Raised from 4.0 to overcome L1 dominance and force the learnable scale to grow
   lambda_entropy: float = 0.5   # One-sided hinge: penalizes entropy > 1.2, zero cost if already sharp
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
