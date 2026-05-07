@@ -52,10 +52,13 @@ class LossOutputs(dict):
 # ------------------------------------------------------------------
 # 1. Mel-spectrogram reconstruction – L1 (+ optional L2 blend)
 # ------------------------------------------------------------------
-class MelSpectrogramLoss(nn.Module):
+class NormalizedMelLoss(nn.Module):
     """
-    L1 / L2 loss on log-mel spectrograms.
-    `weight_l1` controls the blend (1.0 = pure L1, 0.5 = 50-50).
+    Decouples structural (shape) reconstruction from absolute amplitude.
+    Computes L1 loss on zero-mean, unit-variance mel spectrograms.
+    This prevents the reconstruction loss from aggressively penalizing 
+    high-variance outputs before they are perfectly aligned, which 
+    otherwise causes variance collapse.
     """
     def __init__(self, weight_l1: float = 1.0) -> None:
         super().__init__()
@@ -76,17 +79,41 @@ class MelSpectrogramLoss(nn.Module):
             # Build a (B, T) boolean mask of real frames, broadcast over mels
             T = pred.size(-1)
             mask = (torch.arange(T, device=pred.device)[None, :] < lengths[:, None])  # (B, T)
+            mask_float = mask.unsqueeze(1).float()
+            valid_counts = lengths.float().clamp(min=1.0).view(-1, 1, 1)
+
+            p_mean = (pred * mask_float).sum(dim=-1, keepdim=True) / valid_counts
+            t_mean = (target * mask_float).sum(dim=-1, keepdim=True) / valid_counts
+
+            p_var = (((pred - p_mean)**2) * mask_float).sum(dim=-1, keepdim=True) / valid_counts
+            t_var = (((target - t_mean)**2) * mask_float).sum(dim=-1, keepdim=True) / valid_counts
+
+            p_std = torch.sqrt(p_var + 1e-6)
+            t_std = torch.sqrt(t_var + 1e-6)
+
+            pred_norm = (pred - p_mean) / p_std
+            target_norm = (target - t_mean) / t_std
+
             mask = mask.unsqueeze(1).expand_as(pred)  # (B, n_mels, T)
             # Only compute loss over real frames
-            l1 = (pred - target).abs()[mask].mean()
+            l1 = (pred_norm - target_norm).abs()[mask].mean()
             if self.weight_l1 >= 1.0 - 1e-6:
                 return l1
-            l2 = ((pred - target) ** 2)[mask].mean()
+            l2 = ((pred_norm - target_norm) ** 2)[mask].mean()
+            return self.weight_l1 * l1 + (1.0 - self.weight_l1) * l2
         else:
-            l1 = F.l1_loss(pred, target)
+            p_mean = pred.mean(dim=-1, keepdim=True)
+            t_mean = target.mean(dim=-1, keepdim=True)
+            p_std = pred.std(dim=-1, keepdim=True) + 1e-6
+            t_std = target.std(dim=-1, keepdim=True) + 1e-6
+
+            pred_norm = (pred - p_mean) / p_std
+            target_norm = (target - t_mean) / t_std
+
+            l1 = F.l1_loss(pred_norm, target_norm)
             if self.weight_l1 >= 1.0 - 1e-6:
                 return l1
-            l2 = F.mse_loss(pred, target)
+            l2 = F.mse_loss(pred_norm, target_norm)
 
         return self.weight_l1 * l1 + (1.0 - self.weight_l1) * l2
 
@@ -369,7 +396,7 @@ class VCGeneratorLoss(nn.Module):
         # --- Instantiate individual loss components ---
 
         # 1. Mel-spectrogram L1 reconstruction loss
-        self.mel_loss = MelSpectrogramLoss(weight_l1=0.7) # Using pure L1
+        self.mel_loss = NormalizedMelLoss(weight_l1=0.7) # Using Normalized L1
 
         # 2. Multi-resolution STFT loss
         self.stft_loss = MRSTFTLoss()
@@ -405,9 +432,9 @@ class VCGeneratorLoss(nn.Module):
 
         # --- Compute and weight each loss term ---
 
-        # Mel reconstruction loss (Raw L1)
+        # Mel reconstruction loss (Normalized L1)
         # Option C decoder normalization prevents Conv1d from overfitting amplitude.
-        # Raw L1 provides the single-hop gradient that drives output_scale upward.
+        # Normalized L1 prevents misaligned high-variance predictions from crushing scale.
         if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
             try:
                 # Mask computation
@@ -499,7 +526,7 @@ if __name__ == "__main__":  # pragma: no cover
     pred_mel = torch.randn(B, N_MEL, T_mel)
     gt_mel = torch.randn_like(pred_mel) * 0.8 # Make it slightly different
     pred_wave = torch.randn(B, T_wav)
-    gt_wave = torch.randn_like(pred_wav) * 0.9
+    gt_wave = torch.randn_like(pred_wave) * 0.9
 
     # --- Fake Speaker Encoder for testing ---
     class _DummySpeakerEncoder(nn.Module):
