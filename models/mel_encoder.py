@@ -123,7 +123,7 @@ class MelEncoder(nn.Module):
         # Projection
         self.projection = nn.Sequential(
             nn.Linear(self.ecapa_dim, self.num_speaker_tokens * self.output_dim),
-            nn.Tanh()   # bounds output to [-1, 1] without collapsing inter-speaker variance
+            nn.Tanh()  # bounds output to [-1, 1] while preserving inter-speaker amplitude differences
         )
 
         self._init_projection()

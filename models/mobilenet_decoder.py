@@ -235,8 +235,8 @@ class MobileNetDecoder(nn.Module):
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
         # Option A: Mean-Decoupled Deviation Scaling
-        # Initializes softplus(1.0) ≈ 1.31 to structurally amplify deviations.
-        self.output_scale = nn.Parameter(torch.ones(80))
+        # Initializes softplus(2.3) ≈ 2.4 to jump-start variance recovery for HiFi-GAN
+        self.output_scale = nn.Parameter(torch.ones(80) * 2.3)
 
 
     # ---------------------------------------------------------------------- #

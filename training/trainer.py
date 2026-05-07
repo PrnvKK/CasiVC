@@ -1,954 +1,560 @@
-# hubertvc/training/trainer.py
+# hubertvc/training/losses.py
 # ------------------------------------------------------------------
-#  Classic PyTorch training loop for HuBERT-VC
+# Baseline generator losses for HuBERT-VC
 #
-#  Features
-#    • configurable via config.py + CLI overrides
-#    • checkpointing:  last.ckpt (periodic)  &  best.ckpt (lowest val loss)
-#    • early-stopping on total validation loss
-#    • tqdm progress bar with mel / stft / aux / total / lr
-#    • frozen HiFi-GAN vocoder inside the loss loop (no grad)
+# 1.  Mel-spectrogram L1 loss                   – λ_mel
+# 2.  Multi-resolution STFT loss               – λ_rec
+# 3.  HuBERT content-consistency (cosine) loss – λ_aux
+#
+# The class VCGeneratorLoss wraps them and returns a LossOutputs
+# dict so that new loss terms can be plugged in with one line.
 # ------------------------------------------------------------------
 
 from __future__ import annotations
-import argparse
-import json
-import os
-import random
-import sys
-import time
-from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
-from torch.utils.data import DataLoader
-from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
-from tqdm import tqdm
+import torch.nn.functional as F
+from torch import nn
 
-from torch.cuda.amp import GradScaler, autocast
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning,
+                        message="stft with return_complex=False")
+
+# ------------------------------------------------------------------
+# Config fallback (allows standalone `python losses.py` test)
+# ------------------------------------------------------------------
+try:
+    from config import TrainingConfig   # project config
+except Exception:
+    print("USING EXCEPTION IN LOSSESSS")                        # pragma: no cover
+    class TrainingConfig:               # minimal stub
+        lambda_mel = 1.0
+        lambda_rec = 10.0
+        lambda_aux = 0.3
+        lambda_adv = 0.0
+        lambda_feat = 0.0
+        # default STFT schedule (HiFi-GAN)
+        stft_fft_sizes = (512, 1024, 2048)
+        stft_hop_sizes = (128, 256, 512)
+        stft_win_lengths = (512, 1024, 2048)
 
 
+# ------------------------------------------------------------------
+# Helper container
+# ------------------------------------------------------------------
+class LossOutputs(dict):
+    """Dict[str, Tensor] with `.total()` convenience method."""
+    def total(self) -> torch.Tensor:
+        return sum(v for v in self.values())
 
 
-import torch
-import random
-import numpy as np
+# ------------------------------------------------------------------
+# 1. Mel-spectrogram reconstruction – L1 (+ optional L2 blend)
+# ------------------------------------------------------------------
+class NormalizedMelLoss(nn.Module):
+    """
+    Decouples structural (shape) reconstruction from absolute amplitude.
+    Computes L1 loss on zero-mean, unit-variance mel spectrograms.
+    This prevents the reconstruction loss from aggressively penalizing 
+    high-variance outputs before they are perfectly aligned, which 
+    otherwise causes variance collapse.
+    """
+    def __init__(self, weight_l1: float = 1.0) -> None:
+        super().__init__()
+        self.weight_l1 = float(weight_l1)
 
-torch.manual_seed(0)
-random.seed(0)
-np.random.seed(0)
+    def forward(
+        self,
+        pred: torch.Tensor,             # (B, n_mels, T)
+        target: torch.Tensor,           # (B, n_mels, T)
+        lengths: torch.Tensor = None,   # (B,) real frame counts — excludes padding
+    ) -> torch.Tensor:
+        if pred.shape != target.shape:
+            min_t = min(pred.size(-1), target.size(-1))
+            pred   = pred[..., :min_t]
+            target = target[..., :min_t]
 
-torch.cuda.manual_seed_all(0)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+        if lengths is not None:
+            # Build a (B, T) boolean mask of real frames, broadcast over mels
+            T = pred.size(-1)
+            mask = (torch.arange(T, device=pred.device)[None, :] < lengths[:, None])  # (B, T)
+            mask_float = mask.unsqueeze(1).float()
+            valid_counts = lengths.float().clamp(min=1.0).view(-1, 1, 1)
 
-# ───────────────────────────────────────────────────────────────────
-#  Project imports
-# ───────────────────────────────────────────────────────────────────
-from config import (
-    AudioConfig,
-    DataConfig,
-    ModelConfig,
-    TrainingConfig,
-    PathConfig,
-)
-from data.dataset import (
-    VoiceConversionDataset,
-    collate_training_pairs,
-)
-from data.audio_utils import extract_mel_spectrogram
-from models.hubertvc_model import HubertVCModel
-from training.losses import VCGeneratorLoss, SpeakerClassifierLoss
-from inference import load_vocoder, load_speaker_encoder  # thin wrapper to HiFi-GAN
-from models.mobilenet_decoder import MobileNetDecoder
+            p_mean = (pred * mask_float).sum(dim=-1, keepdim=True) / valid_counts
+            t_mean = (target * mask_float).sum(dim=-1, keepdim=True) / valid_counts
 
-def print_gradients(module, module_name):
-    print(f"\n[GRADIENT CHECK] {module_name}")
-    for name, param in module.named_parameters():
-        if param.grad is None:
-            print(f"  {name}: grad is None")
+            p_var = (((pred - p_mean)**2) * mask_float).sum(dim=-1, keepdim=True) / valid_counts
+            t_var = (((target - t_mean)**2) * mask_float).sum(dim=-1, keepdim=True) / valid_counts
+
+            p_std = torch.sqrt(p_var + 1e-6)
+            t_std = torch.sqrt(t_var + 1e-6)
+
+            pred_norm = (pred - p_mean) / p_std
+            target_norm = (target - t_mean) / t_std
+
+            mask = mask.unsqueeze(1).expand_as(pred)  # (B, n_mels, T)
+            # Only compute loss over real frames
+            l1 = (pred_norm - target_norm).abs()[mask].mean()
+            if self.weight_l1 >= 1.0 - 1e-6:
+                return l1
+            l2 = ((pred_norm - target_norm) ** 2)[mask].mean()
+            return self.weight_l1 * l1 + (1.0 - self.weight_l1) * l2
         else:
-            grad_mean = param.grad.abs().mean().item()
-            grad_max = param.grad.abs().max().item()
-            grad_min = param.grad.abs().min().item()
-            print(f"  {name}: mean={grad_mean:.6e}, max={grad_max:.6e}, min={grad_min:.6e}")
+            p_mean = pred.mean(dim=-1, keepdim=True)
+            t_mean = target.mean(dim=-1, keepdim=True)
+            p_std = pred.std(dim=-1, keepdim=True) + 1e-6
+            t_std = target.std(dim=-1, keepdim=True) + 1e-6
+
+            pred_norm = (pred - p_mean) / p_std
+            target_norm = (target - t_mean) / t_std
+
+            l1 = F.l1_loss(pred_norm, target_norm)
+            if self.weight_l1 >= 1.0 - 1e-6:
+                return l1
+            l2 = F.mse_loss(pred_norm, target_norm)
+
+        return self.weight_l1 * l1 + (1.0 - self.weight_l1) * l2
 
 
-# ==================================================================
-#                           Trainer
-# ==================================================================
-class Trainer:
-    def __init__(self, args: argparse.Namespace) -> None:
-        # ----------------------------------------------------------
-        # 1. configs (instantiate once; may be mutated by CLI flags)
-        # ----------------------------------------------------------
-        self.audio_cfg = AudioConfig()
-        self.data_cfg = DataConfig()
-        self.model_cfg = ModelConfig()
-        self.train_cfg = TrainingConfig()
-        self.path_cfg = PathConfig()
+# ------------------------------------------------------------------
+# 2. Multi-resolution STFT loss – HiFi-GAN recipe
+# ------------------------------------------------------------------
+class MRSTFTLoss(nn.Module):
+    """
+    Spectral-convergence + log-magnitude loss over multiple STFT
+    resolutions.  FFT / hop / win schedules are passed via kwargs or
+    `TrainingConfig.*` so nothing is ever hard-coded.
+    """
+    def __init__(
+        self,
+        fft_sizes: Sequence[int] | None = None,
+        hop_sizes: Sequence[int] | None = None,
+        win_lengths: Sequence[int] | None = None,
+    ) -> None:
+        super().__init__()
 
-        #  – optional new attributes added here for save/stop freq
-        self.train_cfg.save_every_steps   = getattr(self.train_cfg, "save_every_steps", 0)
-        self.train_cfg.save_every_epochs  = getattr(self.train_cfg, "save_every_epochs", 1)
-        self.train_cfg.early_stop_patience= getattr(self.train_cfg, "early_stop_patience", 1000)
+        cfg = TrainingConfig
 
-        # CLI overrides
-        if args.save_every_steps is not None:
-            self.train_cfg.save_every_steps = args.save_every_steps
-        if args.save_every_epochs is not None:
-            self.train_cfg.save_every_epochs = args.save_every_epochs
-        if args.early_stop_patience is not None:
-            self.train_cfg.early_stop_patience = args.early_stop_patience
+        self._windows: Optional[List[torch.Tensor]] = None
+        self._windows_device: Optional[torch.device] = None
 
-        # ----------------------------------------------------------
-        # 2. device
-        # ----------------------------------------------------------
-        self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        self.fft_sizes = list(fft_sizes or cfg.stft_fft_sizes)
+        self.hop_sizes = list(hop_sizes or cfg.stft_hop_sizes)
+        self.win_lengths = list(win_lengths or cfg.stft_win_lengths)
 
-        # ----------------------------------------------------------
-        # 3. data
-        # ----------------------------------------------------------
-        self._init_dataloaders()
 
-        # ----------------------------------------------------------
-        # 4. model, vocoder, loss fn
-        # ----------------------------------------------------------
-        num_speakers = len(self.train_dataset.speaker_to_idx)
-        self.model: HubertVCModel = HubertVCModel(self.model_cfg, num_speakers=num_speakers).to(self.device)
+        if not (
+            len(self.fft_sizes)
+            == len(self.hop_sizes)
+            == len(self.win_lengths)
+        ):
+            raise ValueError("STFT schedule lengths must match")
 
-        for name, param in self.model.named_parameters():
-            print(name, param.requires_grad)
+        # Pre-create Hann windows (device gets fixed at first call)
+        #self.register_buffer("_windows", None, persistent=False)
 
-        #self.vocoder = load_vocoder(self.path_cfg.vocoder_path, device=self.device, trainable=True)
-        
-        
-        self.vocoder = load_vocoder(self.path_cfg.vocoder_path, device=self.device)
-        self.vocoder.eval()
-        for p in self.vocoder.parameters():
-            p.requires_grad = False
-        
-        
-        self.speaker_encoder = load_speaker_encoder(
-            self.path_cfg.speaker_encoder_path, device=self.device
+    # ————————————————————————————————————————————————
+    @staticmethod
+    def _stft(
+        x: torch.Tensor,
+        n_fft: int,
+        hop: int,
+        win: int,
+        window: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.stft(
+            x,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=win,
+            window=window,
+            center=True,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=False,      # keeps older PyTorch compatibility
         )
+
+    # ————————————————————————————————————————————————
+    def forward(
+        self,
+        pred_wave: torch.Tensor,  # (B, T)
+        gt_wave: torch.Tensor,    # (B, T)
+    ) -> torch.Tensor:
+
+
+        # Align lengths by truncating to the shortest
+        min_len = min(pred_wave.shape[-1], gt_wave.shape[-1])
+        pred_wave = pred_wave[..., :min_len]
+        gt_wave = gt_wave[..., :min_len]
+        
+        if pred_wave.shape != gt_wave.shape:
+            raise ValueError(
+                f"STFT loss shape mismatch: pred {pred_wave.shape} vs gt {gt_wave.shape}"
+            )
+
+        device = pred_wave.device
+        if self._windows is None or self._windows_device != device:
+            self._windows = [
+                torch.hann_window(wl, device=device) for wl in self.win_lengths
+            ]
+            self._windows_device = device
+
+        total_loss = 0.0
+        for i, (n_fft, hop, win) in enumerate(
+            zip(self.fft_sizes, self.hop_sizes, self.win_lengths)
+        ):
+            win_tensor = self._windows[i]
+            pred_spec = self._stft(pred_wave, n_fft, hop, win, win_tensor)
+            gt_spec = self._stft(gt_wave, n_fft, hop, win, win_tensor)
+
+            # magnitude
+            pred_mag = torch.clamp(
+                torch.sqrt(pred_spec.pow(2).sum(-1) + 1e-9), min=1e-7
+            )
+            gt_mag = torch.clamp(
+                torch.sqrt(gt_spec.pow(2).sum(-1) + 1e-9), min=1e-7
+            )
+
+            # spectral convergence
+            sc_loss = (
+                (pred_mag - gt_mag).norm(p="fro") / gt_mag.norm(p="fro")
+            )
+
+            # log magnitude
+            mag_loss = F.l1_loss(
+                torch.log(pred_mag), torch.log(gt_mag)
+            )
+
+            total_loss += sc_loss + mag_loss
+
+        return total_loss / len(self.fft_sizes)
+
+    
+# ------------------------------------------------------------------
+# 3. Speaker Identity Loss – cosine distance on embeddings
+# ------------------------------------------------------------------
+# (in losses.py)
+# ------------------------------------------------------------------
+# 3. Speaker Identity Loss – cosine distance on embeddings
+# ------------------------------------------------------------------
+class SpeakerIdentityLoss(nn.Module):
+    """
+    Measures the cosine similarity between speaker embeddings extracted
+    from predicted and ground-truth WAVEFORMS.
+    """
+    def __init__(self, speaker_encoder: nn.Module) -> None:
+        super().__init__()
+        if speaker_encoder is None:
+            raise ValueError("A pre-trained speaker_encoder must be provided.")
+        self.speaker_encoder = speaker_encoder
         self.speaker_encoder.eval()
-        for p in self.speaker_encoder.parameters():
-            p.requires_grad = False
+        for param in self.speaker_encoder.parameters():
+            param.requires_grad = False
 
-        self.loss_fn = VCGeneratorLoss(self.train_cfg, self.speaker_encoder).to(self.device)
-        self.classifier_loss_fn = SpeakerClassifierLoss().to(self.device)
-
-        # ----------------------------------------------------------
-        # 5. optimiser & scheduler
-        # ----------------------------------------------------------
-        all_params = list(self.model.parameters())
-        self.optimizer = Adam(
-            all_params,
-            lr=self.train_cfg.learning_rate,
-            betas=(self.train_cfg.adam_beta1, self.train_cfg.adam_beta2),
-        )
-
-        
-        # Mixed precision training
-        self.scaler = GradScaler()
-
-
-        self.scheduler = StepLR(
-            self.optimizer,
-            step_size=self.train_cfg.lr_decay_steps,
-            gamma=self.train_cfg.lr_decay_factor,
-        )
-
-        # ----------------------------------------------------------
-        # 6. training state
-        # ----------------------------------------------------------
-        self.start_epoch      = 0
-        self.global_step      = 0
-        self.best_val_loss    = float("inf")
-        self.no_improve_epochs= 0
-
-        #  (optional) gradient clipping
-        self.grad_clip = getattr(self.train_cfg, "grad_clip", None)
-
-        # ----------------------------------------------------------
-        # 7. checkpoint resume
-        # ----------------------------------------------------------
-        if args.checkpoint:
-            self._load_checkpoint(args.checkpoint)
-
-        # pretty print config once
-        if self.global_step == 0:
-            self._log_config()
-            
-        self._register_decoder_forward_hooks()
-    
-    def _register_decoder_forward_hooks(self):
-        """Register forward hooks to detect NaN/Inf in decoder blocks"""
-        def make_hook(module_name):
-            def hook_fn(module, input, output):
-                # Decoder can return (mel, intermediate) tuple when return_intermediate=True
-                check = output[0] if isinstance(output, tuple) else output
-                if torch.isnan(check).any() or torch.isinf(check).any():
-                    print(f"❌ NaN/Inf detected in {module_name}")
-                    raise RuntimeError(f"Numerical instability in {module_name}")
-            return hook_fn
-        
-        for name, module in self.model.named_modules():
-            if 'decoder' in name:
-                module.register_forward_hook(make_hook(name))
-        
-        print("✅ Registered NaN/Inf detection hooks on decoder modules")
-
-    # ==============================================================
-    #  Data helpers
-    # ==============================================================
-    def _init_dataloaders(self) -> None:
-        batch_size = getattr(self.train_cfg, "batch_size", 16)
-
-        self.train_dataset = VoiceConversionDataset(
-            split="train",
-            audio_config=self.audio_cfg,
-            data_config=self.data_cfg,
-            training_config=self.train_cfg,
-            max_items=self.data_cfg.max_items
-        )
-        self.val_dataset = VoiceConversionDataset(
-            split="val",
-            audio_config=self.audio_cfg,
-            data_config=self.data_cfg,
-            training_config=self.train_cfg,
-            max_items=self.data_cfg.max_items
-        )
-
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=collate_training_pairs,
-        )
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=collate_training_pairs,
-        )
-
-    # ==============================================================
-    #  Checkpoint I/O
-    # ==============================================================
-    def _checkpoint_path(self, name: str) -> str:
-        Path(self.path_cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        return str(Path(self.path_cfg.checkpoint_dir) / name)
-
-    def _save_checkpoint(self, name: str) -> None:
-        path = self._checkpoint_path(name)
-        torch.save(
-            {
-                "epoch": self.start_epoch,
-                "global_step": self.global_step,
-                "model_state": self.model.state_dict(),
-                "vocoder_state": self.vocoder.state_dict(),  # ADD vocoder state
-                "optim_state": self.optimizer.state_dict(),
-                "sched_state": self.scheduler.state_dict(),
-                "scaler_state": self.scaler.state_dict(),    # ADD scaler state
-                "best_val_loss": self.best_val_loss,
-                "no_improve_epochs": self.no_improve_epochs,
-                "config": self._collect_config(),
-            },
-            path,
-        )
-
-        print(f"[checkpoint] saved → {path}")
-
-    def _load_checkpoint(self, ckpt_path: str) -> None:
-        if not Path(ckpt_path).exists():
-            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"], strict=False)
-        
-        try:
-            self.optimizer.load_state_dict(ckpt["optim_state"])
-            self.scheduler.load_state_dict(ckpt["sched_state"])
-        except ValueError:
-            print("[Warning] Optimizer/Scheduler state mismatch (expected when adding new parameters). Continuing with fresh optimizer states for new weights.")
-        self.start_epoch       = ckpt.get("epoch", 0)
-        self.global_step       = ckpt.get("global_step", 0)
-        self.best_val_loss     = ckpt.get("best_val_loss", float("inf"))
-        self.no_improve_epochs = ckpt.get("no_improve_epochs", 0)
-
-        # ADD vocoder state loading with backward compatibility
-        if "vocoder_state" in ckpt:
-            self.vocoder.load_state_dict(ckpt["vocoder_state"])
-        self.optimizer.load_state_dict(ckpt["optim_state"])
-        self.scheduler.load_state_dict(ckpt["sched_state"])
-        # ADD scaler state loading with backward compatibility
-        if "scaler_state" in ckpt:
-            self.scaler.load_state_dict(ckpt["scaler_state"])
-
-        print(f"[checkpoint] resumed from {ckpt_path} at epoch {self.start_epoch}")
-
-
-    def analyze_gradient_flow(self):
-        """
-        Prints a summary of the gradient flow for the major components of the HubertVCModel.
-        Call this function immediately after loss.backward() in your training loop.
-        """
-
-        model = self.model
-        print("\n" + "="*60)
-        print("           GRADIENT FLOW ANALYSIS")
-        print("="*60)
-        
-        # Define the key components of your model to inspect
-        # The keys are descriptive names, the values are keywords in the parameter names
-        components_to_check = {
-            "Mel Encoder": "mel_encoder",
-            "Content Projection": "content_proj",
-            "Speaker Projection": "speaker_proj",
-            "Cross-Attention": "cross_attn",
-            "Decoder Adapter": "decoder.adapter",
-            "Decoder Block 0": "decoder.blocks.0",
-            "Decoder Mel Projection": "decoder.mel_proj",
-        }
-        
-        # Add the final decoder block dynamically if it exists
-        if hasattr(model, 'decoder') and hasattr(model.decoder, 'blocks') and len(model.decoder.blocks) > 1:
-            final_block_idx = len(model.decoder.blocks) - 1
-            components_to_check[f"Decoder Block {final_block_idx}"] = f"decoder.blocks.{final_block_idx}"
-
-        # Iterate through all trainable parameters
-        for name, param in model.named_parameters():
-            if not param.requires_grad or param.grad is None:
-                continue
-                
-            for component_name, keyword in components_to_check.items():
-                if keyword in name:
-                    grad = param.grad
-                    grad_mean_abs = grad.abs().mean().item()
-                    grad_max_abs = grad.abs().max().item()
-                    
-                    # Identify if it's a weight or bias parameter for clarity
-                    param_type = "bias" if "bias" in name else "weight"
-                    
-                    print(f"[{component_name:<22s} ({param_type:^6s})] \t"
-                          f"| Grad Mean Abs: {grad_mean_abs:.2e} \t"
-                          f"| Grad Max Abs: {grad_max_abs:.2e}")
-                          
-        print("="*60 + "\n")
-
-
-
-      # ==============================================================
-      #  Training step / epoch
-      # ==============================================================
-    def _train_epoch(self) -> dict:
-        self.model.train()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0}
-        num_batches = 0
-
-        pbar = tqdm(self.train_loader, desc=f"Train | epoch {self.start_epoch}", leave=False)
-        for batch in pbar:
-
-            self.optimizer.zero_grad(set_to_none=True)
-
-            # Extract batch data - UPDATED FOR ECAPA-TDNN AND CACHING
-            content_audio = [wav.to(self.device) for wav in batch["content_audio"]] if batch.get("content_audio") is not None and batch["content_audio"][0] is not None else None
-            ref_audio = batch["ref_audio"].to(self.device) if batch.get("ref_audio") is not None else None
-            ref_mel = batch["ref_mel"].to(self.device) if batch.get("ref_mel") is not None else None
-            
-            # Caching feature tensors
-            if batch.get("content_feats") is not None:
-                batch["content_feats"] = batch["content_feats"].to(self.device)
-            if batch.get("speaker_feats") is not None:
-                batch["speaker_feats"] = batch["speaker_feats"].to(self.device)
-                
-            gt_mel = batch["gt_mel"].to(self.device)
-            gt_wave = batch["gt_wave"].to(self.device)
-            gt_lengths = batch["gt_lengths"].to(self.device)    # (B,) real mel frame counts
-
-            # Forward pass - NOW USES ref_audio and optionally precomputed features
-            classifier_weight = getattr(self.train_cfg, 'classifier_weight', 0.0)
-            need_bottleneck = classifier_weight > 0 and self.model.speaker_classifier is not None
-            
-            pred_mel, _, aux = self.model(
-                ref_audio=ref_audio,
-                content_audio=content_audio,
-                gt_mels=gt_mel,
-                compute_losses=False,
-                return_aux=need_bottleneck,
-                return_bottleneck=need_bottleneck,
-                precomputed_speaker_feats=batch.get("speaker_feats"),
-                precomputed_content_feats=batch.get("content_feats")
-            )
-
-            # 🔍 TEMPORAL ALIGNMENT CHECK (print once)
-            if self.global_step == 0 and num_batches == 0:
-                print("\n" + "="*60)
-                print("⏱️ TEMPORAL ALIGNMENT CHECK & UTTERANCE INFO")
-                print("="*60)
-                print(f"Training on utterance: {batch.get('utterance_id', ['Unknown'])[0]}")
-                print(f"Speaker ID: {batch.get('speaker_id', ['Unknown'])[0]}")
-                print(f"Predicted mel shape: {pred_mel.shape}")   # (B, 80, T_pred)
-                print(f"Target mel shape:    {gt_mel.shape}")     # (B, 80, T_gt)")
-                print("="*60 + "\n")
-
-            # We skip HiFi-GAN forward pass entirely to prevent VRAM OOM on Colab.
-            # STFT and Speaker losses are disabled for training.
-            pred_wave = None
-            gt_wave_vocoded = None
-
-            current_epoch = self.start_epoch
-            stft_weight = 0.0 # Disabled STFT loss optimization completely
-            
-            pbar.set_description(f"Train | ep {current_epoch} | Mel-Only")
-
-            pred_mel = pred_mel.to(torch.float32)
-
-            # Calculate Losses
-            # mel_loss gets computed with gradients. 
-            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths)
-            
-            # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
-            total = losses.total()
-
-            # --- Entropy hinge: penalizes attention outside [1.0, 1.5] (uniform=2.08). Two-sided pocket. ---
-            lambda_entropy = getattr(self.train_cfg, 'lambda_entropy', 0.0)
-            if lambda_entropy > 0 and hasattr(self.model.cross_attn, '_cached_entropy'):
-                entropy_val = self.model.cross_attn._cached_entropy
-                entropy_hinge = torch.clamp(1.0 - entropy_val, min=0.0) + torch.clamp(entropy_val - 1.5, min=0.0)
-                total = total + lambda_entropy * entropy_hinge
-                loss_accum["entropy"] += entropy_hinge.item()
-                if num_batches == 0:
-                    print(f"[ENTROPY_HINGE] raw_entropy={entropy_val.item():.4f}, hinge={entropy_hinge.item():.4f}, weighted={lambda_entropy * entropy_hinge.item():.4f}")
-
-            
-            # --- Speaker classifier CE loss (self-pair, per-frame, no dilution) ---
-            if need_bottleneck and aux is not None and "classifier_logits" in aux:
-                logits_self = aux["classifier_logits"]  # [B, N, T]
-                target_idx = batch["target_speaker_idx"].to(self.device)  # [B]
-                T = logits_self.size(-1)
-                target_expanded = target_idx.unsqueeze(1).expand(-1, T)  # [B, T]
-                ce_loss_self = self.classifier_loss_fn(logits_self, target_expanded)
-                total = total + classifier_weight * ce_loss_self
-                loss_accum["classifier"] += ce_loss_self.item()
-                
-                if num_batches == 0:
-                    with torch.no_grad():
-                        logit_entropy = - (logits_self.softmax(dim=1) * torch.log_softmax(logits_self, dim=1)).sum(dim=1).mean().item()
-                        _, predicted = logits_self.max(dim=1)  # [B, T]
-                        accuracy = (predicted == target_expanded).float().mean().item()
-                        print(f"[CLASSIFIER] weight={classifier_weight}, logit_entropy={logit_entropy:.4f}, self_accuracy={accuracy:.4f}")
-                        # Top-3 predicted speakers (first frame of first sample)
-                        top3_vals, top3_idx = logits_self[0, :, 0].topk(min(3, logits_self.size(1)))
-                        print(f"[CLASSIFIER] frame-0 top3 indices: {top3_idx.tolist()}, values: {[f'{v:.3f}' for v in top3_vals.tolist()]}")
-            
-            print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
-            f"raw_stft={losses.get('stft', 0):.4f}, "
-            f"actual_total={total:.4f}")
-            
-            # =========================================================================
-            # CROSS-PAIR TRAINING: Mel Spectral Stats only (no L1 on cross pairs)
-            # =========================================================================
-            # Mathematically safe because Mel Stats matches per-band spectral shape
-            # without penalizing phoneme mismatch: ∂L_stats/∂γ encourages stronger γ.
-            # Reuses precomputed content/speaker features — no HuBERT/ECAPA re-run.
-            cross_pair_prob = getattr(self.train_cfg, 'cross_pair_prob', 0.0)
-            cross_stats_weight = getattr(self.train_cfg, 'cross_pair_stats_weight', 1.0)
-            
-            if cross_pair_prob > 0:
-                speaker_ids = batch.get("speaker_id", [])
-                B = len(speaker_ids)
-                
-                # Build mask: cross-pair only for different-speaker neighbours
-                cross_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
-                if B >= 2:
-                    for i in range(B):
-                        j = (i + 1) % B
-                        if speaker_ids[i] != speaker_ids[j]:
-                            cross_mask[i] = True
-                
-                valid_pairs = cross_mask.sum().item()
-                print(f"[CROSS-PAIR-CHECK] prob={cross_pair_prob}, B={B}, valid={valid_pairs}")
-                
-                if valid_pairs > 0 and random.random() < cross_pair_prob:
-                    # Roll speaker features and targets by 1
-                    rolled_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
-                    rolled_gt_mel = torch.roll(gt_mel, shifts=1, dims=0)
-                    rolled_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
-                    
-                    # Forward pass with rolled speaker (content unchanged)
-                    pred_cross, _, aux_cross = self.model(
-                        ref_audio=None,
-                        content_audio=None,
-                        gt_mels=None,
-                        compute_losses=False,
-                        return_aux=need_bottleneck,
-                        return_bottleneck=need_bottleneck,
-                        precomputed_speaker_feats=rolled_speaker_feats,
-                        precomputed_content_feats=batch.get("content_feats")
-                    )
-                    pred_cross = pred_cross.to(torch.float32)
-                    
-                    # Cross-pair loss: Mel Spectral Stats ONLY (no L1)
-                    # Uses independent pred/target lengths to avoid paddding corruption
-                    cross_loss_tensor = self.loss_fn.mel_stats_loss(
-                        pred_cross,
-                        rolled_gt_mel,
-                        pred_lengths=gt_lengths,        # content speaker's length
-                        target_lengths=rolled_lengths    # target speaker's length
-                    )
-                    
-                    # Average over valid cross-pairs only
-                    cross_loss = cross_loss_tensor * cross_stats_weight
-                    total = total + cross_loss
-                    
-                    # --- Classifier CE on cross-pair (target = rolled speaker) ---
-                    if need_bottleneck and aux_cross is not None and "classifier_logits" in aux_cross:
-                        logits_cross = aux_cross["classifier_logits"]  # [B, N, T]
-                        target_idx_rolled = torch.roll(batch["target_speaker_idx"], shifts=1, dims=0).to(self.device)
-                        T_cross = logits_cross.size(-1)
-                        target_cross_expanded = target_idx_rolled.unsqueeze(1).expand(-1, T_cross)
-                        ce_loss_cross = self.classifier_loss_fn(logits_cross, target_cross_expanded)
-                        total = total + classifier_weight * ce_loss_cross
-                    
-                    if num_batches == 0:
-                        rolled_ids = [speaker_ids[(i+1) % B] for i in range(B)]
-                        print(f"[CROSS-PAIR] prob={cross_pair_prob}, weight={cross_stats_weight}")
-                        print(f"[CROSS-PAIR] Active: {valid_pairs}/{B} items cross-paired (mask={cross_mask.tolist()})")
-                        print(f"[CROSS-PAIR] speakers: {speaker_ids} → {rolled_ids}")
-                        print(f"[CROSS-PAIR] self_loss={losses.total():.4f}, cross_stats_loss={cross_loss_tensor.item():.4f}, "
-                              f"weighted_cross={cross_loss.item():.4f}")
-                        print(f"[CROSS-PAIR] total (self + cross) = {total:.4f}")
-            
-            # 🔍 ENHANCED SIGNAL AUDIT (Run on first batch of session + periodically)
-            if num_batches == 0 and (self.global_step == 0 or self.global_step % 100 == 0):
-                print("\n" + "█"*60)
-                print(f"🕵️  DEEP SIGNAL AUDIT | Step {self.global_step}")
-                print("█"*60)
-
-                # Safe accessor to handle (B, C, T) vs (B, T)
-                def get_sample(tensor):
-                    t = tensor.detach().cpu()
-                    if t.dim() == 3: return t[0, 0, :8].numpy() # (B, C, T) -> First channel
-                    if t.dim() == 2: return t[0, :8].numpy()    # (B, T) or (B, C) -> First row
-                    return t.flatten()[:8].numpy()              # Fallback
-
-                t_sample = get_sample(gt_mel)
-                p_sample = get_sample(pred_mel)
-                
-                print(f"\n[1] RAW SAMPLE VALUES (First 8 frames/points):")
-                print(f"    Target: {[float(f'{x:.2f}') for x in t_sample]}") 
-                print(f"    Pred:   {[float(f'{x:.2f}') for x in p_sample]}")
-
-                # 2. QUANTILES
-                print(f"\n[2] DISTRIBUTION SHAPE:")
-                for name, tensor in [("Target", gt_mel), ("Pred  ", pred_mel)]:
-                    t_flat = tensor.float().reshape(-1)
-                    q = torch.quantile(t_flat, torch.tensor([0.05, 0.5, 0.95]).to(self.device))
-                    mean, std = t_flat.mean().item(), t_flat.std().item()
-                    print(f"    {name}: 5%={q[0]:.2f} | Med={q[1]:.2f} | 95%={q[2]:.2f} || μ={mean:.2f}, σ={std:.2f}")
-
-                # 3. SCALE MISMATCH DIAGNOSIS
-                l1_err = torch.abs(gt_mel - pred_mel).mean().item()
-                
-
-                print(f"\n[3] DIAGNOSIS:")
-                print(f"    Mean L1 Error: {l1_err:.4f}")
-                if abs(gt_mel.mean()) > 2.0 and abs(pred_mel.mean()) < 0.5:
-                     print("    🚨 ALERT: Target looks like Unnormalized Log-Mel (negative offset), Pred looks Zero-Centered.")
-                elif l1_err > 2.0:
-                     print("    ⚠️  WARNING: Massive scale mismatch detected.")
-                else:
-                     print("    ✅ Scales look roughly compatible.")
-                print("█"*60 + "\n")
-
-                with torch.no_grad():
-                    print(f"[DOMAIN GAP] STFT diagnostics are disabled to save Colab VRAM.")
-                    print(f"[SAME DOMAIN] Skipping diagnostic STFT calculation...")
-
-            
-            # =============================================================================
-            # 🩺 VOCODER & MEL CONSISTENCY DIAGNOSTIC (Epoch-level, non-invasive)
-            # =============================================================================
-            if self.start_epoch in (0, 8):
-                print("\n" + "=" * 100)
-                print(f"🔬 VOCODER DIAGNOSTIC | Epoch {self.start_epoch:03d} | Step {self.global_step}")
-                print("=" * 100)
-
-                # -------------------------------------------------------------------------
-                # Select first sample in batch: [B, 80, T] → [80, T]
-                # -------------------------------------------------------------------------
-                gt_mel_sample = gt_mel[0].detach()
-
-                # Prediction might have lost its batch dim
-                if pred_mel.dim() == 3:  # [B, 80, T]
-                    pred_mel_sample = pred_mel[0].detach()
-                else:                    # [80, T] (Batch dim already squeezed)
-                    pred_mel_sample = pred_mel.detach()
-
-                # In the vocoder diagnostic section, compare:
-                print(f"[MEL_SCALE] gt_mel: mean={gt_mel.mean():.3f}, std={gt_mel.std():.3f}")
-                print(f"[MEL_SCALE] pred_mel: mean={pred_mel.mean():.3f}, std={pred_mel.std():.3f}")
-                # Both should be in the range the vocoder expects
-                # SpeechBrain HiFi-GAN typically expects unnormalized log-mel in [-11, 2] range
-
-                # -------------------------------------------------------------------------
-                # 1. MEL DISTRIBUTION STATS
-                # -------------------------------------------------------------------------
-                print("\n📊 1. MEL DISTRIBUTION")
-                print("─" * 60)
-                print(
-                    f"GT   | min={gt_mel_sample.min():6.3f} "
-                    f"max={gt_mel_sample.max():6.3f} "
-                    f"mean={gt_mel_sample.mean():6.3f} "
-                    f"std={gt_mel_sample.std():6.3f}"
-                )
-                print(
-                    f"PRED | min={pred_mel_sample.min():6.3f} "
-                    f"max={pred_mel_sample.max():6.3f} "
-                    f"mean={pred_mel_sample.mean():6.3f} "
-                    f"std={pred_mel_sample.std():6.3f}"
-                )
-
-                l1_val = torch.nn.functional.l1_loss(pred_mel_sample.unsqueeze(0), gt_mel_sample.unsqueeze(0)).item()
-                print(f"L1(pred, gt) = {l1_val:.4f}")
-
-                # Percentiles (distribution shape)
-                gt_p5, gt_p95 = torch.quantile(gt_mel_sample, torch.tensor([0.05, 0.95], device=gt_mel_sample.device))
-                pr_p5, pr_p95 = torch.quantile(pred_mel_sample, torch.tensor([0.05, 0.95], device=pred_mel_sample.device))
-                print(f"GT   5–95%: [{gt_p5:6.3f}, {gt_p95:6.3f}]")
-                print(f"PRED 5–95%: [{pr_p5:6.3f}, {pr_p95:6.3f}]")
-
-                # -------------------------------------------------------------------------
-                # 2. VOCODER HANDSHAKE TESTS (SpeechBrain HiFi-GAN fix)
-                # -------------------------------------------------------------------------
-                print("\n🔧 2. VOCODER INPUT / OUTPUT CHECK")
-                print("─" * 60)
-
-                vocoder_tests = [
-                    ("GT Mel (baseline)", gt_mel_sample),
-                    ("Pred Mel (raw)", pred_mel_sample),
-                    ("Pred → match GT μ/σ", 
-                    (pred_mel_sample - pred_mel_sample.mean()) / (pred_mel_sample.std() + 1e-6)
-                    * gt_mel_sample.std() + gt_mel_sample.mean()),
-                    ("Silence (-10)", torch.full_like(pred_mel_sample, -10.0)),
-                ]
-
-                with torch.no_grad():
-                    for name, mel_in in vocoder_tests:
-                        # FIX: SpeechBrain HiFi-GAN expects [B=1, C=80, T]
-                        mel_in_correct = mel_in.unsqueeze(0)  # [1, 80, T] ✅ CORRECT
-                        wav = self.vocoder(mel_in_correct).squeeze()  # [T]
-
-                        wav_std = wav.std().item()
-                        wav_peak = wav.abs().max().item()
-                        clip_pct = (wav.abs() > 1.0).float().mean().item() * 100.0
-
-                        print(
-                            f"{name:22s} | "
-                            f"wav σ={wav_std:6.3f} "
-                            f"peak={wav_peak:6.3f} "
-                            f"clip={clip_pct:5.1f}%"
-                        )
-
-                # -------------------------------------------------------------------------
-                # 3. TEMPORAL SANITY CHECK (first mel bin, first 20 frames)
-                # -------------------------------------------------------------------------
-                print("\n⏱️ 3. TEMPORAL SNAPSHOT (mel bin 0)")
-                print("─" * 60)
-                T = min(20, gt_mel_sample.shape[1])
-                print("t | GT      | PRED    | |Δ|")
-                for t in range(T):
-                    g = gt_mel_sample[0, t].item()
-                    p = pred_mel_sample[0, t].item()
-                    print(f"{t:2d} | {g:7.3f} | {p:7.3f} | {abs(g-p):7.3f}")
-
-                print("=" * 100 + "\n")
-
-            torch.autograd.set_detect_anomaly(True)  
-
-            self.scaler.scale(total).backward()
-            vocoder_has_grad = False
-            for name, p in self.vocoder.named_parameters():
-                if p.grad is not None and p.grad.abs().max() > 0:
-                    vocoder_has_grad = True
-                    break
-            print(f"[VOCODER_GRAD] Gradients flowing through vocoder: {vocoder_has_grad}")
-
-            self.scaler.unscale_(self.optimizer)
-
-            if self.global_step % 1 == 0:  # Print every step for now
-                print(f"\n[GRADIENT ANALYSIS]")
-                
-                # Content projection gradients
-                if self.model.cross_attn.content_proj.weight.grad is not None:
-                    content_grad = self.model.cross_attn.content_proj.weight.grad
-                    print(f"content_proj grad: mean={content_grad.abs().mean():.6f}, "
-                          f"max={content_grad.abs().max():.6f}")
-                
-                # Speaker projection gradients
-                if self.model.cross_attn.speaker_proj.weight.grad is not None:
-                    speaker_grad = self.model.cross_attn.speaker_proj.weight.grad
-                    print(f"speaker_proj grad: mean={speaker_grad.abs().mean():.6f}, "
-                          f"max={speaker_grad.abs().max():.6f}")
-                
-                # Alpha was replaced by the AdaIN Mapping Network
-
-            self.analyze_gradient_flow()
-
-            all_params = list(self.model.parameters()) + list(self.vocoder.parameters())
-
-            if self.grad_clip:
-                torch.nn.utils.clip_grad_norm_(all_params, max_norm=2.0)
-
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            # accumulate losses
-            for k in loss_accum:
-                loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
-            num_batches += 1
-
-            postfix = {
-                "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
-                "mel": f"{losses.get('mel', torch.tensor(0.)).item():.3f}",
-                "stft": f"{losses.get('stft', torch.tensor(0.)).item():.3f}",
-                "spk": f"{losses.get('speaker', torch.tensor(0.)).item():.3f}",
-                "var": f"{losses.get('var', torch.tensor(0.)).item():.3f}",
-                "tot": f"{total.item():.3f}",
-            }
-            if need_bottleneck:
-                postfix["cls"] = f"{ce_loss_self.item():.3f}"
-            pbar.set_postfix(**postfix)
-
-            if (
-                self.train_cfg.save_every_steps > 0
-                and self.global_step % self.train_cfg.save_every_steps == 0
-            ):
-                self._save_checkpoint("last.ckpt")
-
-            self.global_step += 1
-
-        for k in loss_accum:
-            loss_accum[k] /= max(1, num_batches)
-
-        return loss_accum
-
-
-    # ==============================================================
-    #  Validation
-    # ==============================================================
     @torch.no_grad()
-    def _validate(self) -> dict:
-        self.model.eval()
-        self.vocoder.eval()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "var": 0.0, "total": 0.0}
-        num_batches = 0
+    def _extract_embedding(self, wave: torch.Tensor) -> torch.Tensor:
+        """Extracts speaker embedding from a waveform."""
+        return self.speaker_encoder.encode_batch(wave).detach()
 
-        for batch in tqdm(self.val_loader, desc="Valid", leave=False):
+    def forward(
+        self,
+        pred_wave: torch.Tensor,    # (B, T_wav)
+        gt_wave: torch.Tensor,      # (B, T_wav)
+    ) -> torch.Tensor:
+        """Calculates the speaker identity loss on waveforms."""
+        self.speaker_encoder.eval()
 
-            # Extract batch data - UPDATED FOR ECAPA-TDNN AND CACHING
-            content_audio = [wav.to(self.device) for wav in batch["content_audio"]] if batch.get("content_audio") is not None and batch["content_audio"][0] is not None else None
-            ref_audio = batch["ref_audio"].to(self.device) if batch.get("ref_audio") is not None else None
-            ref_mel = batch["ref_mel"].to(self.device) if batch.get("ref_mel") is not None else None
+        emb_pred = self.speaker_encoder.encode_batch(pred_wave)
+        emb_gt = self._extract_embedding(gt_wave)
+
+        emb_pred = F.normalize(emb_pred.squeeze(1), p=2, dim=1)
+        emb_gt = F.normalize(emb_gt.squeeze(1), p=2, dim=1)
+        
+        cosine_sim = F.cosine_similarity(emb_pred, emb_gt, dim=-1)
+        loss = 1.0 - cosine_sim.mean()
+        
+        return loss
+
+# ------------------------------------------------------------------
+# 3b. Mel Spectral Stats Loss - Timbre/EQ Signature Loss
+# ------------------------------------------------------------------
+class MelSpectralStatsLoss(nn.Module):
+    """
+    Penalizes differences in the global mean and standard deviation of Mel-spectrograms.
+    Forces the network to match the target speaker's time-invariant acoustic signature (timbre/EQ)
+    rather than just phoneme structures, strongly mitigating the source-leakage 'shortcut trap'.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        pred: torch.Tensor,             # (B, n_mels, T1)
+        target: torch.Tensor,           # (B, n_mels, T2)
+        lengths: torch.Tensor = None,   # (B,) (legacy: applies to both if provided)
+        pred_lengths: torch.Tensor = None, # (B,)
+        target_lengths: torch.Tensor = None, # (B,)
+    ) -> torch.Tensor:
+        if pred_lengths is None and lengths is not None:
+            pred_lengths = lengths
+        if target_lengths is None and lengths is not None:
+            target_lengths = lengths
+        if pred.shape != target.shape:
+            min_t = min(pred.size(-1), target.size(-1))
+            pred   = pred[..., :min_t]
+            target = target[..., :min_t]
             
-            # Caching feature tensors
-            if batch.get("content_feats") is not None:
-                batch["content_feats"] = batch["content_feats"].to(self.device)
-            if batch.get("speaker_feats") is not None:
-                batch["speaker_feats"] = batch["speaker_feats"].to(self.device)
-                
-            gt_mel = batch["gt_mel"].to(self.device)
-            gt_wave = batch["gt_wave"].to(self.device)
-            gt_lengths = batch["gt_lengths"].to(self.device) if batch.get("gt_lengths") is not None else None
-
-            # Forward pass - NOW USES ref_audio and optionally precomputed features
-            pred_mel, _, _ = self.model(
-                ref_audio=ref_audio,
-                content_audio=content_audio,
-                gt_mels=None,
-                compute_losses=False,
-                return_aux=False,
-                precomputed_speaker_feats=batch.get("speaker_feats"),
-                precomputed_content_feats=batch.get("content_feats")
-            )
-            pred_wave = None
-
-            # Same-domain STFT ground truth
-            gt_wave_vocoded = None
-            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths)
-
-            total = losses.total()
-
-            for k in loss_accum:
-                loss_accum[k] += losses.get(k, torch.tensor(0.)).item() if k != "total" else total.item()
-            num_batches += 1
-
-        for k in loss_accum:
-            loss_accum[k] /= max(1, num_batches)
-
-        return loss_accum
-
-
-    # ==============================================================
-    #  Public runner
-    # ==============================================================
-    def _build_cache_if_needed(self):
-        """Builds a local cache of HuBERT and ECAPA features to speed up Colab training."""
-        cache_dir = Path("/content/hubertvc_cache")
-        # To force recomputation on the first epoch of every run, we can wipe the folder
-        if cache_dir.exists():
-            import shutil
-            shutil.rmtree(cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        if pred_lengths is not None and target_lengths is not None:
+            T_pred = pred.size(-1)
+            T_target = target.size(-1)
+            
+            mask_pred = (torch.arange(T_pred, device=pred.device)[None, :] < pred_lengths[:, None]).unsqueeze(1).float()
+            mask_target = (torch.arange(T_target, device=target.device)[None, :] < target_lengths[:, None]).unsqueeze(1).float()
+            
+            valid_pred = pred_lengths.view(-1, 1).float().clamp(min=1.0)
+            valid_target = target_lengths.view(-1, 1).float().clamp(min=1.0)
+            
+            pred_mean = (pred * mask_pred).sum(dim=-1) / valid_pred
+            target_mean = (target * mask_target).sum(dim=-1) / valid_target
+            
+            pred_var = (((pred - pred_mean.unsqueeze(-1)) ** 2) * mask_pred).sum(dim=-1) / valid_pred
+            target_var = (((target - target_mean.unsqueeze(-1)) ** 2) * mask_target).sum(dim=-1) / valid_target
+            
+            pred_std = torch.sqrt(pred_var + 1e-6)
+            target_std = torch.sqrt(target_var + 1e-6)
+        else:
+            pred_mean = pred.mean(dim=-1)
+            target_mean = target.mean(dim=-1)
+            pred_std = pred.std(dim=-1)
+            target_std = target.std(dim=-1)
+            
+        l1_mean = F.l1_loss(pred_mean, target_mean)
+        l1_std = F.l1_loss(pred_std, target_std)
         
-        print("\n" + "="*60)
-        print("🚀 PRECOMPUTING FROZEN FEATURES (HuBERT + ECAPA-TDNN)")
-        print("="*60)
-        self.model.eval()
-        
-        for split, loader in [("Train", self.train_loader), ("Val", self.val_loader)]:
-            print(f"Caching {split} dataset...")
-            # Use raw dataset directly to bypass padding for single utterances
-            dataset = loader.dataset
-            for idx in tqdm(range(len(dataset)), desc=f"{split} Cache", leave=False):
-                speaker_id, utterance_path = dataset.valid_utterances[idx]
-                utterance_id = Path(utterance_path).stem
-                
-                # Check if this precise utterance is cached
-                cache_file = cache_dir / f"{utterance_id}.pt"
-                if cache_file.exists():
-                    continue
-                    
-                # Run the standard audio loader manually to get the exact split
-                result = dataset._load_and_process_audio(utterance_path)
-                if result is None:
-                    continue
-                ref_audio, ref_mel, content_audio, _, _ = result
-                
-                # Send to GPU
-                ref_audio_gpu = ref_audio.unsqueeze(0).to(self.device)
-                content_audio_gpu = [content_audio.to(self.device)]
-                
-                with torch.inference_mode():
-                    # 1. ECAPA-TDNN Speaker Features
-                    speaker_feats = self.model.mel_encoder(ref_audio_gpu)[0] # [64, 96]
-                    
-                    # 2. HuBERT Content Features 
-                    hubert_out = self.model.hubert(content_audio_gpu)
-                    content_feats = self.model.hubert_proj(hubert_out)[0] # [T, 96]
-                    
-                    # 3. GT Mel 
-                    gt_mel = extract_mel_spectrogram(
-                        content_audio, 
-                        sample_rate=self.audio_cfg.sample_rate
-                    )
-                    
-                # Save to disk
-                torch.save({
-                    'content_feats': content_feats.cpu(),
-                    'speaker_feats': speaker_feats.cpu(),
-                    'gt_mel': gt_mel.cpu(),
-                    'gt_wave': content_audio.cpu(),
-                }, cache_file)
-                
-        print("✅ Precompution complete! Training will now run exponentially faster.\n")
-        self.model.train()
+        return l1_mean + l1_std
 
 
-    def run(self, max_epochs: int) -> None:
-        #print(f"[trainer] device: {self.device} | epochs: {max_epochs}")
-        
-        self._build_cache_if_needed()
-        
-        for epoch in range(self.start_epoch, max_epochs):
-            self.start_epoch = epoch
-
-            train_loss = self._train_epoch()
-            self.scheduler.step() 
-            val_loss   = self._validate()
-
-            print(
-                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | var={train_loss.get('var', 0.0):.3f} | cls={train_loss.get('classifier', 0.0):.3f} | ent_h={train_loss.get('entropy', 0.0):.3f} | gam_h={train_loss.get('gamma', 0.0):.3f} | total={train_loss['total']:.3f}"
-            )
-            print(
-                f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | var={val_loss.get('var', 0.0):.3f} | total={val_loss['total']:.3f}"
-            )
-
-
-            # ---- epoch-based saving
-            if (
-                self.train_cfg.save_every_epochs > 0
-                and (epoch + 1) % self.train_cfg.save_every_epochs == 0
-            ):
-                self._save_checkpoint("last.ckpt")
-
-            # ---- best model logic
-            if val_loss['total'] < self.best_val_loss:
-                self.best_val_loss = val_loss['total']
-                self.no_improve_epochs = 0
-                self._save_checkpoint("best.ckpt")
-            else:
-                self.no_improve_epochs += 1
-
-            # ---- early stopping
-            if self.no_improve_epochs >= self.train_cfg.early_stop_patience:
-                print(
-                    f"[early-stop] no improvement for "
-                    f"{self.no_improve_epochs} epochs; stopping."
-                )
-                break
-
-
-        print("[trainer] training completed")
-
-    # ==============================================================
-    #  utilities
-    # ==============================================================
-    def _collect_config(self) -> Dict[str, Any]:
-        # serialisable snapshot (for reproducibility)
-        return {
-            "audio": vars(self.audio_cfg),
-            "data": vars(self.data_cfg),
-            "model": vars(self.model_cfg),
-            "train": vars(self.train_cfg),
-        }
-
-    def _log_config(self) -> None:
-        cfg_json = json.dumps(self._collect_config(), indent=2)
-        print("═════════ CONFIG ═════════")
-        print(cfg_json)
-        print("══════════════════════════")
+# ------------------------------------------------------------------
+# 3c. Speaker Classifier Loss - per-frame CE on decoder bottleneck
+# ------------------------------------------------------------------
+class SpeakerClassifierLoss(nn.Module):
+    """
+    Per-frame cross-entropy loss applied to decoder bottleneck features.
     
-
-# ==================================================================
-#                       CLI entry-point
-# ==================================================================
-def _parse_cli() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="HuBERT-VC training loop (manual)")
-    p.add_argument("--checkpoint", type=str, default=None, help="resume from .ckpt")
-    p.add_argument("--device",     type=str, default="cuda", help="cpu | cuda | cuda:0")
-    p.add_argument("--epochs",     type=int, default=100,    help="max epochs")
-
-    # optional overrides
-    p.add_argument("--save_every_steps",   type=int, help="save last.ckpt every N steps")
-    p.add_argument("--save_every_epochs",  type=int, help="save last.ckpt every N epochs")
-    p.add_argument("--early_stop_patience",type=int, help="epochs without val-improve")
-
-    return p.parse_args()
-
-
-def main() -> None:
-    args = _parse_cli()
-    trainer = Trainer(args)
-    trainer.run(max_epochs=args.epochs)
+    Uses Conv1d(kernel=1) classifier → no GAP, no 1/T dilution.
+    Each frame receives an independent speaker identity gradient.
+    
+    Args:
+        logits: [B, num_speakers, T] from Conv1d classifier
+        target_indices: [B, T] expanded from batch["target_speaker_idx"]
+    Returns:
+        scalar cross-entropy loss
+    """
+    def forward(
+        self,
+        logits: torch.Tensor,           # [B, num_speakers, T]
+        target_indices: torch.Tensor,   # [B, T]
+    ) -> torch.Tensor:
+        return F.cross_entropy(logits, target_indices)
 
 
-if __name__ == "__main__":
-    main()
+# ------------------------------------------------------------------
+# 4. Aggregator – easy extension point for new terms
+# ------------------------------------------------------------------
+class VCGeneratorLoss(nn.Module):
+    """
+    Primary loss module used by the trainer. Aggregates mel, STFT,
+    and speaker identity losses.
+
+    Example:
+        # In your trainer
+        loss_module = VCGeneratorLoss(train_cfg, speaker_encoder_model)
+        losses = loss_module(pred_mel, gt_mel, pred_wav, gt_wav)
+        total_loss = losses.total()  # scalar for .backward()
+        total_loss.backward()
+    """
+
+    def __init__(
+        self,
+        cfg: TrainingConfig,
+        speaker_encoder: Optional[nn.Module] = None,
+    ) -> None:
+        """
+        Initializes the loss aggregator.
+
+        Args:
+            cfg (TrainingConfig): Configuration object with loss weights.
+            speaker_encoder (nn.Module): A pre-trained, frozen speaker
+                verification model used for the SpeakerIdentityLoss.
+        """
+        super().__init__()
+        self.cfg = cfg
+
+        # --- Instantiate individual loss components ---
+
+        # 1. Mel-spectrogram L1 reconstruction loss
+        self.mel_loss = NormalizedMelLoss(weight_l1=0.7) # Using Normalized L1
+
+        # 2. Multi-resolution STFT loss
+        self.stft_loss = MRSTFTLoss()
+
+        # 3. Speaker identity loss
+        self.speaker_loss: Optional[SpeakerIdentityLoss] = None
+        self.mel_stats_loss = MelSpectralStatsLoss()
+        
+        if hasattr(cfg, 'lambda_spk') and cfg.lambda_spk > 0:
+            if speaker_encoder is None:
+                print("Warning: lambda_spk > 0 but speaker_encoder is None. Using MelStatsLoss only.")
+            else:
+                self.speaker_loss = SpeakerIdentityLoss(speaker_encoder)
+        else:
+            print(
+                "Warning: `lambda_spk` is not defined or is 0. "
+                "Speaker Identity / Stats losses will be disabled."
+            )
+
+
+    def forward(
+        self,
+        pred_mel: torch.Tensor,             # (B, n_mel, T_mel)
+        gt_mel: torch.Tensor,               # (B, n_mel, T_mel)
+        pred_wave: torch.Tensor,            # (B, T_wav)
+        gt_wave: torch.Tensor,              # (B, T_wav)
+        gt_lengths: torch.Tensor = None,    # (B,) real mel frame counts (excludes padding)
+    ) -> LossOutputs:
+        """
+        Computes the weighted sum of all configured losses.
+        """
+        outs = LossOutputs()
+
+        # --- Compute and weight each loss term ---
+
+        # Mel reconstruction loss (Normalized L1)
+        # Option C decoder normalization prevents Conv1d from overfitting amplitude.
+        # Normalized L1 prevents misaligned high-variance predictions from crushing scale.
+        if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
+            try:
+                # Mask computation
+                T_common = min(pred_mel.size(-1), gt_mel.size(-1))
+                p_align = pred_mel[:, :, :T_common]
+                g_align = gt_mel[:, :, :T_common]
+                
+                l_mel = self.mel_loss(p_align, g_align, lengths=gt_lengths)
+                outs["mel"] = self.cfg.lambda_mel * l_mel
+            except Exception as exc:
+                raise RuntimeError(f"Mel loss failed: {exc}") from exc
+
+        # Multi-resolution STFT loss
+        if hasattr(self.cfg, 'lambda_rec') and self.cfg.lambda_rec > 0 and pred_wave is not None and gt_wave is not None:
+            try:
+                l_stft = self.stft_loss(pred_wave, gt_wave)
+                outs["stft"] = self.cfg.lambda_rec * l_stft
+            except Exception as exc:
+                raise RuntimeError(f"STFT loss failed: {exc}") from exc
+
+        # Speaker identity & Stats loss
+        if hasattr(self.cfg, 'lambda_spk') and self.cfg.lambda_spk > 0:
+            try:
+                # 1. Always compute the highly potent Mel Stats Loss
+                l_spk_stats = self.mel_stats_loss(pred_mel, gt_mel, lengths=gt_lengths)
+                outs["speaker"] = self.cfg.lambda_spk * l_spk_stats
+                
+                # 2. Add True Speaker Cosine Loss IF waveforms were generated (not OOMing)
+                if self.speaker_loss is not None and pred_wave is not None and gt_wave is not None:
+                    l_spk_wave = self.speaker_loss(pred_wave, gt_wave) 
+                    outs["speaker"] = outs["speaker"] + (self.cfg.lambda_spk * l_spk_wave)
+            except Exception as exc:
+                raise RuntimeError(f"Speaker/Stats loss failed: {exc}") from exc
+
+        # Mel variance loss — penalizes compressed dynamic range (pred σ ≈ 1.3 vs GT σ ≥ 2.5)
+        if hasattr(self.cfg, 'lambda_var') and self.cfg.lambda_var > 0:
+            try:
+                if gt_lengths is not None:
+                    B, N = pred_mel.shape[0], pred_mel.shape[1]
+                    # Align time dimensions: decoder may produce 1-2 fewer frames than GT
+                    T_common = min(pred_mel.size(-1), gt_mel.size(-1))
+                    pred_aligned = pred_mel[:, :, :T_common]
+                    gt_aligned = gt_mel[:, :, :T_common]
+                    lengths = gt_lengths.clamp(max=T_common)
+                    mask = (torch.arange(T_common, device=pred_mel.device)[None, None, :] < lengths[:, None, None]).float()
+                    valid_counts = lengths.float().clamp(min=1.0)  # [B]
+                    # Masked mean per band
+                    pred_mean = (pred_aligned * mask).sum(dim=-1) / valid_counts[:, None]
+                    tgt_mean = (gt_aligned * mask).sum(dim=-1) / valid_counts[:, None]
+                    # Masked variance per band
+                    pred_sq = ((pred_aligned - pred_mean[:, :, None]) ** 2) * mask
+                    tgt_sq = ((gt_aligned - tgt_mean[:, :, None]) ** 2) * mask
+                    pred_std = torch.sqrt(pred_sq.sum(dim=-1) / valid_counts[:, None] + 1e-8)
+                    tgt_std = torch.sqrt(tgt_sq.sum(dim=-1) / valid_counts[:, None] + 1e-8)
+                else:
+                    T_common = min(pred_mel.size(-1), gt_mel.size(-1))
+                    pred_std = pred_mel[:, :, :T_common].std(dim=-1)  # [B, 80]
+                    tgt_std = gt_mel[:, :, :T_common].std(dim=-1)
+                l_var = F.l1_loss(pred_std, tgt_std)
+                outs["var"] = self.cfg.lambda_var * l_var
+            except Exception as exc:
+                raise RuntimeError(f"Variance loss failed: {exc}") from exc
+
+        return outs
+
+
+# ------------------------------------------------------------------
+# Stand-alone sanity check
+# ------------------------------------------------------------------
+if __name__ == "__main__":  # pragma: no cover
+    print("Quick losses.py self-test…")
+    torch.manual_seed(0)
+    B, T_mel, N_MEL = 2, 100, 80
+    T_wav = 16000
+    EMBED_DIM = 256
+
+    # Add lambda_spk to the dummy config
+    class TrainingConfig:
+        lambda_mel = 1.0
+        lambda_rec = 1.0
+        lambda_spk = 1.0
+        stft_fft_sizes = (512, 1024, 2048)
+        stft_hop_sizes = (128, 256, 512)
+        stft_win_lengths = (512, 1024, 2048)
+    
+    cfg = TrainingConfig()
+
+    # --- Dummy data ---
+    pred_mel = torch.randn(B, N_MEL, T_mel)
+    gt_mel = torch.randn_like(pred_mel) * 0.8 # Make it slightly different
+    pred_wave = torch.randn(B, T_wav)
+    gt_wave = torch.randn_like(pred_wav) * 0.9
+
+    # --- Fake Speaker Encoder for testing ---
+    class _DummySpeakerEncoder(nn.Module):
+        def __init__(self, embed_dim):
+            super().__init__()
+            # A simple linear layer to project mel to embedding
+            self.proj = nn.Linear(N_MEL, embed_dim)
+
+        def forward(self, mel):
+            # (B, n_mels, T) -> (B, T, n_mels) -> mean pool -> (B, n_mels) -> proj
+            return self.proj(mel.transpose(1, 2).mean(dim=1))
+
+    speaker_encoder = _DummySpeakerEncoder(EMBED_DIM)
+    
+    # --- Initialize and run the final loss module ---
+    loss_mod = VCGeneratorLoss(cfg, speaker_encoder)
+
+    out = loss_mod(pred_mel, gt_mel, pred_wave, gt_wave)
+    
+    print("  Individual:", {k: f"{v.item():.4f}" for k, v in out.items()})
+    print(f"  Total:      {out.total().item():.4f}")
+
+    # Test backward pass
+    try:
+        out.total().backward()
+        print("✓ Backward pass successful.")
+    except Exception as e:
+        print(f"✗ Backward pass failed: {e}")
+
+    print("✓ losses.py self-test passed")
+

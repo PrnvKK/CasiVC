@@ -405,10 +405,9 @@ class VCGeneratorLoss(nn.Module):
 
         # --- Compute and weight each loss term ---
 
-        # Mel reconstruction loss (Normalized Shape L1)
-        # We instance-normalize both pred and gt per-band before L1.
-        # This completely decouples shape error from scale/variance error.
-        # L1 can no longer crush the model's variance, and output_scale is driven PURELY by var_loss.
+        # Mel reconstruction loss (Raw L1)
+        # Option C decoder normalization prevents Conv1d from overfitting amplitude.
+        # Raw L1 provides the single-hop gradient that drives output_scale upward.
         if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
             try:
                 # Mask computation
@@ -416,26 +415,7 @@ class VCGeneratorLoss(nn.Module):
                 p_align = pred_mel[:, :, :T_common]
                 g_align = gt_mel[:, :, :T_common]
                 
-                if gt_lengths is not None:
-                    lens = gt_lengths.clamp(max=T_common)
-                    mask = (torch.arange(T_common, device=pred_mel.device)[None, None, :] < lens[:, None, None]).float()
-                    v_counts = lens.float().clamp(min=1.0)[:, None]
-                    
-                    p_mean = (p_align * mask).sum(dim=-1) / v_counts
-                    g_mean = (g_align * mask).sum(dim=-1) / v_counts
-                    
-                    p_std = torch.sqrt((((p_align - p_mean[:, :, None]) ** 2) * mask).sum(dim=-1) / v_counts + 1e-8)
-                    g_std = torch.sqrt((((g_align - g_mean[:, :, None]) ** 2) * mask).sum(dim=-1) / v_counts + 1e-8)
-                else:
-                    p_mean = p_align.mean(dim=-1)
-                    g_mean = g_align.mean(dim=-1)
-                    p_std = p_align.std(dim=-1) + 1e-8
-                    g_std = g_align.std(dim=-1) + 1e-8
-
-                p_norm = (p_align - p_mean[:, :, None]) / p_std[:, :, None]
-                g_norm = (g_align - g_mean[:, :, None]) / g_std[:, :, None]
-                
-                l_mel = self.mel_loss(p_norm, g_norm, lengths=gt_lengths)
+                l_mel = self.mel_loss(p_align, g_align, lengths=gt_lengths)
                 outs["mel"] = self.cfg.lambda_mel * l_mel
             except Exception as exc:
                 raise RuntimeError(f"Mel loss failed: {exc}") from exc
