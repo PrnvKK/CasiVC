@@ -72,8 +72,8 @@ class PositionAgnosticCrossAttention(nn.Module):
         #self.alpha = nn.Parameter(torch.tensor(0.1))
         self.alpha = nn.Parameter(torch.tensor(2.0))
 
-        # Learnable attention temperature (softplus-constrained, starts ≈0.35 for sharper attention)
-        self.raw_temperature = nn.Parameter(torch.tensor(-0.9))  # F.softplus(-0.9) ≈ 0.34
+        # Learnable attention temperature (softplus-constrained, starts ≈0.19 for sharper attention)
+        self.raw_temperature = nn.Parameter(torch.tensor(-1.6))  # F.softplus(-1.6) ≈ 0.18
 
         # Multi-head attention (speaker features already at correct dimension)
         self.multihead_attn = nn.MultiheadAttention(
@@ -117,8 +117,8 @@ class PositionAgnosticCrossAttention(nn.Module):
         # std≈1.0, so its outputs are proportionally smaller. This scalar scales gamma/beta
         # back to meaningful modulation range WITHOUT reintroducing normalization noise.
         # Softplus reparameterization: scale = softplus(raw) + 0.5, always > 0.5
-        # Init: softplus(1.3) ≈ 1.5 + 0.5 = 2.0 — conservative start, learns upward if needed.
-        self.raw_film_scale = nn.Parameter(torch.tensor(1.3))
+        # Init: softplus(2.5) ≈ 2.6 + 0.5 = 3.1 — strong enough to imprint identity, stable enough to prevent hiccups.
+        self.raw_film_scale = nn.Parameter(torch.tensor(2.5))
 
         # AdaIN Mapping Network
         # Converts attention-weighted speaker features into per-frame
@@ -322,7 +322,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         # ------------------------------------------------------------------
         # MultiheadAttention (with Learnable Temperature Scaling)
         # ------------------------------------------------------------------
-        temperature = F.softplus(self.raw_temperature) + 0.01  # learnable, starts ≈0.5, ensures >0.01
+        temperature = F.softplus(self.raw_temperature) + 0.01  # learnable, starts ≈0.19, ensures >0.01
         queries_scaled = queries / temperature
         
         print(f"[cross_attn] attention temperature: {temperature.item():.4f}")
