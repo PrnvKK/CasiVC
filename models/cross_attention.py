@@ -387,6 +387,12 @@ class PositionAgnosticCrossAttention(nn.Module):
             # average spectral shape (timbre/formants), causing a "weird mix of both voices" and loss of nuance.
             # We want the target speaker's mean energy levels to be preserved.
 
+            # Gamma inversion guard: ELU bounds gamma to [-1, ∞), so (1+gamma) ≥ 0 always.
+            # Without this, gamma hitting -1.87 inverts residual channels → crackle/breakiness.
+            # ELU is preferred over hard clamp: gradient = exp(x) at x<0, non-zero, mapping network
+            # still learns to avoid the negative region naturally.
+            gamma = F.elu(gamma)
+
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
             print(f"[cross_attn] FiLM scale: {film_scale.item():.4f}")
@@ -403,6 +409,12 @@ class PositionAgnosticCrossAttention(nn.Module):
                   f"max={gamma_per_channel_std.max():.4f}, min={gamma_per_channel_std.min():.4f}")
             print(f"[cross_attn] FiLM gamma top-3 volatile channels: "
                   f"{list(zip(top3_idx[0].tolist(), [f'{v:.4f}' for v in top3_vals[0].tolist()]))}")
+            # Beta diagnostics: since DC removal is gone, log beta to confirm it is shifting
+            # the spectral envelope toward target speaker without exploding the mean.
+            print(f"[cross_attn] FiLM beta: mean={beta.mean():.4f}, std={beta.std():.4f}, "
+                  f"min={beta.min():.4f}, max={beta.max():.4f}")
+            beta_temporal_std = beta.std(dim=1).mean()
+            print(f"[cross_attn] FiLM beta temporal std: {beta_temporal_std:.4f}")
             attended_features = attended_features + (residual_norm * (1.0 + gamma) + beta)
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
