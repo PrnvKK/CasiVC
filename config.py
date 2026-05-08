@@ -149,7 +149,7 @@ class TrainingConfig:
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
   lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
   lambda_var: float = 15.0     # Raised from 4.0 to overcome L1 dominance and force the learnable scale to grow
-  lambda_entropy: float = 0.5   # One-sided hinge: penalizes entropy > 1.2, zero cost if already sharp
+  lambda_entropy: float = 1.0   # Two-sided hinge [1.0, 1.5]: doubled from 0.5 — entropy at 1.75-1.93 needs stronger ceiling pressure
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
   cross_pair_prob: float = 1.0           # probability of applying cross-pair in a batch (increased for decisive diagnostic)
