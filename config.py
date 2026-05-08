@@ -152,11 +152,11 @@ class TrainingConfig:
   lambda_entropy: float = 0.5   # One-sided hinge: penalizes entropy > 1.2, zero cost if already sharp
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
-  cross_pair_prob: float = 0.25          # probability of applying cross-pair in a batch
+  cross_pair_prob: float = 1.0           # probability of applying cross-pair in a batch (increased for decisive diagnostic)
   cross_pair_stats_weight: float = 2.0   # weight multiplier for cross-pair Mel Stats loss
 
   # Speaker classifier head at decoder bottleneck
-  classifier_weight: float = 0.1         # weight for per-frame CE loss on target speaker ID
+  classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0

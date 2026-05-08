@@ -153,7 +153,7 @@ class HubertVCModel(nn.Module):
         self.info_bottleneck = nn.Sequential(
             nn.Linear(self.m_cfg.cross_attention_dim, self.ib_dim),
             nn.LayerNorm(self.ib_dim),
-            nn.Tanh(),  # Bounding it softly creates a continuous pseudo-quantization
+            nn.GELU(),  # Replaced Tanh to prevent hard saturation and information loss
             nn.Linear(self.ib_dim, self.m_cfg.cross_attention_dim),
             nn.LayerNorm(self.m_cfg.cross_attention_dim)
         )
