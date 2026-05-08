@@ -234,11 +234,12 @@ class MobileNetDecoder(nn.Module):
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
-        # Per-band output scale: direct amplitude lever for mel dynamic range recovery.
-        # Initialized at 1.5 so mel std ~1.5 * 1.5 = 2.25 at run start, near the 2.5 GT target.
-        # Trained by raw L1 + variance loss — both provide non-zero gradient per band.
-        # Distinct from Option C (Run 10-15): no normalization, no instance-norm, pure multiplicative.
+        # Per-band output scale + bias: decouple variance from mean.
+        # out_scale: variance lever (L1 + variance loss pull it toward ~1.5)
+        # out_bias: mean correction lever (L1 uses this to fix any mean offset, leaving out_scale free)
+        # This prevents out_scale from being pulled back toward 1.0 by mean-shift conflict.
         self.out_scale = nn.Parameter(torch.ones(1, 80, 1) * 1.5)
+        self.out_bias  = nn.Parameter(torch.zeros(80))
 
 
 
@@ -350,7 +351,7 @@ class MobileNetDecoder(nn.Module):
           
         
         mel = self.mel_proj(x)
-        mel = mel * self.out_scale   # per-band amplitude scale: init 1.5, direct mel std lever
+        mel = mel * self.out_scale.view(1, 80, 1) + self.out_bias.view(1, 80, 1)  # decouple: scale owns variance, bias owns mean
         mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
         self._check(mel, "mel_proj")
         
