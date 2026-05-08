@@ -52,13 +52,10 @@ class LossOutputs(dict):
 # ------------------------------------------------------------------
 # 1. Mel-spectrogram reconstruction – L1 (+ optional L2 blend)
 # ------------------------------------------------------------------
-class NormalizedMelLoss(nn.Module):
+class MelSpectrogramLoss(nn.Module):
     """
-    Decouples structural (shape) reconstruction from absolute amplitude.
-    Computes L1 loss on zero-mean, unit-variance mel spectrograms.
-    This prevents the reconstruction loss from aggressively penalizing 
-    high-variance outputs before they are perfectly aligned, which 
-    otherwise causes variance collapse.
+    L1 / L2 loss on log-mel spectrograms.
+    `weight_l1` controls the blend (1.0 = pure L1, 0.5 = 50-50).
     """
     def __init__(self, weight_l1: float = 1.0) -> None:
         super().__init__()
@@ -79,41 +76,18 @@ class NormalizedMelLoss(nn.Module):
             # Build a (B, T) boolean mask of real frames, broadcast over mels
             T = pred.size(-1)
             mask = (torch.arange(T, device=pred.device)[None, :] < lengths[:, None])  # (B, T)
-            mask_float = mask.unsqueeze(1).float()
-            valid_counts = lengths.float().clamp(min=1.0).view(-1, 1, 1)
-
-            p_mean = (pred * mask_float).sum(dim=-1, keepdim=True) / valid_counts
-            t_mean = (target * mask_float).sum(dim=-1, keepdim=True) / valid_counts
-
-            p_var = (((pred - p_mean)**2) * mask_float).sum(dim=-1, keepdim=True) / valid_counts
-            t_var = (((target - t_mean)**2) * mask_float).sum(dim=-1, keepdim=True) / valid_counts
-
-            p_std = torch.sqrt(p_var + 1e-6)
-            t_std = torch.sqrt(t_var + 1e-6)
-
-            pred_norm = (pred - p_mean) / p_std
-            target_norm = (target - t_mean) / t_std
-
             mask = mask.unsqueeze(1).expand_as(pred)  # (B, n_mels, T)
             # Only compute loss over real frames
-            l1 = (pred_norm - target_norm).abs()[mask].mean()
+            l1 = (pred - target).abs()[mask].mean()
             if self.weight_l1 >= 1.0 - 1e-6:
                 return l1
-            l2 = ((pred_norm - target_norm) ** 2)[mask].mean()
+            l2 = ((pred - target) ** 2)[mask].mean()
             return self.weight_l1 * l1 + (1.0 - self.weight_l1) * l2
         else:
-            p_mean = pred.mean(dim=-1, keepdim=True)
-            t_mean = target.mean(dim=-1, keepdim=True)
-            p_std = pred.std(dim=-1, keepdim=True) + 1e-6
-            t_std = target.std(dim=-1, keepdim=True) + 1e-6
-
-            pred_norm = (pred - p_mean) / p_std
-            target_norm = (target - t_mean) / t_std
-
-            l1 = F.l1_loss(pred_norm, target_norm)
+            l1 = F.l1_loss(pred, target)
             if self.weight_l1 >= 1.0 - 1e-6:
                 return l1
-            l2 = F.mse_loss(pred_norm, target_norm)
+            l2 = F.mse_loss(pred, target)
 
         return self.weight_l1 * l1 + (1.0 - self.weight_l1) * l2
 
@@ -396,7 +370,7 @@ class VCGeneratorLoss(nn.Module):
         # --- Instantiate individual loss components ---
 
         # 1. Mel-spectrogram L1 reconstruction loss
-        self.mel_loss = NormalizedMelLoss(weight_l1=0.7) # Using Normalized L1
+        self.mel_loss = MelSpectrogramLoss(weight_l1=0.7) # Raw L1
 
         # 2. Multi-resolution STFT loss
         self.stft_loss = MRSTFTLoss()
@@ -432,9 +406,7 @@ class VCGeneratorLoss(nn.Module):
 
         # --- Compute and weight each loss term ---
 
-        # Mel reconstruction loss (Normalized L1)
-        # Option C decoder normalization prevents Conv1d from overfitting amplitude.
-        # Normalized L1 prevents misaligned high-variance predictions from crushing scale.
+        # Mel reconstruction loss (Raw L1)
         if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
             try:
                 # Mask computation

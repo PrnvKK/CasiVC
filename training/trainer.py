@@ -143,18 +143,8 @@ class Trainer:
         # ----------------------------------------------------------
         # 5. optimiser & scheduler
         # ----------------------------------------------------------
-        base_params = []
-        scale_params = []
-        for n, p in self.model.named_parameters():
-            if 'output_scale' in n:
-                scale_params.append(p)
-            else:
-                base_params.append(p)
-
-        self.optimizer = Adam([
-            {"params": base_params},
-            {"params": scale_params, "lr": self.train_cfg.learning_rate * 10.0}
-        ],
+        self.optimizer = Adam(
+            self.model.parameters(),
             lr=self.train_cfg.learning_rate,
             betas=(self.train_cfg.adam_beta1, self.train_cfg.adam_beta2),
         )
@@ -710,8 +700,7 @@ class Trainer:
             self.analyze_gradient_flow()
 
             if self.grad_clip:
-                # Exclude output_scale from global gradient clipping to prevent extreme attenuation
-                params_to_clip = [p for n, p in self.model.named_parameters() if 'output_scale' not in n and p.requires_grad]
+                params_to_clip = [p for p in self.model.parameters() if p.requires_grad]
                 params_to_clip += [p for p in self.vocoder.parameters() if p.requires_grad]
                 torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=2.0)
 
