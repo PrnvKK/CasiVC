@@ -160,7 +160,7 @@ class MelEncoder(nn.Module):
     def _init_projection(self):
         for module in self.projection.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.03)  # reduced from 0.1 to prevent Tanh saturation (max → 0.86, not 0.9997)
+                nn.init.xavier_uniform_(module.weight, gain=0.06)  # increased from 0.03 to 0.06 to improve token diversity without hard saturation
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 

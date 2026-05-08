@@ -383,12 +383,9 @@ class PositionAgnosticCrossAttention(nn.Module):
             gamma = gamma * film_scale
             beta  = beta  * film_scale
 
-            # β DC removal: subtract per-channel temporal mean to zero the speaker-specific
-            # mel mean offset. Proven cause: B→B and B→A share identical content but their
-            # mel mean differs by +1.0 unit (B→B mean=−3.245, B→A mean=−4.244) — only β
-            # can produce this shift since residual_norm is zero-mean. dim=1 removes the
-            # temporal DC [B,1,96] while preserving per-frame variation (the AC component).
-            beta = beta - beta.mean(dim=1, keepdim=True)
+            # Beta DC removal REMOVED: subtracting the temporal mean destroyed the target speaker's
+            # average spectral shape (timbre/formants), causing a "weird mix of both voices" and loss of nuance.
+            # We want the target speaker's mean energy levels to be preserved.
 
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
