@@ -397,14 +397,25 @@ class PositionAgnosticCrossAttention(nn.Module):
             # on the time axis. Smoothes frame-level FiLM modulation jitter that causes
             # shimmer/breakiness. Replicate padding preserves edge frames instead of
             # attenuating them (zero padding distorts first/last frames).
-            # Beta is NOT smoothed — it carries the speaker's spectral envelope/nuance.
+            # PARTIAL blending (50/50 raw+smooth): retains some per-frame sharpness
+            # for speaker nuance while still reducing the worst jitter peaks.
+            # Beta is NOT smoothed — it carries the speaker's spectral envelope.
             # gamma shape: [B, T, 96] → [B, 96, T] → pooled → [B, T, 96]
+            gamma_raw = gamma  # save for 50/50 blend
             gamma_t = gamma.transpose(1, 2)  # [B, 96, T]
             # Manual replicate padding to avoid zero-padding edge distortion
             first_pad = gamma_t[:, :, :1]     # [B, 96, 1] — replicate first frame
             last_pad  = gamma_t[:, :, -1:]    # [B, 96, 1] — replicate last frame
             gamma_t_padded = torch.cat([first_pad, gamma_t, last_pad], dim=2)  # [B, 96, T+2]
-            gamma = F.avg_pool1d(gamma_t_padded, kernel_size=3, stride=1).transpose(1, 2)  # [B, T, 96]
+            gamma_smooth = F.avg_pool1d(gamma_t_padded, kernel_size=3, stride=1).transpose(1, 2)  # [B, T, 96]
+            # 50/50 blend: recover some per-frame sharpness for speaker nuance
+            gamma = 0.5 * gamma_raw + 0.5 * gamma_smooth
+
+            # Beta soft magnitude guard: 2*tanh(beta/2) bounds beta to (-2, 2)
+            # with smooth gradients. Prevents extreme ±2.19 excursions that cause
+            # per-frame spectral envelope spikes ("noisy sheet" symptom).
+            # Not smoothing — just a gradient-safe guardrail on the extremes.
+            beta = 2.0 * torch.tanh(beta / 2.0)
 
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
