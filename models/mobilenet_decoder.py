@@ -351,7 +351,14 @@ class MobileNetDecoder(nn.Module):
           
         
         mel = self.mel_proj(x)
-        mel = mel * self.out_scale.view(1, 80, 1) + self.out_bias.view(1, 80, 1)  # decouple: scale owns variance, bias owns mean
+        # out_scale/out_bias DISABLED for diagnostic run: mel = mel * out_scale + out_bias
+        # On: revert to pure mel_proj to test whether Conv1d compression is the real bottleneck.
+        # If mel std stays flat without affine → bottleneck is upstream at mel_proj weights.
+        # Diagnostic: log current out_scale/out_bias values even when in bypass.
+        print(f"[decoder] out_scale: mean={self.out_scale.mean():.4f}, std={self.out_scale.std():.4f}, "
+              f"min={self.out_scale.min():.4f}, max={self.out_scale.max():.4f}")
+        print(f"[decoder] out_bias:  mean={self.out_bias.mean():.4f}, std={self.out_bias.std():.4f}, "
+              f"min={self.out_bias.min():.4f}, max={self.out_bias.max():.4f}")
         mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
         self._check(mel, "mel_proj")
         

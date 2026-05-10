@@ -393,12 +393,18 @@ class PositionAgnosticCrossAttention(nn.Module):
             # still learns to avoid the negative region naturally.
             gamma = F.elu(gamma)
 
-            # Temporal smoothing: 3-frame moving average over the time axis to reduce
-            # frame-level FiLM modulation jitter (shimmer/breakiness from gamma temporal std peaks).
-            # gamma/beta shape: [B, T, 96] -> [B, 96, T] -> avg_pool1d -> [B, T, 96]
-            # Gradient flows cleanly through avg_pool1d (uniform convolution, no dead zones).
-            gamma = F.avg_pool1d(gamma.transpose(1, 2), kernel_size=3, stride=1, padding=1).transpose(1, 2)
-            beta  = F.avg_pool1d(beta.transpose(1, 2),  kernel_size=3, stride=1, padding=1).transpose(1, 2)
+            # Temporal smoothing (gamma only): 3-frame moving average with replicate padding
+            # on the time axis. Smoothes frame-level FiLM modulation jitter that causes
+            # shimmer/breakiness. Replicate padding preserves edge frames instead of
+            # attenuating them (zero padding distorts first/last frames).
+            # Beta is NOT smoothed — it carries the speaker's spectral envelope/nuance.
+            # gamma shape: [B, T, 96] → [B, 96, T] → pooled → [B, T, 96]
+            gamma_t = gamma.transpose(1, 2)  # [B, 96, T]
+            # Manual replicate padding to avoid zero-padding edge distortion
+            first_pad = gamma_t[:, :, :1]     # [B, 96, 1] — replicate first frame
+            last_pad  = gamma_t[:, :, -1:]    # [B, 96, 1] — replicate last frame
+            gamma_t_padded = torch.cat([first_pad, gamma_t, last_pad], dim=2)  # [B, 96, T+2]
+            gamma = F.avg_pool1d(gamma_t_padded, kernel_size=3, stride=1).transpose(1, 2)  # [B, T, 96]
 
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
