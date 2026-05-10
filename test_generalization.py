@@ -68,6 +68,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     torchaudio.save(os.path.join(output_dir, "03_vocoded_A.wav"), vocoded_A.unsqueeze(0), audio_cfg.sample_rate)
     torchaudio.save(os.path.join(output_dir, "04_vocoded_B.wav"), vocoded_B.unsqueeze(0), audio_cfg.sample_rate)
     print("✅ Saved vocoded GT mels for A and B")
+    print(f"   GT mel A: mean={gt_mel_A.mean():.4f}, std={gt_mel_A.std():.4f}")
+    print(f"   GT mel B: mean={gt_mel_B.mean():.4f}, std={gt_mel_B.std():.4f}")
 
     # ── Load model ─────────────────────────────────────────────────
     print(f"\n[4] Loading Model from {checkpoint_path}...")
@@ -133,7 +135,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         pred_mel_AA, _, _ = model(ref_A.unsqueeze(0), [content_A])
         wave_AA = vocoder(pred_mel_AA).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "05_self_recon_A.wav"), wave_AA.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_AA.shape}, mean={pred_mel_AA.mean():.4f}")
+        print(f"   Pred mel: {pred_mel_AA.shape}, mean={pred_mel_AA.mean():.4f}, std={pred_mel_AA.std():.4f}")
         print("✅ Saved A→A")
 
         # ── Test 4: Self-reconstruction B → B ─────────────────────
@@ -141,7 +143,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         pred_mel_BB, _, _ = model(ref_B.unsqueeze(0), [content_B])
         wave_BB = vocoder(pred_mel_BB).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "06_self_recon_B.wav"), wave_BB.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_BB.shape}, mean={pred_mel_BB.mean():.4f}")
+        print(f"   Pred mel: {pred_mel_BB.shape}, mean={pred_mel_BB.mean():.4f}, std={pred_mel_BB.std():.4f}")
         print("✅ Saved B→B")
 
         # ── Test 5: Cross-conversion A content → B voice (Man speaking as Woman) ──────────
@@ -149,7 +151,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         pred_mel_AB, _, _ = model(ref_B.unsqueeze(0), [content_A])
         wave_AB = vocoder(pred_mel_AB).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "07_cross_AtoB.wav"), wave_AB.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_AB.shape}, mean={pred_mel_AB.mean():.4f}")
+        print(f"   Pred mel: {pred_mel_AB.shape}, mean={pred_mel_AB.mean():.4f}, std={pred_mel_AB.std():.4f}")
         print("✅ Saved A→B")
 
         # ── Test 6: Cross-conversion B content → A voice (Woman speaking as Man) ──────────
@@ -157,7 +159,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         pred_mel_BA, _, _ = model(ref_A.unsqueeze(0), [content_B])
         wave_BA = vocoder(pred_mel_BA).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "08_cross_BtoA.wav"), wave_BA.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}")
+        print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}, std={pred_mel_BA.std():.4f}")
         print("✅ Saved B→A")
 
     print("\n" + "="*60)
