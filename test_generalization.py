@@ -124,7 +124,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         wave_blend = vocoder(pred_blend_A).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "09_blend_A_spk50.wav"), 
                         wave_blend.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"  Blended mel mean: {pred_blend_A.mean():.4f}")
+        print(f"  Blended mel mean: {pred_blend_A.mean():.4f}, std={pred_blend_A.std():.4f}")
         print("✅ Saved 09_blend_A_spk50.wav  (Man content + 50% Man / 50% Woman voice)")
     print()
     # ──────────────────────────────────────────────────────────────────
@@ -171,6 +171,22 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("  06_self_recon_B.wav    → Model: Woman content + Woman voice")
     print("  07_cross_AtoB.wav      → Model: Man's WORDS in Woman's VOICE ← Key Test!")
     print("  08_cross_BtoA.wav      → Model: Woman's WORDS in Man's VOICE ← Key Test!")
+    print("="*60)
+    
+    print("\n" + "="*60)
+    print("📊 VARIANCE SUMMARY (GT vs Pred)")
+    print("="*60)
+    print(f"  GT mel A:           mean={gt_mel_A.mean():.4f}, std={gt_mel_A.std():.4f}")
+    print(f"  GT mel B:           mean={gt_mel_B.mean():.4f}, std={gt_mel_B.std():.4f}")
+    print(f"  A→A pred:           mean={pred_mel_AA.mean():.4f}, std={pred_mel_AA.std():.4f}  "
+          f"(std ratio={pred_mel_AA.std().item()/gt_mel_A.std().item():.3f})")
+    print(f"  B→B pred:           mean={pred_mel_BB.mean():.4f}, std={pred_mel_BB.std():.4f}  "
+          f"(std ratio={pred_mel_BB.std().item()/gt_mel_B.std().item():.3f})")
+    print(f"  A→B pred:           mean={pred_mel_AB.mean():.4f}, std={pred_mel_AB.std():.4f}  "
+          f"(std ratio={pred_mel_AB.std().item()/gt_mel_B.std().item():.3f})")
+    print(f"  B→A pred:           mean={pred_mel_BA.mean():.4f}, std={pred_mel_BA.std():.4f}  "
+          f"(std ratio={pred_mel_BA.std().item()/gt_mel_A.std().item():.3f})")
+    print(f"  Blend (A+50%):      mean={pred_blend_A.mean():.4f}, std={pred_blend_A.std():.4f}")
     print("="*60)
 
 if __name__ == "__main__":

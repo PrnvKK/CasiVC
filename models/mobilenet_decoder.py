@@ -235,11 +235,11 @@ class MobileNetDecoder(nn.Module):
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
         # Per-band output scale + bias: decouple variance from mean.
-        # out_scale: variance lever (L1 + variance loss pull it toward ~1.5)
-        # out_bias: mean correction lever (L1 uses this to fix any mean offset, leaving out_scale free)
-        # This prevents out_scale from being pulled back toward 1.0 by mean-shift conflict.
-        self.out_scale = nn.Parameter(torch.ones(1, 80, 1) * 1.5)
-        self.out_bias  = nn.Parameter(torch.zeros(80))
+        # out_scale: identity start at 1.0 — variance loss pushes it upward. out_bias
+        # starts at 0 and absorbs L1 mean correction, preventing the mean-shift conflict
+        # that previously decayed out_scale from 1.5 toward 1.0.
+        self.out_scale = nn.Parameter(torch.ones(1, 80, 1))        # identity start
+        self.out_bias  = nn.Parameter(torch.zeros(80))             # zero start
 
 
 
@@ -351,10 +351,10 @@ class MobileNetDecoder(nn.Module):
           
         
         mel = self.mel_proj(x)
-        # out_scale/out_bias DISABLED for diagnostic run: mel = mel * out_scale + out_bias
-        # On: revert to pure mel_proj to test whether Conv1d compression is the real bottleneck.
-        # If mel std stays flat without affine → bottleneck is upstream at mel_proj weights.
-        # Diagnostic: log current out_scale/out_bias values even when in bypass.
+        # Re-enabled out_scale + out_bias with identity start (1.0 / 0.0).
+        # Variance loss gradient flows directly through out_scale → bypasses decoder depth.
+        # L1 mean correction flows through out_bias → no conflict with out_scale.
+        mel = mel * self.out_scale.view(1, 80, 1) + self.out_bias.view(1, 80, 1)
         print(f"[decoder] out_scale: mean={self.out_scale.mean():.4f}, std={self.out_scale.std():.4f}, "
               f"min={self.out_scale.min():.4f}, max={self.out_scale.max():.4f}")
         print(f"[decoder] out_bias:  mean={self.out_bias.mean():.4f}, std={self.out_bias.std():.4f}, "
