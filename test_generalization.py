@@ -107,9 +107,11 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         else:
             print("Speaker space is WELL-SEPARATED. Problem is training task (no cross-pair training).")
     print()
-    # ─────────────────────────────────────────────────────────────────────
 
-    # ── Interpolation Probe ───────────────────────────────────────────
+    # Initialize beta cache for per-speaker FiLM analysis
+    beta_cache = {}
+
+    # ── Interpolation Probe ──────────────────────────────────────────
     print("[INTERPOLATION PROBE]")
     with torch.no_grad():
         spk_A = model.mel_encoder([ref_A.to(device)]) # [1, 1, 96]
@@ -121,18 +123,73 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             precomputed_speaker_feats=blended_spk,
             content_audio=[content_A.to(device)]
         )
+        beta_cache['blend'] = model.cross_attn._cached_beta.clone()
         wave_blend = vocoder(pred_blend_A).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "09_blend_A_spk50.wav"), 
                         wave_blend.unsqueeze(0), audio_cfg.sample_rate)
         print(f"  Blended mel mean: {pred_blend_A.mean():.4f}, std={pred_blend_A.std():.4f}")
         print("✅ Saved 09_blend_A_spk50.wav  (Man content + 50% Man / 50% Woman voice)")
     print()
+
+    # ================================================================
+    # DIAGNOSTIC A: Information Bottleneck Speaker Leakage Probe
+    # ================================================================
+    print("\n" + "="*60)
+    print("[DIAGNOSTIC A] INFORMATION BOTTLENECK 32D SPEAKER LEAKAGE")
+    print("="*60)
+    with torch.no_grad():
+        # Run both speakers' audio through HuBERT → hubert_proj → bottleneck[:3]
+        hubert_A = model.hubert([content_A.to(device)])      # [1, T_A, 768]
+        hubert_B = model.hubert([content_B.to(device)])      # [1, T_B, 768]
+        proj_A = model.hubert_proj(hubert_A)                  # [1, T_A, 96]
+        proj_B = model.hubert_proj(hubert_B)                  # [1, T_B, 96]
+        # Extract 32D chokepoint: info_bottleneck[:3] = Linear→LayerNorm→GELU
+        bn_32_A = model.info_bottleneck[:3](proj_A).squeeze(0)  # [T_A, 32]
+        bn_32_B = model.info_bottleneck[:3](proj_B).squeeze(0)  # [T_B, 32]
+
+        mean_A = bn_32_A.mean(dim=0)  # [32]
+        mean_B = bn_32_B.mean(dim=0)  # [32]
+
+        cos_bn = torch.nn.functional.cosine_similarity(
+            mean_A.unsqueeze(0), mean_B.unsqueeze(0)
+        ).item()
+        l2_bn = torch.norm(mean_A - mean_B, p=2).item()
+
+        print(f"  Bottleneck frames A: {bn_32_A.shape[0]}, B: {bn_32_B.shape[0]}")
+        print(f"  Mean-A vector: μ={mean_A.mean():.4f}, σ={mean_A.std():.4f}")
+        print(f"  Mean-B vector: μ={mean_B.mean():.4f}, σ={mean_B.std():.4f}")
+        print(f"  Cosine similarity (mean-A vs mean-B): {cos_bn:.4f}")
+        print(f"  L2 distance   (mean-A vs mean-B):    {l2_bn:.4f}")
+
+        # Nearest-centroid per-frame classification
+        centroids = torch.stack([mean_A, mean_B])          # [2, 32]
+        all_feats = torch.cat([bn_32_A, bn_32_B])           # [T_A+T_B, 32]
+        labels = torch.cat([
+            torch.zeros(bn_32_A.shape[0]),
+            torch.ones(bn_32_B.shape[0])
+        ]).to(device)
+        dists = torch.cdist(all_feats, centroids)           # [T_A+T_B, 2]
+        preds = dists.argmin(dim=1)
+        acc = (preds == labels).float().mean().item()
+
+        print(f"  Nearest-centroid frame accuracy: {acc:.4f} (chance=0.50)")
+        if acc > 0.70:
+            print(f"  ⚠️  SEVERE LEAK: Bottleneck 32D strongly retains speaker identity (>70%)")
+        elif acc > 0.60:
+            print(f"  ⚠️  MODERATE LEAK: Source-speaker info survives bottleneck (>60%)")
+        elif acc > 0.55:
+            print(f"  ⚠️  MILD: Weak speaker signal in bottleneck (55-60%)")
+        else:
+            print(f"  ✅ Bottleneck effectively scrubs speaker-discriminable content (≤55%)")
+    print("="*60)
+
     # ──────────────────────────────────────────────────────────────────
 
     with torch.no_grad():
         # ── Test 3: Self-reconstruction A → A ─────────────────────
         print("\n[5] Self-reconstruction: A content + A voice...")
         pred_mel_AA, _, _ = model(ref_A.unsqueeze(0), [content_A])
+        beta_cache['AA'] = model.cross_attn._cached_beta.clone()
         wave_AA = vocoder(pred_mel_AA).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "05_self_recon_A.wav"), wave_AA.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_AA.shape}, mean={pred_mel_AA.mean():.4f}, std={pred_mel_AA.std():.4f}")
@@ -141,6 +198,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         # ── Test 4: Self-reconstruction B → B ─────────────────────
         print("\n[6] Self-reconstruction: B content + B voice...")
         pred_mel_BB, _, _ = model(ref_B.unsqueeze(0), [content_B])
+        beta_cache['BB'] = model.cross_attn._cached_beta.clone()
         wave_BB = vocoder(pred_mel_BB).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "06_self_recon_B.wav"), wave_BB.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_BB.shape}, mean={pred_mel_BB.mean():.4f}, std={pred_mel_BB.std():.4f}")
@@ -149,6 +207,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         # ── Test 5: Cross-conversion A content → B voice (Man speaking as Woman) ──────────
         print("\n[7] Cross-conversion: A content + B voice (Man speaking as Woman)...")
         pred_mel_AB, _, _ = model(ref_B.unsqueeze(0), [content_A])
+        beta_cache['AB'] = model.cross_attn._cached_beta.clone()
         wave_AB = vocoder(pred_mel_AB).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "07_cross_AtoB.wav"), wave_AB.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_AB.shape}, mean={pred_mel_AB.mean():.4f}, std={pred_mel_AB.std():.4f}")
@@ -157,10 +216,60 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         # ── Test 6: Cross-conversion B content → A voice (Woman speaking as Man) ──────────
         print("\n[8] Cross-conversion: B content + A voice (Woman speaking as Man)...")
         pred_mel_BA, _, _ = model(ref_A.unsqueeze(0), [content_B])
+        beta_cache['BA'] = model.cross_attn._cached_beta.clone()
         wave_BA = vocoder(pred_mel_BA).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "08_cross_BtoA.wav"), wave_BA.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}, std={pred_mel_BA.std():.4f}")
         print("✅ Saved B→A")
+
+    # ================================================================
+    # DIAGNOSTIC B: FiLM Beta Per-Speaker Analysis
+    # ================================================================
+    print("\n" + "="*60)
+    print("[DIAGNOSTIC B] FiLM BETA PER-SPEAKER ANALYSIS")
+    print("="*60)
+    for key in ['AA', 'BB', 'AB', 'BA', 'blend']:
+        if key in beta_cache:
+            b = beta_cache[key].squeeze(0)  # [T, 96]
+            ch_mean = b.mean(dim=0)         # [96] per-channel temporal mean
+            ch_std  = b.std(dim=0)          # [96] per-channel temporal std
+            print(f"  beta_{key:5s}: ch-mean μ={ch_mean.mean():.4f}, σ={ch_mean.std():.4f}, "
+                  f"ch-std μ={ch_std.mean():.4f}, |μ|max={ch_mean.abs().max():.4f}")
+
+    # Compare A-speaker beta (AA) vs B-speaker beta (BB) channel-wise
+    if 'AA' in beta_cache and 'BB' in beta_cache:
+        ch_mean_AA = beta_cache['AA'].squeeze(0).mean(dim=0)  # [96]
+        ch_mean_BB = beta_cache['BB'].squeeze(0).mean(dim=0)  # [96]
+        beta_diff = (ch_mean_AA - ch_mean_BB).abs()
+        top5_diff = beta_diff.topk(5)
+        print(f"\n  Self-recon beta channel-mean Δ (|A − B|):")
+        print(f"    mean Δ = {beta_diff.mean():.4f}, max = {beta_diff.max():.4f}")
+        print(f"    Top-5 differing channels: {top5_diff.indices.tolist()}")
+        print(f"    Values: {[f'{v:.4f}' for v in top5_diff.values.tolist()]}")
+        if beta_diff.mean() < 0.05:
+            print(f"  ⚠️  WARNING: Beta channel-means nearly identical across speakers (Δ<0.05)")
+            print(f"  → FiLM beta is NOT encoding per-speaker DC offset / spectral envelope!")
+            print(f"  → This explains why cross-conversion mel-mean follows source speaker.")
+        elif beta_diff.mean() < 0.15:
+            print(f"  ⚠️  MILD: Beta carries weak speaker signal (0.05≤Δ<0.15)")
+        else:
+            print(f"  ✅ Beta channel-means differ meaningfully across speakers (Δ≥0.15)")
+
+    # Cross-conversion: does beta change when target speaker changes?
+    if 'AB' in beta_cache and 'AA' in beta_cache:
+        ch_mean_AB = beta_cache['AB'].squeeze(0).mean(dim=0)
+        ch_mean_AA = beta_cache['AA'].squeeze(0).mean(dim=0)
+        delta_same_content = (ch_mean_AB - ch_mean_AA).abs()
+        print(f"\n  Cross-pair beta shift (A→B minus A→A, same content):")
+        print(f"    mean |Δβ| = {delta_same_content.mean():.4f}, max = {delta_same_content.max():.4f}")
+        if delta_same_content.mean() < 0.02:
+            print(f"  ⚠️  Beta barely moves when target speaker changes (same content)!")
+            print(f"  → FiLM conditioning is being OVERRIDDEN by content-path signal.")
+
+    # attended_features std from cross-attention logs (summary reference)
+    print(f"\n  [REFERENCE] See cross_attn logs above for attended_features std per condition.")
+    print(f"  Key metric: attended_features std should differ between self and cross conditions.")
+    print("="*60)
 
     print("\n" + "="*60)
     print("📋 LISTENING GUIDE:")

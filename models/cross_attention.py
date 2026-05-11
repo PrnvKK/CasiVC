@@ -416,6 +416,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             # per-frame spectral envelope spikes ("noisy sheet" symptom).
             # Not smoothing — just a gradient-safe guardrail on the extremes.
             beta = 2.0 * torch.tanh(beta / 2.0)
+            self._cached_beta = beta  # cached for external diagnostics (test_generalization.py)
 
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
