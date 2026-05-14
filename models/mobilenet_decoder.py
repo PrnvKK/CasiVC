@@ -229,16 +229,20 @@ class MobileNetDecoder(nn.Module):
             bias=True
         )
         
-        nn.init.xavier_uniform_(self.mel_proj.weight)
+        # Identity-initialized 1×1 projection: preserves block3 variance (~2.0)
+        # instead of compressing it by ~50% as Xavier init does.  Each output
+        # mel band starts as its corresponding input channel + bias, then
+        # training learns cross-channel corrections if needed.
+        nn.init.eye_(self.mel_proj.weight.squeeze(-1))
         if self.mel_proj.bias is not None:
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
-        # Per-band output scale: direct amplitude lever for mel dynamic range recovery.
-        # Initialized at 1.5 so mel std ~1.5 * 1.5 = 2.25 at run start, near the 2.5 GT target.
-        # Trained by raw L1 + variance loss — both provide non-zero gradient per band.
-        # Distinct from Option C (Run 10-15): no normalization, no instance-norm, pure multiplicative.
-        self.out_scale = nn.Parameter(torch.ones(1, 80, 1) * 1.5)
+        # Per-band output scale: identity mel_proj preserves block3 σ≈2.0,
+        # so out_scale starts at 1.0 (no amplification needed initially).
+        # Variance loss (λ=15) can push it from 2.0→2.5 without fighting
+        # through mel_proj compression first.
+        self.out_scale = nn.Parameter(torch.ones(1, 80, 1) * 1.0)
 
 
 
@@ -350,8 +354,29 @@ class MobileNetDecoder(nn.Module):
           
         
         mel = self.mel_proj(x)
-        mel = mel * self.out_scale   # per-band amplitude scale: init 1.5, direct mel std lever
-        mel = torch.clamp(mel, min=-11.5, max=1.7)   # GT range is [-9.165, 1.655]; 1.7 adds tiny margin
+
+        # ── Decoder output diagnostics ──────────────────────────────────
+        # We log three stages separately: (1) raw conv output, (2) after
+        # per-band out_scale, (3) after clamp.  This isolates whether the
+        # mel variance deficit comes from the conv backbone, insufficient
+        # out_scale growth, or clamp compression.
+        out_scale_vals = self.out_scale.squeeze()  # [80]
+        print(f"[decoder] out_scale: mean={out_scale_vals.mean().item():.4f}, "
+              f"min={out_scale_vals.min().item():.4f}, max={out_scale_vals.max().item():.4f}")
+
+        mel_pre_scale_std = mel.std().item()
+        print(f"[decoder] pre-scale  mel std: {mel_pre_scale_std:.4f}")
+
+        mel_scaled = mel * self.out_scale
+        mel_post_scale_std = mel_scaled.std().item()
+        print(f"[decoder] post-scale pre-clamp mel std: {mel_post_scale_std:.4f}")
+
+        mel = torch.clamp(mel_scaled, min=-11.5, max=1.7)
+
+        clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 1.7)
+        clamp_pct = clamp_mask.float().mean().item() * 100
+        print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
+
         self._check(mel, "mel_proj")
         
         if should_return_feats:
@@ -420,3 +445,4 @@ if __name__ == "__main__":
     print(f"\nMel shape: {mel.shape}")
     for i, f in enumerate(feats):
         print(f"Block {i} feat shape: {f.shape}")
+ssss
