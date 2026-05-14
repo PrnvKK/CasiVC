@@ -84,16 +84,20 @@ class PositionAgnosticCrossAttention(nn.Module):
             bias=True
         )
 
-        # Tie MHA internal Q and K projections: in_proj_weight layout is
-        # [3*d_model, d_model] = Q | K | V stacked row-wise. Copying Q→K
-        # guarantees Q_eff and K_eff inhabit the same subspace regardless
-        # of independent Xavier initialization, making attention dot products
-        # a learned Mahalanobis metric instead of random noise.
-        d = self.d_model
-        self.multihead_attn.in_proj_weight.data[d:2*d] = \
-            self.multihead_attn.in_proj_weight.data[:d].clone()
-        self.multihead_attn.in_proj_bias.data[d:2*d] = \
-            self.multihead_attn.in_proj_bias.data[:d].clone()
+        # True Q-K weight tying via pre-forward hook: before every MHA call,
+        # copy Q projection weights → K projection weights. This guarantees
+        # K_eff = Q_eff at every training step, unlike a one-time .clone()
+        # which allows divergence during training as Q and K receive
+        # independent gradient updates.
+        # Note: K's gradient path is intentionally overridden — Q learns
+        # from the full attention mechanism (Q contributes to both the
+        # dot-product numerator and the softmax denominator).
+        def _tie_qk(module, _input):
+            d_mha = module.embed_dim
+            module.in_proj_weight.data[d_mha:2*d_mha] = module.in_proj_weight.data[:d_mha]
+            if module.in_proj_bias is not None:
+                module.in_proj_bias.data[d_mha:2*d_mha] = module.in_proj_bias.data[:d_mha]
+        self.multihead_attn.register_forward_pre_hook(_tie_qk)
 
         # Residual connection projection
         # Residual connection
