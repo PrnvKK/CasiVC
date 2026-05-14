@@ -83,7 +83,18 @@ class PositionAgnosticCrossAttention(nn.Module):
             batch_first=True,
             bias=True
         )
-        
+
+        # Tie MHA internal Q and K projections: in_proj_weight layout is
+        # [3*d_model, d_model] = Q | K | V stacked row-wise. Copying Q→K
+        # guarantees Q_eff and K_eff inhabit the same subspace regardless
+        # of independent Xavier initialization, making attention dot products
+        # a learned Mahalanobis metric instead of random noise.
+        d = self.d_model
+        self.multihead_attn.in_proj_weight.data[d:2*d] = \
+            self.multihead_attn.in_proj_weight.data[:d].clone()
+        self.multihead_attn.in_proj_bias.data[d:2*d] = \
+            self.multihead_attn.in_proj_bias.data[:d].clone()
+
         # Residual connection projection
         # Residual connection
         self.enable_residual = enable_residual          # keep the flag
@@ -275,9 +286,13 @@ class PositionAgnosticCrossAttention(nn.Module):
         # ------------------------------------------------------------------
         # Projection
         # ------------------------------------------------------------------
+        # Q and K share the same external projection so they inhabit the
+        # same vector space. Combined with tied MHA internal Q-K projections,
+        # the attention dot product becomes c^T·M·s where M = W_ext^T·W_mha^T·W_mha·W_ext
+        # is a learned PSD Mahalanobis metric — guaranteeing comparability.
         queries = self.content_proj(content_features)
-        keys    = self.speaker_proj(speaker_features)
-        values  = self.speaker_val_proj(speaker_features)  # separate projection
+        keys    = self.content_proj(speaker_features)   # SHARED projection for Q-K alignment
+        values  = self.speaker_val_proj(speaker_features)  # separate value projection
 
         # Check query diversity (debug — always use first batch item only)
         queries_sample = queries[0]  # [T, 96] — safe for any batch size
