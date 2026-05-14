@@ -116,7 +116,12 @@ class Trainer:
         # 4. model, vocoder, loss fn
         # ----------------------------------------------------------
         num_speakers = len(self.train_dataset.speaker_to_idx)
-        self.model: HubertVCModel = HubertVCModel(self.model_cfg, num_speakers=num_speakers).to(self.device)
+        self.model: HubertVCModel = HubertVCModel(
+            audio_cfg=self.audio_cfg,
+            model_cfg=self.model_cfg,
+            training_cfg=self.train_cfg,
+            num_speakers=num_speakers
+        ).to(self.device)
 
         for name, param in self.model.named_parameters():
             print(name, param.requires_grad)

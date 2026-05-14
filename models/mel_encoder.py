@@ -121,9 +121,14 @@ class MelEncoder(nn.Module):
         print(f"ECAPA-TDNN embedding dimension: {self.ecapa_dim}D")
         
         # Projection
+        # LayerNorm replaces Tanh: ECAPA embeddings carry rich inter-speaker
+        # structure at L2 norm ~330. Tanh saturates everything above magnitude 2
+        # into ±1, clipping the very amplitude differences that distinguish speakers.
+        # LayerNorm preserves per-dimension relative magnitudes while keeping the
+        # output well-conditioned for downstream cross-attention.
         self.projection = nn.Sequential(
             nn.Linear(self.ecapa_dim, self.num_speaker_tokens * self.output_dim),
-            nn.Tanh()  # bounds output to [-1, 1] while preserving inter-speaker amplitude differences
+            nn.LayerNorm(self.num_speaker_tokens * self.output_dim)
         )
 
         self._init_projection()
