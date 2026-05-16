@@ -383,10 +383,14 @@ class PositionAgnosticCrossAttention(nn.Module):
             residual = self.residual_proj(content_features)
             
             # STEP 1: ERASING THE SOURCE VOICE
-            if self.training:
-                residual = F.dropout(residual, p=0.4, training=True)
-                
+            # Replaced training-only dropout (p=0.4) with deterministic scale (0.6).
+            # F.instance_norm is scale-invariant (normalizes to μ=0, σ=1 regardless of
+            # input magnitude), so the scale MUST go AFTER normalization.  Applying
+            # 0.6 before InstanceNorm would be a mathematical no-op.  This gives
+            # identical behaviour in train and eval, eliminating the 67% stronger
+            # source residual at inference that caused "mix of both voices."
             residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
+            residual_norm = residual_norm * 0.6  # constant source suppression, train==eval
             
             # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
             # film_norm REMOVED: LayerNorm was amplifying attended_features (std≈0.15) by ~6-7x
@@ -434,7 +438,12 @@ class PositionAgnosticCrossAttention(nn.Module):
                   f"min={beta.min():.4f}, max={beta.max():.4f}")
             beta_temporal_std = beta.std(dim=1).mean()
             print(f"[cross_attn] FiLM beta temporal std: {beta_temporal_std:.4f}")
-            attended_features = attended_features + (residual_norm * (1.0 + gamma) + beta)
+            film_output = residual_norm * (1.0 + gamma) + beta
+            attended_features = attended_features + film_output
+
+            # ── Source-leakage audit: is FiLM dominating or is the residual still winning? ──
+            print(f"[cross_attn] residual_norm contribution: std={residual_norm.std():.4f}")
+            print(f"[cross_attn] FiLM output (resid*(1+γ)+β): std={film_output.std():.4f}")
 
         print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
         print("=" * 80 + "\n")
