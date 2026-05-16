@@ -244,6 +244,13 @@ class MobileNetDecoder(nn.Module):
         # through mel_proj compression first.
         self.out_scale = nn.Parameter(torch.ones(1, 80, 1) * 1.0)
 
+        # Per-band output bias: handles spectral tilt / per-band mean offset
+        # independently of variance scaling.  Without this, the single mel_proj
+        # bias (-4.5) is shared across all 80 bands, coupling mean correction
+        # to variance correction through out_scale alone.  Adding a per-band
+        # bias lets out_scale focus on variance while bias handles spectral shape.
+        self.out_bias = nn.Parameter(torch.zeros(1, 80, 1))
+
 
 
     # ---------------------------------------------------------------------- #
@@ -361,15 +368,20 @@ class MobileNetDecoder(nn.Module):
         # mel variance deficit comes from the conv backbone, insufficient
         # out_scale growth, or clamp compression.
         out_scale_vals = self.out_scale.squeeze()  # [80]
+        out_bias_vals  = self.out_bias.squeeze()   # [80]
         print(f"[decoder] out_scale: mean={out_scale_vals.mean().item():.4f}, "
               f"min={out_scale_vals.min().item():.4f}, max={out_scale_vals.max().item():.4f}")
+        print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
+              f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
 
         mel_pre_scale_std = mel.std().item()
-        print(f"[decoder] pre-scale  mel std: {mel_pre_scale_std:.4f}")
+        mel_pre_scale_mean = mel.mean().item()
+        print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
-        mel_scaled = mel * self.out_scale
+        mel_scaled = mel * self.out_scale + self.out_bias
         mel_post_scale_std = mel_scaled.std().item()
-        print(f"[decoder] post-scale pre-clamp mel std: {mel_post_scale_std:.4f}")
+        mel_post_scale_mean = mel_scaled.mean().item()
+        print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
         mel = torch.clamp(mel_scaled, min=-11.5, max=1.7)
 
@@ -445,4 +457,3 @@ if __name__ == "__main__":
     print(f"\nMel shape: {mel.shape}")
     for i, f in enumerate(feats):
         print(f"Block {i} feat shape: {f.shape}")
-ssss
