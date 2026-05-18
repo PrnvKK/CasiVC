@@ -126,10 +126,17 @@ class MelEncoder(nn.Module):
         # into ±1, clipping the very amplitude differences that distinguish speakers.
         # LayerNorm preserves per-dimension relative magnitudes while keeping the
         # output well-conditioned for downstream cross-attention.
+        #
+        # CRITICAL FIX: LayerNorm is now applied PER-TOKEN (after reshape) instead of
+        # globally over the concatenated 8×96=768D vector. Global LayerNorm forced all
+        # 8 tokens to share one mean/std, erasing inter-token variation (diversity=0.11).
+        # Per-token LayerNorm(96) normalizes each token independently, preserving the
+        # inter-token differences that cross-attention needs to route between.
         self.projection = nn.Sequential(
             nn.Linear(self.ecapa_dim, self.num_speaker_tokens * self.output_dim),
-            nn.LayerNorm(self.num_speaker_tokens * self.output_dim)
         )
+        # Per-token normalization: each of the 8 tokens gets its own mean/std
+        self.token_norm = nn.LayerNorm(self.output_dim)  # LayerNorm(96)
 
         self._init_projection()
         
@@ -165,9 +172,10 @@ class MelEncoder(nn.Module):
     def _init_projection(self):
         for module in self.projection.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.06)  # increased from 0.03 to 0.06 to improve token diversity without hard saturation
+                nn.init.xavier_uniform_(module.weight, gain=0.1)  # increased to 0.1: per-token LayerNorm handles scale, higher gain creates more diverse token basis
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        # token_norm is a single LayerNorm(96) — default init (weight=1, bias=0) is correct
 
     def _safe_encode(self, wavs: torch.Tensor, wav_lens: torch.Tensor) -> torch.Tensor:
         """
@@ -251,9 +259,9 @@ class MelEncoder(nn.Module):
         if apply_projection:
             projected = self.projection(ecapa_embeddings)
             
-            # ============ DEBUG: AFTER PROJECTION ============
-            print(f"\n[AFTER PROJECTION (before reshape)]")
-            print(f"  Shape: {projected.shape}")  # Should be (B, 1*96 = 96)
+            # ============ DEBUG: AFTER PROJECTION (raw, before reshape) ============
+            print(f"\n[AFTER PROJECTION (raw, before reshape & per-token norm)]")
+            print(f"  Shape: {projected.shape}")  # Should be (B, 8*96 = 768)
             print(f"  Mean: {projected.mean().item():.4f}")
             print(f"  Std: {projected.std().item():.4f}")
             print(f"  Min: {projected.min().item():.4f}")
@@ -264,6 +272,9 @@ class MelEncoder(nn.Module):
                 self.num_speaker_tokens, 
                 self.output_dim
             )
+            
+            # Per-token LayerNorm: each of the 8 tokens independently normalized
+            speaker_features = self.token_norm(speaker_features)
             
             # ============ DEBUG: SPEAKER FEATURES (for cross-attention) ============
             print(f"\n[SPEAKER FEATURES - FINAL]")

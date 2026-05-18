@@ -104,7 +104,31 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             print("Partial separation. Speaker info is weak but present.")
         else:
             print("Speaker space is WELL-SEPARATED. Problem is training task (no cross-pair training).")
+
+        # ── Per-token diversity audit ─────────────────────────────────────
+        print("\n[PER-TOKEN DIVERSITY AUDIT]")
+        for speaker_label, spk_feats in [("A (Man)", spk_A), ("B (Woman)", spk_B)]:
+            tokens = spk_feats[0]  # [8, 96]
+            print(f"  Speaker {speaker_label}:")
+            token_l2 = torch.norm(tokens, dim=-1)  # [8]
+            token_means = tokens.mean(dim=-1)       # [8]
+            token_stds  = tokens.std(dim=-1)        # [8]
+            print(f"    Token L2 norms:  [{', '.join(f'{v:.3f}' for v in token_l2.tolist())}]")
+            print(f"    Token means:     [{', '.join(f'{v:.3f}' for v in token_means.tolist())}]")
+            print(f"    Token stds:      [{', '.join(f'{v:.3f}' for v in token_stds.tolist())}]")
+            # Inter-token cosine similarity (lower = more diverse)
+            tokens_norm = torch.nn.functional.normalize(tokens, dim=-1)  # [8, 96]
+            cos_matrix = tokens_norm @ tokens_norm.T  # [8, 8]
+            off_diag = cos_matrix[~torch.eye(8, dtype=torch.bool, device=tokens.device)]
+            print(f"    Inter-token cosine: mean={off_diag.mean():.4f}, max={off_diag.max():.4f} (lower=more diverse)")
+            # Effective rank (should now be >> 8/96)
+            _, S, _ = torch.svd(tokens)
+            ev = (S**2) / (S**2).sum()
+            rank_95 = (ev.cumsum(0) < 0.95).sum().item() + 1
+            print(f"    Effective rank (95% var): {rank_95}/8  |  Singular values: [{', '.join(f'{v:.2f}' for v in S.tolist())}]")
+        # ─────────────────────────────────────────────────────────────────
     print()
+
     # ─────────────────────────────────────────────────────────────────────
 
     # ── Interpolation Probe ───────────────────────────────────────────
@@ -158,18 +182,60 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         wave_BA = vocoder(pred_mel_BA).squeeze(0).squeeze(0).cpu()
         torchaudio.save(os.path.join(output_dir, "08_cross_BtoA.wav"), wave_BA.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}")
-        print("✅ Saved B→A")
+        print("\u2705 Saved B\u2192A")
+
+    # \u2500\u2500 FORCED-GAMMA DIAGNOSTIC \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # Bypasses the mapping network. Injects constant gamma to answer:
+    # "Can decoder blocks compute given strong FiLM, or are they dead?"
+    #
+    # Read [Block] After block: std= lines in the decoder prints above.
+    #   Block 3 body std > 0.25  \u2192  blocks ALIVE, mapping net is timid.
+    #                                Fix: raise raw_film_scale to 0.5.
+    #   Block 3 body std < 0.20  \u2192  block weights structurally dead.
+    #                                Fix: reduce residual suppression 0.6\u21920.35.
+    print("\n" + "="*70)
+    print("\U0001f52c FORCED-GAMMA DIAGNOSTIC (mapping network bypassed)")
+    print("="*70)
+    print("  Runs A\u2192A with constant gamma injected. Beta=0. Pure residual-scale test.")
+    print("  Watch [Block] After block: std= in decoder prints above each result.\n")
+    with torch.no_grad():
+        for forced_val in [0.5, 1.0]:
+            print(f"  --- gamma={forced_val}  (residual scaled by {1+forced_val:.1f}x) ---")
+            model.cross_attn.force_gamma = forced_val
+            pred_forced, _, _ = model(ref_A.unsqueeze(0), [content_A])
+            print(f"  Forced mel: mean={pred_forced.mean():.4f},  \u03c3={pred_forced.std():.4f}")
+            print()
+    model.cross_attn.force_gamma = None   # always reset
+    print("  [force_gamma reset \u2192 None, normal mode restored]")
+    print("="*70)
+    # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     print("\n" + "="*60)
-    print("📋 LISTENING GUIDE:")
+    print("\U0001f4cb LISTENING GUIDE:")
     print("="*60)
-    print("  01_raw_content_A.wav   → Ground truth Man (what was said)")
-    print("  02_raw_content_B.wav   → Ground truth Woman (what was said)")
-    print("  05_self_recon_A.wav    → Model: Man content + Man voice")
-    print("  06_self_recon_B.wav    → Model: Woman content + Woman voice")
-    print("  07_cross_AtoB.wav      → Model: Man's WORDS in Woman's VOICE ← Key Test!")
-    print("  08_cross_BtoA.wav      → Model: Woman's WORDS in Man's VOICE ← Key Test!")
+    print("  01_raw_content_A.wav   \u2192 Ground truth Man (what was said)")
+    print("  02_raw_content_B.wav   \u2192 Ground truth Woman (what was said)")
+    print("  05_self_recon_A.wav    \u2192 Model: Man content + Man voice")
+    print("  06_self_recon_B.wav    \u2192 Model: Woman content + Woman voice")
+    print("  07_cross_AtoB.wav      \u2192 Model: Man's WORDS in Woman's VOICE \u2190 Key Test!")
+    print("  08_cross_BtoA.wav      \u2192 Model: Woman's WORDS in Man's VOICE \u2190 Key Test!")
     print("="*60)
+
+
+    # ── Mel variance summary (key out_scale health check) ─────────────
+    print("\n[MEL VARIANCE SUMMARY]  (target σ ≈ 2.5 for HiFi-GAN)")
+    gt_A_std  = gt_mel_A.std().item()
+    gt_B_std  = gt_mel_B.std().item()
+    aa_std    = pred_mel_AA.std().item()
+    bb_std    = pred_mel_BB.std().item()
+    ab_std    = pred_mel_AB.std().item()
+    ba_std    = pred_mel_BA.std().item()
+    print(f"  GT A σ={gt_A_std:.4f}  |  GT B σ={gt_B_std:.4f}")
+    print(f"  A→A σ={aa_std:.4f}  |  B→B σ={bb_std:.4f}  |  A→B σ={ab_std:.4f}  |  B→A σ={ba_std:.4f}")
+    deficit = ((2.5 - aa_std) / 2.5) * 100
+    print(f"  Variance deficit (A→A vs 2.5): {deficit:.1f}%  {'✅ OK' if deficit < 15 else '❌ Compressed'}")
+    # ──────────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
