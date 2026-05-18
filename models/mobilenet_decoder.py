@@ -238,17 +238,15 @@ class MobileNetDecoder(nn.Module):
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
 
-        # Per-band output scale: identity mel_proj preserves block3 σ≈2.0,
-        # so out_scale starts at 1.0 (no amplification needed initially).
-        # Variance loss (λ=15) can push it from 2.0→2.5 without fighting
-        # through mel_proj compression first.
-        self.out_scale = nn.Parameter(torch.ones(1, 80, 1) * 1.0)
+        # Per-band output scale — SOFTPLUS reparametrised so scale can NEVER collapse.
+        # Previously out_scale=1.0 (linear) was pulled back toward 1.0 by L1 mel loss
+        # faster than lambda_var=30 could push it up, leaving mel σ at 1.4 vs target 2.5.
+        # Now: out_scale = softplus(raw_out_scale) + 1.5  →  always > 1.5, init ≈ 2.19
+        # This gives variance loss a structural head-start it cannot lose to L1 regression.
+        self.raw_out_scale = nn.Parameter(torch.zeros(1, 80, 1))  # softplus(0) ≈ 0.693 → scale init ≈ 2.19
 
         # Per-band output bias: handles spectral tilt / per-band mean offset
-        # independently of variance scaling.  Without this, the single mel_proj
-        # bias (-4.5) is shared across all 80 bands, coupling mean correction
-        # to variance correction through out_scale alone.  Adding a per-band
-        # bias lets out_scale focus on variance while bias handles spectral shape.
+        # independently of variance scaling.
         self.out_bias = nn.Parameter(torch.zeros(1, 80, 1))
 
 
@@ -367,10 +365,13 @@ class MobileNetDecoder(nn.Module):
         # per-band out_scale, (3) after clamp.  This isolates whether the
         # mel variance deficit comes from the conv backbone, insufficient
         # out_scale growth, or clamp compression.
-        out_scale_vals = self.out_scale.squeeze()  # [80]
-        out_bias_vals  = self.out_bias.squeeze()   # [80]
-        print(f"[decoder] out_scale: mean={out_scale_vals.mean().item():.4f}, "
+        # Compute effective out_scale via softplus reparametrisation (always > 1.5)
+        out_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
+        out_bias_vals  = self.out_bias.squeeze()            # [80]
+        out_scale_vals = out_scale.squeeze()                # [80]
+        print(f"[decoder] out_scale (softplus+1.5): mean={out_scale_vals.mean().item():.4f}, "
               f"min={out_scale_vals.min().item():.4f}, max={out_scale_vals.max().item():.4f}")
+        print(f"[decoder] raw_out_scale: mean={self.raw_out_scale.mean().item():.4f}")
         print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
               f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
 
@@ -378,14 +379,22 @@ class MobileNetDecoder(nn.Module):
         mel_pre_scale_mean = mel.mean().item()
         print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
-        mel_scaled = mel * self.out_scale + self.out_bias
+        # DECOUPLED SCALING: center per-band temporal mean so out_scale is a PURE variance knob.
+        # Previously: mel * out_scale + bias  →  increasing out_scale also shifts mean,
+        # causing L1 gradient to fight the variance gradient (net ≈ 0, scale frozen).
+        # Now: out_scale only amplifies the deviation from each band's own mean.
+        # L1 gradient on out_scale ≈ 0 (centered input is symmetric around 0).
+        # Variance gradient is uncontested → raw_out_scale can grow freely.
+        mel_band_mean = mel.mean(dim=-1, keepdim=True)       # [B, 80, 1] per-band temporal mean
+        mel_centered  = mel - mel_band_mean                   # zero-mean per band per utterance
+        mel_scaled    = mel_centered * out_scale + mel_band_mean + self.out_bias
         mel_post_scale_std = mel_scaled.std().item()
         mel_post_scale_mean = mel_scaled.mean().item()
         print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
-        mel = torch.clamp(mel_scaled, min=-11.5, max=1.7)
+        mel = torch.clamp(mel_scaled, min=-11.5, max=2.0)
 
-        clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 1.7)
+        clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 2.0)
         clamp_pct = clamp_mask.float().mean().item() * 100
         print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
 

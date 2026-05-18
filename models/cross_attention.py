@@ -127,13 +127,12 @@ class PositionAgnosticCrossAttention(nn.Module):
         # by ~6-7x into unit-variance noise when Q-K spaces were orthogonal.
         self.film_norm = nn.LayerNorm(self.d_model)  # retained in state_dict for compat
 
-        # Learnable FiLM output scale — compensates for film_norm removal.
-        # Without film_norm, mapping network sees attended_features std≈0.15-0.22 instead of
-        # std≈1.0, so its outputs are proportionally smaller. This scalar scales gamma/beta
-        # back to meaningful modulation range WITHOUT reintroducing normalization noise.
-        # Softplus reparameterization: scale = softplus(raw) + 0.5, always > 0.5
-        # Init: softplus(2.5) ≈ 2.6 + 0.5 = 3.1 — strong enough to imprint identity, stable enough to prevent hiccups.
-        self.raw_film_scale = nn.Parameter(torch.tensor(2.5))
+        # Learnable FiLM output scale.
+        # IMPORTANT: raw_film_scale init reduced from 2.5 → -0.5 after RMS-norm was added.
+        # Old 2.5 init (scale≈3.07) was calibrated when attended_features had std≈0.18.
+        # RMS-norm now ensures std≈1.0, so 3.07× caused gamma mean to blow up to 0.97
+        # (should be ~0.04). softplus(-0.5)+0.5 ≈ 1.13 — mild amplification, stable.
+        self.raw_film_scale = nn.Parameter(torch.tensor(-0.5))
 
         # AdaIN Mapping Network
         # Converts attention-weighted speaker features into per-frame
@@ -143,7 +142,18 @@ class PositionAgnosticCrossAttention(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(self.d_model, self.d_model * 2)
         )
-        
+
+        # ── Diagnostic override ───────────────────────────────────────────
+        # Set model.cross_attn.force_gamma = <float> before running inference
+        # to bypass the mapping network entirely and inject a constant gamma.
+        # This isolates whether block bodies CAN compute given strong FiLM,
+        # independent of what the mapping network learned to output.
+        # force_beta is forced to 0.0 when force_gamma is set, so only the
+        # pure residual-scaling effect is measured (no additive bias shift).
+        # Reset to None to restore normal behaviour.
+        self.force_gamma: float | None = None
+        # ──────────────────────────────────────────────────────────────────
+
         # Initialize parameters
         self._init_parameters()
         
@@ -390,14 +400,18 @@ class PositionAgnosticCrossAttention(nn.Module):
             # identical behaviour in train and eval, eliminating the 67% stronger
             # source residual at inference that caused "mix of both voices."
             residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
-            residual_norm = residual_norm * 0.6  # constant source suppression, train==eval
+            residual_norm = residual_norm * 0.35  # reduced from 0.6 to force decoder blocks to compute; adapter was normalizing away all FiLM signal
             
             # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
-            # film_norm REMOVED: LayerNorm was amplifying attended_features (std≈0.15) by ~6-7x
-            # into unit-variance noise, feeding the mapping network amplified random routing signal.
-            # Without film_norm, mapping network sees true attended magnitude — lower but honest.
-            # Mapping network weights will re-calibrate over a few epochs to the new input scale.
-            style_stats = self.mapping_network(attended_features)  # [B, T, 192]
+            # RMS-normalise attended_features before mapping network.
+            # Without film_norm, attended_features std ≈ 0.18–0.30 (weak speaker tokens).
+            # LayerNorm was removed because it amplified near-zero inputs into unit-noise.
+            # RMS norm scales to unit RMS *per frame* while preserving relative magnitudes
+            # across the 96 dimensions — mapping network gets ~unit-variance input without
+            # the 6× noise amplification issue.
+            attended_rms = attended_features / (attended_features.pow(2).mean(dim=-1, keepdim=True).sqrt() + 1e-6)
+            print(f"[cross_attn] attended_rms stats: mean={attended_rms.mean():.4f}, std={attended_rms.std():.4f}")
+            style_stats = self.mapping_network(attended_rms)  # [B, T, 192]
             
             gamma, beta = style_stats.chunk(2, dim=-1)                              # [B, T, 96] each
 
@@ -415,6 +429,15 @@ class PositionAgnosticCrossAttention(nn.Module):
             # ELU is preferred over hard clamp: gradient = exp(x) at x<0, non-zero, mapping network
             # still learns to avoid the negative region naturally.
             gamma = F.elu(gamma)
+
+            # ── Diagnostic force_gamma override ──────────────────────────────
+            # If force_gamma is set, bypass mapping network output entirely.
+            # Pure residual-scaling test: gamma = constant, beta = 0.
+            if self.force_gamma is not None:
+                gamma = torch.full_like(gamma, self.force_gamma)
+                beta  = torch.zeros_like(beta)
+                print(f"[cross_attn] ⚠️  DIAGNOSTIC OVERRIDE: gamma forced to {self.force_gamma}, beta forced to 0")
+            # ─────────────────────────────────────────────────────────────────
 
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
