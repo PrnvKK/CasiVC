@@ -69,7 +69,8 @@ class MobileNetBlock(nn.Module):
         use_se: bool,
         norm: str,
         upsample_first: bool = False,
-        residual_scale: float = 1.0
+        residual_scale: float = 1.0,
+        residual_identity_scale: float = 1.0
     ):
         super().__init__()
         
@@ -124,8 +125,10 @@ class MobileNetBlock(nn.Module):
         self.block = nn.Sequential(*layers)
         
         # ✅ ADD THIS SECTION - Residual connection handling
+        self._verbose = True  # set False to suppress per-call debug prints
         self.use_residual = True
         self.residual_scale = residual_scale
+        self.residual_identity_scale = residual_identity_scale  # scale on shortcut path
         
         # If input/output channels differ, need 1x1 conv to match dimensions
         if in_ch != out_ch:
@@ -145,7 +148,8 @@ class MobileNetBlock(nn.Module):
         return out
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print(f"[Block] Input: shape={x.shape}, mean={x.mean():.4f}, std={x.std():.4f}")
+        v = self._verbose
+        if v: print(f"[Block] Input: shape={x.shape}, mean={x.mean():.4f}, std={x.std():.4f}")
         
         # Capture identity BEFORE any modifications
         identity = x
@@ -157,14 +161,14 @@ class MobileNetBlock(nn.Module):
         
         # Process through block
         out = self.block(x)
-        print(f"[Block] After block: shape={out.shape}, mean={out.mean():.4f}, std={out.std():.4f}")
+        if v: print(f"[Block] After block: shape={out.shape}, mean={out.mean():.4f}, std={out.std():.4f}")
         
         # Apply residual connection
         if self.residual_proj is not None:
             identity = self.residual_proj(identity)
         
-        out = identity + self.residual_scale * out  # Using your residual_scale
-        print(f"[Block] After residual (scale={self.residual_scale}): shape={out.shape}, mean={out.mean():.4f}, std={out.std():.4f}")
+        out = self.residual_identity_scale * identity + self.residual_scale * out
+        if v: print(f"[Block] After residual (id_scale={self.residual_identity_scale:.2f}, body_scale={self.residual_scale}): shape={out.shape}, mean={out.mean():.4f}, std={out.std():.4f}")
         
         return out
 
@@ -248,6 +252,7 @@ class MobileNetDecoder(nn.Module):
         # Per-band output bias: handles spectral tilt / per-band mean offset
         # independently of variance scaling.
         self.out_bias = nn.Parameter(torch.zeros(1, 80, 1))
+        self._verbose = True  # set False to suppress per-call debug prints
 
 
 
@@ -321,11 +326,13 @@ class MobileNetDecoder(nn.Module):
     def _check(self, x, tag):
         """Debug check for finite values."""
         if not torch.isfinite(x).all():
-            print(f"❌  Non-finite values after {tag}")
-            print("    mean:", x.mean().item(), "std:", x.std().item())
+            if self._verbose:
+                print(f"❌  Non-finite values after {tag}")
+                print("    mean:", x.mean().item(), "std:", x.std().item())
             raise RuntimeError("Stop trace here")
         else:
-            print(f"✅ {tag:16s}  mean={x.mean():7.4f}  std={x.std():7.4f}")
+            if self._verbose:
+                print(f"✅ {tag:16s}  mean={x.mean():7.4f}  std={x.std():7.4f}")
 
     
     def forward(self, fused: torch.Tensor, return_intermediate: bool = False) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
@@ -369,15 +376,17 @@ class MobileNetDecoder(nn.Module):
         out_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
         out_bias_vals  = self.out_bias.squeeze()            # [80]
         out_scale_vals = out_scale.squeeze()                # [80]
-        print(f"[decoder] out_scale (softplus+1.5): mean={out_scale_vals.mean().item():.4f}, "
-              f"min={out_scale_vals.min().item():.4f}, max={out_scale_vals.max().item():.4f}")
-        print(f"[decoder] raw_out_scale: mean={self.raw_out_scale.mean().item():.4f}")
-        print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
-              f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
+        v = self._verbose
+        if v:
+            print(f"[decoder] out_scale (softplus+1.5): mean={out_scale_vals.mean().item():.4f}, "
+                  f"min={out_scale_vals.min().item():.4f}, max={out_scale_vals.max().item():.4f}")
+            print(f"[decoder] raw_out_scale: mean={self.raw_out_scale.mean().item():.4f}")
+            print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
+                  f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
 
         mel_pre_scale_std = mel.std().item()
         mel_pre_scale_mean = mel.mean().item()
-        print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
+        if v: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
         # DECOUPLED SCALING: center per-band temporal mean so out_scale is a PURE variance knob.
         # Previously: mel * out_scale + bias  →  increasing out_scale also shifts mean,
@@ -390,13 +399,13 @@ class MobileNetDecoder(nn.Module):
         mel_scaled    = mel_centered * out_scale + mel_band_mean + self.out_bias
         mel_post_scale_std = mel_scaled.std().item()
         mel_post_scale_mean = mel_scaled.mean().item()
-        print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
+        if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
         mel = torch.clamp(mel_scaled, min=-11.5, max=2.0)
 
         clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 2.0)
         clamp_pct = clamp_mask.float().mean().item() * 100
-        print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
+        if v: print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
 
         self._check(mel, "mel_proj")
         

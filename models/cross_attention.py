@@ -62,6 +62,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         self.dropout_rate = getattr(model_config, 'cross_attention_dropout')
 
         self.enable_output_projection = enable_output_projection
+        self._verbose = True  # set False to suppress per-call debug prints
                 
         # Validate dimensions
         if self.d_model % self.num_heads != 0:
@@ -276,23 +277,25 @@ class PositionAgnosticCrossAttention(nn.Module):
         """
         Forward pass of position-agnostic cross-attention.
         """
-        print("\n" + "=" * 80)
-        print("[cross_attn] >>> ENTERING CROSS ATTENTION FORWARD <<<")
+        v = self._verbose
+        if v:
+            print("\n" + "=" * 80)
+        if v: print("[cross_attn] >>> ENTERING CROSS ATTENTION FORWARD <<<")
 
         # Input validation
         content_features, speaker_features = self.validate_inputs(content_features, speaker_features)
 
         batch_size, time_content, _ = content_features.shape
 
-        print(f"[cross_attn] content_features shape: {content_features.shape}")
-        print(f"[cross_attn] speaker_features shape: {speaker_features.shape}")
+        if v: print(f"[cross_attn] content_features shape: {content_features.shape}")
+        if v: print(f"[cross_attn] speaker_features shape: {speaker_features.shape}")
 
-        print(f"[cross_attn] content stats: mean={content_features.mean():.4f}, "
+        if v: print(f"[cross_attn] content stats: mean={content_features.mean():.4f}, "
               f"std={content_features.std():.4f}, "
               f"min={content_features.min():.4f}, "
               f"max={content_features.max():.4f}")
 
-        print(f"[cross_attn] speaker stats: mean={speaker_features.mean():.4f}, "
+        if v: print(f"[cross_attn] speaker stats: mean={speaker_features.mean():.4f}, "
               f"std={speaker_features.std():.4f}, "
               f"min={speaker_features.min():.4f}, "
               f"max={speaker_features.max():.4f}")
@@ -308,45 +311,46 @@ class PositionAgnosticCrossAttention(nn.Module):
         keys    = self.content_proj(speaker_features)   # SHARED projection for Q-K alignment
         values  = self.speaker_val_proj(speaker_features)  # separate value projection
 
-        # Check query diversity (debug — always use first batch item only)
-        queries_sample = queries[0]  # [T, 96] — safe for any batch size
+        if v:
+            # Check query diversity (debug — always use first batch item only)
+            queries_sample = queries[0]  # [T, 96] — safe for any batch size
 
-        # Compute pairwise distances between queries
-        query_diffs = queries_sample.unsqueeze(0) - queries_sample.unsqueeze(1)  # [T, T, 96]
-        query_distances = torch.norm(query_diffs, dim=-1)  # [T, T]
+            # Compute pairwise distances between queries
+            query_diffs = queries_sample.unsqueeze(0) - queries_sample.unsqueeze(1)  # [T, T, 96]
+            query_distances = torch.norm(query_diffs, dim=-1)  # [T, T]
 
-        num_frames = query_distances.shape[0]
-        mask = ~torch.eye(num_frames, dtype=torch.bool, device=queries.device)
+            num_frames = query_distances.shape[0]
+            mask = ~torch.eye(num_frames, dtype=torch.bool, device=queries.device)
 
-        off_diag_distances = query_distances[mask]
+            off_diag_distances = query_distances[mask]
 
-        print(f"[DEBUG] Query distances: mean={off_diag_distances.mean():.4f}, "
-              f"min={off_diag_distances.min():.4f}, "
-              f"max={off_diag_distances.max():.4f}")
+            print(f"[DEBUG] Query distances: mean={off_diag_distances.mean():.4f}, "
+                  f"min={off_diag_distances.min():.4f}, "
+                  f"max={off_diag_distances.max():.4f}")
 
-        # Check alignment between query and key spaces (first batch item only)
-        avg_query = queries_sample.mean(dim=0, keepdim=True)  # [1, 96]
-        avg_key = keys[0].mean(dim=0, keepdim=True)           # [1, 96]
+            # Check alignment between query and key spaces (first batch item only)
+            avg_query = queries_sample.mean(dim=0, keepdim=True)  # [1, 96]
+            avg_key = keys[0].mean(dim=0, keepdim=True)           # [1, 96]
 
-        cos_sim = F.cosine_similarity(avg_query, avg_key, dim=-1)
-        print(f"[DEBUG] Query-Key space alignment (cosine): {cos_sim.item():.4f}")
+            cos_sim = F.cosine_similarity(avg_query, avg_key, dim=-1)
+            print(f"[DEBUG] Query-Key space alignment (cosine): {cos_sim.item():.4f}")
         
 
-        print(f"[cross_attn] queries shape: {queries.shape}")
-        print(f"[cross_attn] keys shape: {keys.shape}")
+        if v: print(f"[cross_attn] queries shape: {queries.shape}")
+        if v: print(f"[cross_attn] keys shape: {keys.shape}")
 
-        print(f"[cross_attn] queries stats: mean={queries.mean():.4f}, std={queries.std():.4f}")
-        print(f"[cross_attn] keys stats: mean={keys.mean():.4f}, std={keys.std():.4f}")
+        if v: print(f"[cross_attn] queries stats: mean={queries.mean():.4f}, std={queries.std():.4f}")
+        if v: print(f"[cross_attn] keys stats: mean={keys.mean():.4f}, std={keys.std():.4f}")
 
-        # Raw attention scores (diagnostic only)
-        # ------------------------------------------------------------------
-        scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if v:
+            # Raw attention scores (diagnostic only)
+            scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        print(f"[cross_attn] attention scores shape: {scores.shape}")
-        print(f"[cross_attn] attention scores stats: mean={scores.mean():.4f}, "
-              f"std={scores.std():.4f}, "
-              f"min={scores.min():.4f}, "
-              f"max={scores.max():.4f}")
+            print(f"[cross_attn] attention scores shape: {scores.shape}")
+            print(f"[cross_attn] attention scores stats: mean={scores.mean():.4f}, "
+                  f"std={scores.std():.4f}, "
+                  f"min={scores.min():.4f}, "
+                  f"max={scores.max():.4f}")
 
         # ------------------------------------------------------------------
         # MultiheadAttention (with Learnable Temperature Scaling)
@@ -354,7 +358,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         temperature = F.softplus(self.raw_temperature) + 0.01  # learnable, starts ≈0.19, ensures >0.01
         queries_scaled = queries / temperature
         
-        print(f"[cross_attn] attention temperature: {temperature.item():.4f}")
+        if v: print(f"[cross_attn] attention temperature: {temperature.item():.4f}")
         
         attended_features, attention_weights = self.multihead_attn(
             query=queries_scaled,
@@ -364,19 +368,19 @@ class PositionAgnosticCrossAttention(nn.Module):
             average_attn_weights=True
         )
 
-        print(f"[cross_attn] attended_features shape: {attended_features.shape}")
-        print(f"[cross_attn] attended_features stats: mean={attended_features.mean():.4f}, "
+        if v: print(f"[cross_attn] attended_features shape: {attended_features.shape}")
+        if v: print(f"[cross_attn] attended_features stats: mean={attended_features.mean():.4f}, "
               f"std={attended_features.std():.4f}")
 
         # Compute entropy ON THE SCALED ATTENTION WEIGHTS so gradients flow to temperature!
         entropy = -(attention_weights * torch.log(attention_weights + 1e-9)).sum(-1).mean()
         self._cached_entropy = entropy  # trainer accesses this for entropy hinge loss
 
-        print(f"[cross_attn] attention_weights shape: {attention_weights.shape}")
-        print(f"[cross_attn] attention_weights stats: mean={attention_weights.mean():.4f}, "
+        if v: print(f"[cross_attn] attention_weights shape: {attention_weights.shape}")
+        if v: print(f"[cross_attn] attention_weights stats: mean={attention_weights.mean():.4f}, "
               f"std={attention_weights.std():.4f}")
-        print(f"[cross_attn] attention probs std: {attention_weights.std():.4f}")
-        print(f"[cross_attn] attention entropy: {entropy:.4f} "
+        if v: print(f"[cross_attn] attention probs std: {attention_weights.std():.4f}")
+        if v: print(f"[cross_attn] attention entropy: {entropy:.4f} "
               f"(uniform≈{math.log(attention_weights.shape[-1]):.2f})")
 
         # ------------------------------------------------------------------
@@ -384,7 +388,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         # ------------------------------------------------------------------
         if self.training:
             attended_features = self.dropout(attended_features)
-            print("[cross_attn] dropout applied")
+            if v: print("[cross_attn] dropout applied")
 
         # ------------------------------------------------------------------
         # AdaIN-style Fusion
@@ -410,7 +414,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             # across the 96 dimensions — mapping network gets ~unit-variance input without
             # the 6× noise amplification issue.
             attended_rms = attended_features / (attended_features.pow(2).mean(dim=-1, keepdim=True).sqrt() + 1e-6)
-            print(f"[cross_attn] attended_rms stats: mean={attended_rms.mean():.4f}, std={attended_rms.std():.4f}")
+            if v: print(f"[cross_attn] attended_rms stats: mean={attended_rms.mean():.4f}, std={attended_rms.std():.4f}")
             style_stats = self.mapping_network(attended_rms)  # [B, T, 192]
             
             gamma, beta = style_stats.chunk(2, dim=-1)                              # [B, T, 96] each
@@ -436,45 +440,45 @@ class PositionAgnosticCrossAttention(nn.Module):
             if self.force_gamma is not None:
                 gamma = torch.full_like(gamma, self.force_gamma)
                 beta  = torch.zeros_like(beta)
-                print(f"[cross_attn] ⚠️  DIAGNOSTIC OVERRIDE: gamma forced to {self.force_gamma}, beta forced to 0")
+                if v: print(f"[cross_attn] ⚠️  DIAGNOSTIC OVERRIDE: gamma forced to {self.force_gamma}, beta forced to 0")
             # ─────────────────────────────────────────────────────────────────
 
             # Apply AdaIN: y = (x - mean)/std * gamma + beta
             # ADD to attended_features instead of overwriting!
-            print(f"[cross_attn] FiLM scale: {film_scale.item():.4f}")
-            print(f"[cross_attn] FiLM gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}, "
+            if v: print(f"[cross_attn] FiLM scale: {film_scale.item():.4f}")
+            if v: print(f"[cross_attn] FiLM gamma: mean={gamma.mean():.4f}, std={gamma.std():.4f}, "
                   f"min={gamma.min():.4f}, max={gamma.max():.4f}")
             gamma_temporal_std = gamma.std(dim=1).mean()  # std across time → per-frame variation
             self._cached_gamma_std = gamma_temporal_std   # retained for external monitoring
-            print(f"[cross_attn] FiLM gamma temporal std: {gamma_temporal_std:.4f} "
+            if v: print(f"[cross_attn] FiLM gamma temporal std: {gamma_temporal_std:.4f} "
                   f"(>0.01 = per-frame modulation active)")
-            # Per-channel variance: are a few mel bins being modulated 10× more than others?
-            gamma_per_channel_std = gamma.std(dim=1)  # [B, 96] — temporal std per mel channel
-            top3_vals, top3_idx = gamma_per_channel_std.topk(min(3, gamma_per_channel_std.size(-1)))
-            print(f"[cross_attn] FiLM gamma per-channel std: mean={gamma_per_channel_std.mean():.4f}, "
-                  f"max={gamma_per_channel_std.max():.4f}, min={gamma_per_channel_std.min():.4f}")
-            print(f"[cross_attn] FiLM gamma top-3 volatile channels: "
-                  f"{list(zip(top3_idx[0].tolist(), [f'{v:.4f}' for v in top3_vals[0].tolist()]))}")
+            if v:
+                gamma_per_channel_std = gamma.std(dim=1)  # [B, 96] — temporal std per mel channel
+                top3_vals, top3_idx = gamma_per_channel_std.topk(min(3, gamma_per_channel_std.size(-1)))
+                print(f"[cross_attn] FiLM gamma per-channel std: mean={gamma_per_channel_std.mean():.4f}, "
+                      f"max={gamma_per_channel_std.max():.4f}, min={gamma_per_channel_std.min():.4f}")
+                print(f"[cross_attn] FiLM gamma top-3 volatile channels: "
+                      f"{list(zip(top3_idx[0].tolist(), [f'{val:.4f}' for val in top3_vals[0].tolist()]))}")
             # Beta diagnostics: since DC removal is gone, log beta to confirm it is shifting
             # the spectral envelope toward target speaker without exploding the mean.
-            print(f"[cross_attn] FiLM beta: mean={beta.mean():.4f}, std={beta.std():.4f}, "
+            if v: print(f"[cross_attn] FiLM beta: mean={beta.mean():.4f}, std={beta.std():.4f}, "
                   f"min={beta.min():.4f}, max={beta.max():.4f}")
             beta_temporal_std = beta.std(dim=1).mean()
-            print(f"[cross_attn] FiLM beta temporal std: {beta_temporal_std:.4f}")
+            if v: print(f"[cross_attn] FiLM beta temporal std: {beta_temporal_std:.4f}")
             film_output = residual_norm * (1.0 + gamma) + beta
             attended_features = attended_features + film_output
 
             # ── Source-leakage audit: is FiLM dominating or is the residual still winning? ──
-            print(f"[cross_attn] residual_norm contribution: std={residual_norm.std():.4f}")
-            print(f"[cross_attn] FiLM output (resid*(1+γ)+β): std={film_output.std():.4f}")
+            if v: print(f"[cross_attn] residual_norm contribution: std={residual_norm.std():.4f}")
+            if v: print(f"[cross_attn] FiLM output (resid*(1+γ)+β): std={film_output.std():.4f}")
 
-        print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
-        print("=" * 80 + "\n")
+        if v: print("[cross_attn] <<< EXITING CROSS ATTENTION FORWARD >>>")
+        if v: print("=" * 80 + "\n")
 
         if self.training and self.alpha.grad is not None:
-            print(f"[cross_attn] alpha grad: {self.alpha.grad.item():.6f}")
+            if v: print(f"[cross_attn] alpha grad: {self.alpha.grad.item():.6f}")
         else:
-            print(f"[cross_attn] alpha grad: None")
+            if v: print(f"[cross_attn] alpha grad: None")
 
         if return_attention:
             return attended_features, attention_weights
