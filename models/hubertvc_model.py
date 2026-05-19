@@ -48,14 +48,11 @@ class TemporalResampler(nn.Module):
         self.channels = channels
         self.default_ratio = 1.25  # Theoretical 20ms→16ms ratio
         
-        self.conv = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
-            nn.GroupNorm(8, channels),
-            nn.GELU()
-        )
-        
-        nn.init.xavier_uniform_(self.conv[0].weight, gain=0.1)
-        nn.init.zeros_(self.conv[0].bias)
+        # No-normalization residual refinement: y = interp(x) + 0.1·conv(interp(x))
+        # Preserves FiLM modulation magnitude while smoothing 20ms→16ms.
+        self.refine_conv = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        nn.init.xavier_uniform_(self.refine_conv.weight, gain=0.01)  # tiny init
+        nn.init.zeros_(self.refine_conv.bias)
     
     def forward(self, x: torch.Tensor, target_length: Optional[int] = None) -> torch.Tensor:
         """
@@ -79,7 +76,7 @@ class TemporalResampler(nn.Module):
         
         x = x.transpose(1, 2)  # (B, T, C) → (B, C, T)
         x = F.interpolate(x, size=out_length, mode='linear', align_corners=False)
-        x = self.conv(x)
+        x = x + 0.1 * self.refine_conv(x)  # residual: preserves scale, adds smoothness
         x = x.transpose(1, 2)  # (B, C, T) → (B, T, C)
         
         if input_is_2d:
@@ -138,8 +135,8 @@ class HubertVCModel(nn.Module):
             nn.LayerNorm(96)
         )
 
-        # Temporal resampler (20ms → 16ms)
         self.temporal_resampler = TemporalResampler(channels=96)
+        self._verbose = True  # set False to suppress per-call debug prints
 
         # --------------------------------------------------------- #
         # CONTINUOUS INFORMATION BOTTLENECK (IB)                    #
@@ -275,8 +272,9 @@ class HubertVCModel(nn.Module):
             
             speaker_feats = self.mel_encoder(ref_audio)  # [B, 64, 96]
             
-            print(f"[ECAPA-TDNN] Speaker feats shape: {speaker_feats.shape}")
-            print(f"Speaker feats (96D): μ={speaker_feats.mean():.4f}, σ={speaker_feats.std():.4f}")
+            if self._verbose:
+                print(f"[ECAPA-TDNN] Speaker feats shape: {speaker_feats.shape}")
+                print(f"Speaker feats (96D): μ={speaker_feats.mean():.4f}, σ={speaker_feats.std():.4f}")
 
         # --------------------------------------------------------- #
         # 2. HuBERT content features                                #
@@ -330,11 +328,12 @@ class HubertVCModel(nn.Module):
             resampled_features = self.temporal_resampler(fused_features, target_length=target_len)
         else:
             resampled_features = self.temporal_resampler(fused_features, target_length=None)
-        print(f"[DEBUG] Decoder input shape (Mel rate): {resampled_features.shape}")
+        if self._verbose:
+            print(f"[DEBUG] Decoder input shape (Mel rate): {resampled_features.shape}")
 
-        print(f"[DEBUG] Cross_Attention_Output shape: {fused_features.shape}, "
-              f"mean: {fused_features.mean().item():.4f}, "
-              f"std: {fused_features.std().item():.4f}")
+            print(f"[DEBUG] Cross_Attention_Output shape: {fused_features.shape}, "
+                  f"mean: {fused_features.mean().item():.4f}, "
+                  f"std: {fused_features.std().item():.4f}")
 
         # --------------------------------------------------------- #
         # 4. Mel decoding                                           #
@@ -369,7 +368,8 @@ class HubertVCModel(nn.Module):
             """
             
 
-            print(f"[DEBUG] MobileNet_Decoder_Output shape: {pred_mel.shape}, mean: {pred_mel.mean().item():.4f}, std: {pred_mel.std().item():.4f}")
+            if self._verbose:
+                print(f"[DEBUG] MobileNet_Decoder_Output shape: {pred_mel.shape}, mean: {pred_mel.mean().item():.4f}, std: {pred_mel.std().item():.4f}")
 
         # --------------------------------------------------------- #
         # 5. Losses (optional)                                      #

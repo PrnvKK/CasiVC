@@ -151,6 +151,15 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print()
     # ──────────────────────────────────────────────────────────────────
 
+    # ── Suppress per-call debug prints after diagnostic probe ────────
+    model._verbose = False
+    model.cross_attn._verbose = False
+    model.decoder._verbose = False
+    for blk in model.decoder.blocks:
+        blk._verbose = False
+    model.mel_encoder._verbose = False
+    # ─────────────────────────────────────────────────────────────────
+
     with torch.no_grad():
         # ── Test 3: Self-reconstruction A → A ─────────────────────
         print("\n[5] Self-reconstruction: A content + A voice...")
@@ -183,6 +192,69 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         torchaudio.save(os.path.join(output_dir, "08_cross_BtoA.wav"), wave_BA.unsqueeze(0), audio_cfg.sample_rate)
         print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}")
         print("\u2705 Saved B\u2192A")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STAGE-DELTA AUDIT: A-voice vs B-voice divergence at each pipeline stage
+    # ═══════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("🔬 STAGE-DELTA AUDIT (A-voice vs B-voice divergence per stage)")
+    print("="*70)
+    with torch.no_grad():
+        cont_A_t = model.hubert([content_A.to(device)])
+        cont_A_t = model.hubert_proj(cont_A_t)
+        cont_A_t = model.info_bottleneck(cont_A_t)
+        spk_A_t = model.mel_encoder([ref_A.to(device)])
+        spk_B_t = model.mel_encoder([ref_B.to(device)])
+
+        fused_AA = model.cross_attn(cont_A_t, spk_A_t)
+        fused_AB = model.cross_attn(cont_A_t, spk_B_t)
+
+        tgt_len = gt_mel_A.shape[-1]
+        resampled_AA = model.temporal_resampler(fused_AA, target_length=tgt_len)
+        resampled_AB = model.temporal_resampler(fused_AB, target_length=tgt_len)
+
+        adapter_AA = model.decoder.adapter(resampled_AA.transpose(1, 2))
+        adapter_AB = model.decoder.adapter(resampled_AB.transpose(1, 2))
+
+        x_AA, x_AB = adapter_AA, adapter_AB
+        for i, blk in enumerate(model.decoder.blocks):
+            x_AA, x_AB = blk(x_AA), blk(x_AB)
+            if i == 0:
+                block0_AA, block0_AB = x_AA.clone(), x_AB.clone()
+            if i == 2:
+                block2_AA, block2_AB = x_AA.clone(), x_AB.clone()
+            if i == 3:
+                block3_AA, block3_AB = x_AA.clone(), x_AB.clone()
+
+        mel_AA = model.decoder.mel_proj(block3_AA)
+        mel_AB = model.decoder.mel_proj(block3_AB)
+
+        stages = [
+            ("cross_attn", fused_AA, fused_AB),
+            ("resampler", resampled_AA, resampled_AB),
+            ("adapter", adapter_AA, adapter_AB),
+            ("block0", block0_AA, block0_AB),
+            ("block2", block2_AA, block2_AB),
+            ("block3", block3_AA, block3_AB),
+            ("mel_proj", mel_AA, mel_AB),
+        ]
+        print(f"  {'Stage':<14} {'L1 diff':>9} {'cos sim':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
+        for name, aa, ab in stages:
+            l1 = (aa - ab).abs().mean().item()
+            cos = torch.nn.functional.cosine_similarity(aa.flatten(), ab.flatten(), dim=0).item()
+            sa, sb = aa.std().item(), ab.std().item()
+            ratio = sb / (sa + 1e-8)
+            print(f"  {name:<14} {l1:>9.4f} {cos:>9.4f} {sa:>8.4f} {sb:>8.4f} {ratio:>8.3f}")
+    print("="*70)
+    # ═══════════════════════════════════════════════════════════════════
+
+    # ── Re-enable verbose for forced-gamma diagnostic ────────────────
+    model._verbose = True
+    model.cross_attn._verbose = True
+    model.decoder._verbose = True
+    for blk in model.decoder.blocks:
+        blk._verbose = True
+    # ─────────────────────────────────────────────────────────────────
 
     # \u2500\u2500 FORCED-GAMMA DIAGNOSTIC \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     # Bypasses the mapping network. Injects constant gamma to answer:
@@ -222,8 +294,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("="*60)
 
 
-    # ── Mel variance summary (key out_scale health check) ─────────────
-    print("\n[MEL VARIANCE SUMMARY]  (target σ ≈ 2.5 for HiFi-GAN)")
+    # ── Mel variance summary: compare pred vs matching GT, not fixed 2.5 ─
+    print("\n[MEL VARIANCE SUMMARY]  (pred vs matching GT)")
     gt_A_std  = gt_mel_A.std().item()
     gt_B_std  = gt_mel_B.std().item()
     aa_std    = pred_mel_AA.std().item()
@@ -232,8 +304,10 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     ba_std    = pred_mel_BA.std().item()
     print(f"  GT A σ={gt_A_std:.4f}  |  GT B σ={gt_B_std:.4f}")
     print(f"  A→A σ={aa_std:.4f}  |  B→B σ={bb_std:.4f}  |  A→B σ={ab_std:.4f}  |  B→A σ={ba_std:.4f}")
-    deficit = ((2.5 - aa_std) / 2.5) * 100
-    print(f"  Variance deficit (A→A vs 2.5): {deficit:.1f}%  {'✅ OK' if deficit < 15 else '❌ Compressed'}")
+    deficit_aa = ((gt_A_std - aa_std) / gt_A_std) * 100
+    deficit_bb = ((gt_B_std - bb_std) / gt_B_std) * 100
+    print(f"  Variance deficit (A→A vs GT A={gt_A_std:.4f}): {deficit_aa:.1f}%  {'✅ OK' if deficit_aa < 15 else '❌ Compressed'}")
+    print(f"  Variance deficit (B→B vs GT B={gt_B_std:.4f}): {deficit_bb:.1f}%  {'✅ OK' if deficit_bb < 15 else '❌ Compressed'}")
     # ──────────────────────────────────────────────────────────────────
 
 
