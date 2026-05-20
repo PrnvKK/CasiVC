@@ -221,6 +221,7 @@ class MobileNetDecoder(nn.Module):
                   use_se=use_se[idx],
                   norm=config.mobilenet_norm,
                   upsample_first=should_upsample,
+                  residual_scale=getattr(config, 'block3_residual_scale', 1.0) if idx == 3 else 1.0,
               )
             )
         self.blocks = nn.ModuleList(blocks)

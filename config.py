@@ -119,8 +119,10 @@ class ModelConfig:
         default_factory=lambda: [4, 3, 3, 2]
     )
     mobilenet_use_se: List[bool] = field(
-        default_factory=lambda: [False, False, True, False]  # SE removed from block3 — temporal averaging was dominant speaker eraser (b3_body cent_cos 0.89)
+        default_factory=lambda: [False, False, True, True]  # Reverted: SE on block3 provides some speaker-dependent reweighting; removing it made b3_body worse
     )
+
+    block3_residual_scale: float = 0.5  # Reduce body contribution at block3 only; body (cent_cos 0.90) dominates sum over identity (cent_cos 0.74)
 
     mobilenet_upsample_stages: List[bool] = field(
     default_factory=lambda: [False, False, False, False]
