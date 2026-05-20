@@ -238,13 +238,17 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("block3", block3_AA, block3_AB),
             ("mel_proj", mel_AA, mel_AB),
         ]
-        print(f"  {'Stage':<14} {'L1 diff':>9} {'cos sim':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
+        print(f"  {'Stage':<14} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
         for name, aa, ab in stages:
             l1 = (aa - ab).abs().mean().item()
             cos = torch.nn.functional.cosine_similarity(aa.flatten(), ab.flatten(), dim=0).item()
+            # Centered cosine: subtract per-tensor mean before cosine, removing DC/bias contamination
+            aa_c = aa.flatten() - aa.flatten().mean()
+            ab_c = ab.flatten() - ab.flatten().mean()
+            cos_cent = torch.nn.functional.cosine_similarity(aa_c, ab_c, dim=0).item()
             sa, sb = aa.std().item(), ab.std().item()
             ratio = sb / (sa + 1e-8)
-            print(f"  {name:<14} {l1:>9.4f} {cos:>9.4f} {sa:>8.4f} {sb:>8.4f} {ratio:>8.3f}")
+            print(f"  {name:<14} {l1:>9.4f} {cos:>9.4f} {cos_cent:>9.4f} {sa:>8.4f} {sb:>8.4f} {ratio:>8.3f}")
     print("="*70)
     # ═══════════════════════════════════════════════════════════════════
 

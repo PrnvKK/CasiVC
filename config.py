@@ -129,7 +129,7 @@ class ModelConfig:
     
     mobilenet_kernel_size_first: int = 5
     mobilenet_kernel_size: int = 3
-    mobilenet_norm: str = "none"  
+    mobilenet_norm: str = "gn"  
     mobilenet_upsample_first: bool = True  
          
             
