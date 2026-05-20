@@ -113,13 +113,13 @@ class ModelConfig:
     
     mobilenet_input_dim: int = 96  # Must match cross_attention_dim
     mobilenet_channel_progression: List[int] = field(
-        default_factory=lambda: [96, 128, 160, 192, 80]
+        default_factory=lambda: [96, 128, 160, 192, 96]
     )
     mobilenet_expand_ratios: List[int] = field(
         default_factory=lambda: [4, 3, 3, 2]
     )
     mobilenet_use_se: List[bool] = field(
-        default_factory=lambda: [False, False, True, True]
+        default_factory=lambda: [False, False, True, False]  # SE removed from block3 — temporal averaging was dominant speaker eraser (b3_body cent_cos 0.89)
     )
 
     mobilenet_upsample_stages: List[bool] = field(
@@ -149,7 +149,7 @@ class TrainingConfig:
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
   lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
   lambda_var: float = 30.0     # Raised from 4.0 to overcome L1 dominance and force the learnable scale to grow
-  lambda_entropy: float = 1.0   # Two-sided hinge [1.0, 1.5]: doubled from 0.5 — entropy at 1.75-1.93 needs stronger ceiling pressure
+  lambda_entropy: float = 1.0   # Two-sided hinge [1.0, 1.5]; reverted from 3.0 — 1.72 was blended-speaker diagnostic, not training path
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
   cross_pair_prob: float = 1.0           # probability of applying cross-pair in a batch (increased for decisive diagnostic)

@@ -233,11 +233,13 @@ class MobileNetDecoder(nn.Module):
             bias=True
         )
         
-        # Identity-initialized 1×1 projection: preserves block3 variance (~2.0)
-        # instead of compressing it by ~50% as Xavier init does.  Each output
-        # mel band starts as its corresponding input channel + bias, then
-        # training learns cross-channel corrections if needed.
-        nn.init.eye_(self.mel_proj.weight.squeeze(-1))
+        # Partial-identity init for 96→80 mel_proj (non-square): first 80 input
+        # channels = identity (preserving current mel mapping), remaining 16 channels
+        # = small gain so training can gradually recruit the extra capacity.
+        with torch.no_grad():
+            weight_mat = self.mel_proj.weight.squeeze(-1)  # [80, 96]
+            nn.init.xavier_uniform_(weight_mat, gain=0.1)
+            weight_mat[:, :80] = torch.eye(80)  # first 80 cols = identity
         if self.mel_proj.bias is not None:
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
