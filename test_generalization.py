@@ -218,13 +218,40 @@ def test_generalization(checkpoint_path: str, output_dir: str):
 
         x_AA, x_AB = adapter_AA, adapter_AB
         for i, blk in enumerate(model.decoder.blocks):
-            x_AA, x_AB = blk(x_AA), blk(x_AB)
+            if i == 3:
+                # ── Block3 decomposed: identity vs body vs sum ──
+                # Replicate MobileNetBlock.forward logic to capture each branch
+                identity_AA, identity_AB = x_AA, x_AB
+                # upsampling (none for block3)
+                if blk.upsample_first is not None:
+                    x_AA = blk.upsample_first(x_AA)
+                    x_AB = blk.upsample_first(x_AB)
+                    identity_AA = blk.upsample_first(identity_AA)
+                    identity_AB = blk.upsample_first(identity_AB)
+                # body
+                body_AA = blk.block(x_AA)
+                body_AB = blk.block(x_AB)
+                # identity projection
+                if blk.residual_proj is not None:
+                    id_proj_AA = blk.residual_proj(identity_AA)
+                    id_proj_AB = blk.residual_proj(identity_AB)
+                else:
+                    id_proj_AA = identity_AA
+                    id_proj_AB = identity_AB
+                # final sum
+                sum_AA = blk.residual_identity_scale * id_proj_AA + blk.residual_scale * body_AA
+                sum_AB = blk.residual_identity_scale * id_proj_AB + blk.residual_scale * body_AB
+                # store for stage audit
+                b3_id_AA, b3_id_AB = id_proj_AA, id_proj_AB
+                b3_body_AA, b3_body_AB = body_AA, body_AB
+                block3_AA, block3_AB = sum_AA, sum_AB
+                x_AA, x_AB = sum_AA, sum_AB
+            else:
+                x_AA, x_AB = blk(x_AA), blk(x_AB)
             if i == 0:
                 block0_AA, block0_AB = x_AA.clone(), x_AB.clone()
             if i == 2:
                 block2_AA, block2_AB = x_AA.clone(), x_AB.clone()
-            if i == 3:
-                block3_AA, block3_AB = x_AA.clone(), x_AB.clone()
 
         mel_AA = model.decoder.mel_proj(block3_AA)
         mel_AB = model.decoder.mel_proj(block3_AB)
@@ -235,7 +262,9 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("adapter", adapter_AA, adapter_AB),
             ("block0", block0_AA, block0_AB),
             ("block2", block2_AA, block2_AB),
-            ("block3", block3_AA, block3_AB),
+            ("b3_identity", b3_id_AA, b3_id_AB),
+            ("b3_body", b3_body_AA, b3_body_AB),
+            ("block3_sum", block3_AA, block3_AB),
             ("mel_proj", mel_AA, mel_AB),
         ]
         print(f"  {'Stage':<14} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
