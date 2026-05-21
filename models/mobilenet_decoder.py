@@ -176,6 +176,75 @@ class MobileNetBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+#  Speaker-conditioned FiLM for block3                                       #
+# --------------------------------------------------------------------------- #
+class SpeakerFiLM(nn.Module):
+    """Lightweight speaker-conditioned FiLM applied at block3 output.
+
+    Combats speaker erasure at the block3 residual projection (cent_cos
+    jumps from ~0.49 to ~0.75) by re-injecting speaker identity right
+    before mel_proj.  Speaker tokens are pooled → 2-layer MLP → (gamma,
+    beta) for 96 channels.  ELU on gamma ensures (1+gamma) ≥ 0
+    (inversion guard, consistent with cross_attn).  Small gain=0.1 init
+    ensures near-identity start; model learns scale through training.
+    """
+    def __init__(self, speaker_dim: int = 96, target_channels: int = 96):
+        super().__init__()
+        self.speaker_dim = speaker_dim
+        self.target_channels = target_channels
+
+        self.mlp = nn.Sequential(
+            nn.Linear(speaker_dim, speaker_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(speaker_dim, target_channels * 2),
+        )
+
+        # Conservative init: near-identity start (gamma ≈ 0, beta ≈ 0)
+        with torch.no_grad():
+            for m in self.mlp.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                    nn.init.zeros_(m.bias)
+
+        self._verbose = True
+
+    def forward(self, x: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:             [B, C, T] block3 output features
+            speaker_feats: [B, num_tokens, speaker_dim] speaker tokens from mel_encoder
+        Returns:
+            x conditioned on speaker: [B, C, T]
+        """
+        # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
+        spk_pooled = speaker_feats.mean(dim=1)
+
+        # Generate FiLM parameters
+        film_params = self.mlp(spk_pooled)                       # [B, target_channels * 2]
+        gamma, beta = film_params.chunk(2, dim=-1)               # [B, target_channels] each
+
+        # ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
+        gamma = F.elu(gamma)
+
+        # Reshape for broadcasting over temporal dim: [B, C, 1]
+        gamma = gamma.unsqueeze(-1)
+        beta  = beta.unsqueeze(-1)
+
+        if self._verbose:
+            g = gamma.squeeze(-1)  # [B, C]
+            b = beta.squeeze(-1)
+            print(f"[speaker_film] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
+                  f"min={g.min():.4f}, max={g.max():.4f}")
+            print(f"[speaker_film] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
+                  f"min={b.min():.4f}, max={b.max():.4f}")
+            print(f"[speaker_film] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
+
+        # Apply FiLM: x * (1 + gamma) + beta
+        x = x * (1.0 + gamma) + beta
+        return x
+
+
+# --------------------------------------------------------------------------- #
 #  Decoder                                                                    #
 # --------------------------------------------------------------------------- #
 class MobileNetDecoder(nn.Module):
@@ -249,6 +318,16 @@ class MobileNetDecoder(nn.Module):
         if self.mel_proj.bias is not None:
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
+
+        # Speaker-conditioned FiLM at block3 output: re-injects speaker
+        # identity right before mel_proj, directly targeting the cent_cos
+        # jump from ~0.49 (block2) to ~0.75 (block3_sum).  Pooled speaker
+        # tokens → 2-layer MLP → gamma/beta for 96 channels.  ELU guard
+        # on gamma, conservative gain=0.1 init for near-identity start.
+        self.speaker_film = SpeakerFiLM(
+            speaker_dim=config.speaker_projection_dim,     # 96
+            target_channels=channel_progression[-1],       # 96
+        )
 
         # Per-band output scale — SOFTPLUS reparametrised so scale can NEVER collapse.
         # Previously out_scale=1.0 (linear) was pulled back toward 1.0 by L1 mel loss
@@ -343,7 +422,7 @@ class MobileNetDecoder(nn.Module):
                 print(f"✅ {tag:16s}  mean={x.mean():7.4f}  std={x.std():7.4f}")
 
     
-    def forward(self, fused: torch.Tensor, return_intermediate: bool = False) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
+    def forward(self, fused: torch.Tensor, return_intermediate: bool = False, speaker_feats: torch.Tensor | None = None) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
 
         # Validate input
         if fused.ndim != 3:
@@ -373,6 +452,13 @@ class MobileNetDecoder(nn.Module):
               intermediate.append(x)
           
         
+        # Speaker FiLM at block3 output: re-inject speaker identity
+        # before mel_proj compresses it away.  Without this, block3's
+        # 192→96 residual_proj crushes speaker info (cent_cos 0.49→0.75).
+        if speaker_feats is not None:
+            x = self.speaker_film(x, speaker_feats)
+            self._check(x, "spk_film")
+
         mel = self.mel_proj(x)
 
         # ── Decoder output diagnostics ──────────────────────────────────

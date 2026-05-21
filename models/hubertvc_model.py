@@ -341,9 +341,9 @@ class HubertVCModel(nn.Module):
         # Force FP32 for decoder to avoid NaN gradients
         with torch.amp.autocast(device_type=device.type, enabled=False):
             if return_bottleneck and self.speaker_classifier is not None:
-                pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True)
+                pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True, speaker_feats=speaker_feats)
             else:
-                pred_mel = self.decoder(resampled_features.float())  # [B, 80, T_hubert]
+                pred_mel = self.decoder(resampled_features.float(), speaker_feats=speaker_feats)  # [B, 80, T_hubert]
 
             # Upsample output from HuBERT rate → mel rate (deterministic, clean interpolation)
             if gt_mels is not None:

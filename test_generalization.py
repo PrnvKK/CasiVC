@@ -155,6 +155,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model._verbose = False
     model.cross_attn._verbose = False
     model.decoder._verbose = False
+    model.decoder.speaker_film._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -256,6 +257,12 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_AA = model.decoder.mel_proj(block3_AA)
         mel_AB = model.decoder.mel_proj(block3_AB)
 
+        # ── Speaker FiLM: re-inject speaker identity before mel_proj ──
+        film_AA = model.decoder.speaker_film(block3_AA, spk_A_t)
+        film_AB = model.decoder.speaker_film(block3_AB, spk_B_t)
+        mel_film_AA = model.decoder.mel_proj(film_AA)
+        mel_film_AB = model.decoder.mel_proj(film_AB)
+
         stages = [
             ("cross_attn", fused_AA, fused_AB),
             ("resampler", resampled_AA, resampled_AB),
@@ -265,7 +272,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("b3_identity", b3_id_AA, b3_id_AB),
             ("b3_body", b3_body_AA, b3_body_AB),
             ("block3_sum", block3_AA, block3_AB),
-            ("mel_proj", mel_AA, mel_AB),
+            ("spk_film", film_AA, film_AB),
+            ("mel_proj", mel_film_AA, mel_film_AB),
         ]
         print(f"  {'Stage':<14} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
         for name, aa, ab in stages:
@@ -285,6 +293,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model._verbose = True
     model.cross_attn._verbose = True
     model.decoder._verbose = True
+    model.decoder.speaker_film._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────
