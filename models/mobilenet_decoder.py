@@ -234,13 +234,18 @@ class MobileNetDecoder(nn.Module):
             bias=True
         )
         
-        # Partial-identity init for 96→80 mel_proj (non-square): first 80 input
-        # channels = identity (preserving current mel mapping), remaining 16 channels
-        # = small gain so training can gradually recruit the extra capacity.
+        # Compromise init for 96→80 mel_proj.
+        # Identity anchor on first 80 channels preserves L1 stability and mel
+        # variance scale (σ≈1.68), preventing the upstream regression seen with
+        # full Xavier (gain=1.0, no identity). Channels 80-95 use Xavier(gain=0.5)
+        # — 5× stronger than old gain=0.1 so the gradient can recruit them for
+        # speaker-dependent structure without destabilizing training dynamics.
+        # Hypothesis: this stops channels 80-95 starvation while keeping the
+        # L1 anchor that blocks 0-2 need to converge.
         with torch.no_grad():
             weight_mat = self.mel_proj.weight.squeeze(-1)  # [80, 96]
-            nn.init.xavier_uniform_(weight_mat, gain=0.1)
-            weight_mat[:, :80] = torch.eye(80)  # first 80 cols = identity
+            nn.init.xavier_uniform_(weight_mat, gain=0.5)
+            weight_mat[:, :80] = torch.eye(80)
         if self.mel_proj.bias is not None:
             #nn.init.zeros_(self.mel_proj.bias)
             nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
