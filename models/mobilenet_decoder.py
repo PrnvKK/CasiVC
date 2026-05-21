@@ -206,6 +206,12 @@ class SpeakerFiLM(nn.Module):
                     nn.init.xavier_uniform_(m.weight, gain=0.1)
                     nn.init.zeros_(m.bias)
 
+        # Learnable film_scale: softplus reparam so scale can never collapse.
+        # Matches cross_attn's raw_film_scale pattern.  Init -0.5 →
+        # softplus(-0.5)+0.5 ≈ 1.13, giving the FiLM meaningful
+        # authority from the start while allowing training to grow it.
+        self.raw_film_scale = nn.Parameter(torch.tensor(-0.5))
+
         self._verbose = True
 
     def forward(self, x: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
@@ -223,8 +229,12 @@ class SpeakerFiLM(nn.Module):
         film_params = self.mlp(spk_pooled)                       # [B, target_channels * 2]
         gamma, beta = film_params.chunk(2, dim=-1)               # [B, target_channels] each
 
-        # ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
-        gamma = F.elu(gamma)
+        # Learnable scale (softplus reparam, always > 0.5)
+        film_scale = F.softplus(self.raw_film_scale) + 0.5
+
+        # Scale + ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
+        gamma = F.elu(gamma * film_scale)
+        beta  = beta * film_scale
 
         # Reshape for broadcasting over temporal dim: [B, C, 1]
         gamma = gamma.unsqueeze(-1)
@@ -237,6 +247,7 @@ class SpeakerFiLM(nn.Module):
                   f"min={g.min():.4f}, max={g.max():.4f}")
             print(f"[speaker_film] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
                   f"min={b.min():.4f}, max={b.max():.4f}")
+            print(f"[speaker_film] film_scale: {film_scale.item():.4f}")
             print(f"[speaker_film] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
 
         # Apply FiLM: x * (1 + gamma) + beta
