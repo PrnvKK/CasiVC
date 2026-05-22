@@ -163,8 +163,23 @@ class HubertVCModel(nn.Module):
             nn.init.xavier_uniform_(self.speaker_classifier.weight)
             nn.init.zeros_(self.speaker_classifier.bias)
             print(f"[HubertVCModel] Speaker classifier: Conv1d(192, {num_speakers}, k=1) → {num_speakers * 193:,} params")
+
+            # Block3 classifier: directly supervises block3_sum (96ch, pre-spk_film)
+            # to teach FiLM MLP which channels encode target-speaker identity
+            self.block3_classifier = nn.Conv1d(96, num_speakers, kernel_size=1)
+            nn.init.xavier_uniform_(self.block3_classifier.weight)
+            nn.init.zeros_(self.block3_classifier.bias)
+            print(f"[HubertVCModel] Block3 classifier: Conv1d(96, {num_speakers}, k=1) → {num_speakers * 97:,} params")
+
+            # Mel-output classifier: supervises mel_proj to retain speaker info
+            self.mel_classifier = nn.Conv1d(80, num_speakers, kernel_size=1)
+            nn.init.xavier_uniform_(self.mel_classifier.weight)
+            nn.init.zeros_(self.mel_classifier.bias)
+            print(f"[HubertVCModel] Mel classifier: Conv1d(80, {num_speakers}, k=1) → {num_speakers * 81:,} params")
         else:
             self.speaker_classifier = None
+            self.block3_classifier = None
+            self.mel_classifier = None
 
         # 2. Sanity-check overall parameter budget
         trainables = sum(p.numel() for p in self.parameters()
@@ -422,6 +437,21 @@ class HubertVCModel(nn.Module):
                 aux = {}
             aux["classifier_logits"] = classifier_logits
             aux["bottleneck"] = bottleneck
+
+            # Block3 classifier: supervise block3_sum (pre-SpeakerFiLM) to teach
+            # b3_id_film which channels carry target-speaker identity
+            if self.block3_classifier is not None:
+                block3_sum = intermediate[3]  # [B, 96, T] — after residual sum, before spk_film
+                block3_sum = F.avg_pool1d(block3_sum, kernel_size=3, stride=1, padding=1)
+                block3_logits = self.block3_classifier(block3_sum)  # [B, num_speakers, T]
+                aux["block3_classifier_logits"] = block3_logits
+
+            # Mel-output classifier: supervise mel_proj to retain speaker info
+            if self.mel_classifier is not None:
+                mel_feats = pred_mel  # [B, 80, T] — clamp saturation is 0%, so effectively unclamped
+                mel_feats = F.avg_pool1d(mel_feats, kernel_size=3, stride=1, padding=1)
+                mel_logits = self.mel_classifier(mel_feats)  # [B, num_speakers, T]
+                aux["mel_classifier_logits"] = mel_logits
         
         return pred_mel, loss_dict, aux
 

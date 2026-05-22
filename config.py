@@ -159,6 +159,7 @@ class TrainingConfig:
 
   # Speaker classifier head at decoder bottleneck
   classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID
+  mel_classifier_weight: float = 0.1   # weight for mel-output CE loss (gentle — just prevents erasure)
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
