@@ -156,6 +156,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.cross_attn._verbose = False
     model.decoder._verbose = False
     model.decoder.speaker_film._verbose = False
+    model.decoder.block3_id_film._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -239,11 +240,17 @@ def test_generalization(checkpoint_path: str, output_dir: str):
                 else:
                     id_proj_AA = identity_AA
                     id_proj_AB = identity_AB
+                # store raw id_proj BEFORE FiLM (the erasure point)
+                b3_id_AA, b3_id_AB = id_proj_AA.clone(), id_proj_AB.clone()
+                # ── INJECT: block3_id_film at residual_proj output ──
+                id_proj_AA = model.decoder.block3_id_film(id_proj_AA, spk_A_t)
+                id_proj_AB = model.decoder.block3_id_film(id_proj_AB, spk_B_t)
+                # store id_proj AFTER FiLM (speaker-recovered)
+                b3_id_film_AA, b3_id_film_AB = id_proj_AA.clone(), id_proj_AB.clone()
                 # final sum
                 sum_AA = blk.residual_identity_scale * id_proj_AA + blk.residual_scale * body_AA
                 sum_AB = blk.residual_identity_scale * id_proj_AB + blk.residual_scale * body_AB
                 # store for stage audit
-                b3_id_AA, b3_id_AB = id_proj_AA, id_proj_AB
                 b3_body_AA, b3_body_AB = body_AA, body_AB
                 block3_AA, block3_AB = sum_AA, sum_AB
                 x_AA, x_AB = sum_AA, sum_AB
@@ -269,7 +276,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("adapter", adapter_AA, adapter_AB),
             ("block0", block0_AA, block0_AB),
             ("block2", block2_AA, block2_AB),
-            ("b3_identity", b3_id_AA, b3_id_AB),
+            ("b3_identity", b3_id_AA, b3_id_AB),        # raw residual_proj output (the erasure point)
+            ("b3_id_film", b3_id_film_AA, b3_id_film_AB), # after Block3IdentityFiLM (speaker recovered)
             ("b3_body", b3_body_AA, b3_body_AB),
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
@@ -294,6 +302,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.cross_attn._verbose = True
     model.decoder._verbose = True
     model.decoder.speaker_film._verbose = True
+    model.decoder.block3_id_film._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────

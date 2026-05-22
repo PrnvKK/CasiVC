@@ -378,7 +378,8 @@ class Trainer:
 
             # Forward pass - NOW USES ref_audio and optionally precomputed features
             classifier_weight = getattr(self.train_cfg, 'classifier_weight', 0.0)
-            need_bottleneck = classifier_weight > 0 and self.model.speaker_classifier is not None
+            mel_classifier_weight = getattr(self.train_cfg, 'mel_classifier_weight', 0.1)
+            need_bottleneck = (classifier_weight > 0 or mel_classifier_weight > 0) and self.model.speaker_classifier is not None
             
             pred_mel, _, aux = self.model(
                 ref_audio=ref_audio,
@@ -451,6 +452,33 @@ class Trainer:
                         # Top-3 predicted speakers (first frame of first sample)
                         top3_vals, top3_idx = logits_self[0, :, 0].topk(min(3, logits_self.size(1)))
                         print(f"[CLASSIFIER] frame-0 top3 indices: {top3_idx.tolist()}, values: {[f'{v:.3f}' for v in top3_vals.tolist()]}")
+
+            # --- Block3 classifier CE (self-pair): supervises block3_sum pre-spk_film ---
+            if need_bottleneck and aux is not None and "block3_classifier_logits" in aux:
+                b3_logits = aux["block3_classifier_logits"]  # [B, N, T]
+                T_b3 = b3_logits.size(-1)
+                target_expanded_b3 = target_idx.unsqueeze(1).expand(-1, T_b3)
+                ce_b3 = self.classifier_loss_fn(b3_logits, target_expanded_b3)
+                total = total + classifier_weight * ce_b3
+                loss_accum["classifier"] += ce_b3.item()
+                if num_batches == 0:
+                    with torch.no_grad():
+                        _, pred_b3 = b3_logits.max(dim=1)
+                        acc_b3 = (pred_b3 == target_expanded_b3).float().mean().item()
+                        print(f"[B3_CLASSIFIER] ce={ce_b3.item():.4f}, self_accuracy={acc_b3:.4f}")
+
+            # --- Mel-output classifier CE (self-pair): prevents mel_proj erasure ---
+            if mel_classifier_weight > 0 and aux is not None and "mel_classifier_logits" in aux:
+                mel_logits = aux["mel_classifier_logits"]  # [B, N, T]
+                T_mel = mel_logits.size(-1)
+                target_expanded_mel = target_idx.unsqueeze(1).expand(-1, T_mel)
+                ce_mel = self.classifier_loss_fn(mel_logits, target_expanded_mel)
+                total = total + mel_classifier_weight * ce_mel
+                if num_batches == 0:
+                    with torch.no_grad():
+                        _, pred_mel_cls = mel_logits.max(dim=1)
+                        acc_mel = (pred_mel_cls == target_expanded_mel).float().mean().item()
+                        print(f"[MEL_CLASSIFIER] ce={ce_mel.item():.4f}, self_accuracy={acc_mel:.4f}")
             
             print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
             f"raw_stft={losses.get('stft', 0):.4f}, "
@@ -520,6 +548,23 @@ class Trainer:
                         target_cross_expanded = target_idx_rolled.unsqueeze(1).expand(-1, T_cross)
                         ce_loss_cross = self.classifier_loss_fn(logits_cross, target_cross_expanded)
                         total = total + classifier_weight * ce_loss_cross
+
+                    # --- Block3 classifier CE on cross-pair ---
+                    if need_bottleneck and aux_cross is not None and "block3_classifier_logits" in aux_cross:
+                        b3_logits_cross = aux_cross["block3_classifier_logits"]  # [B, N, T]
+                        T_b3c = b3_logits_cross.size(-1)
+                        target_b3_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_b3c)
+                        ce_b3_cross = self.classifier_loss_fn(b3_logits_cross, target_b3_rolled)
+                        total = total + classifier_weight * ce_b3_cross
+                        loss_accum["classifier"] += ce_b3_cross.item()
+
+                    # --- Mel-output classifier CE on cross-pair ---
+                    if mel_classifier_weight > 0 and aux_cross is not None and "mel_classifier_logits" in aux_cross:
+                        mel_logits_cross = aux_cross["mel_classifier_logits"]  # [B, N, T]
+                        T_melc = mel_logits_cross.size(-1)
+                        target_mel_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_melc)
+                        ce_mel_cross = self.classifier_loss_fn(mel_logits_cross, target_mel_rolled)
+                        total = total + mel_classifier_weight * ce_mel_cross
                     
                     if num_batches == 0:
                         rolled_ids = [speaker_ids[(i+1) % B] for i in range(B)]

@@ -256,6 +256,88 @@ class SpeakerFiLM(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+#  Block3 Identity-Path FiLM — speaker conditioning at residual_proj output  #
+# --------------------------------------------------------------------------- #
+class Block3IdentityFiLM(nn.Module):
+    """Speaker-conditioned FiLM applied to block3's identity projection output.
+
+    The block3 residual_proj (192→96) is the localized speaker eraser:
+    cent_cos jumps from ~0.67 (block2) to ~0.87 (b3_identity).  Injecting
+    speaker-dependent gamma/beta directly after residual_proj means no
+    GroupNorm can undo it — the FiLM sits between residual_proj and the
+    residual sum, outside any normalization layer.
+
+    Same pattern as SpeakerFiLM: pooled speaker tokens → 2-layer MLP →
+    gamma/beta for 96 channels, ELU guard on gamma, gain=0.1 init,
+    learnable film_scale with softplus reparam.
+    """
+    def __init__(self, speaker_dim: int = 96, target_channels: int = 96):
+        super().__init__()
+        self.speaker_dim = speaker_dim
+        self.target_channels = target_channels
+
+        self.mlp = nn.Sequential(
+            nn.Linear(speaker_dim, speaker_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(speaker_dim, target_channels * 2),
+        )
+
+        # Conservative init: near-identity start (gamma ≈ 0, beta ≈ 0)
+        with torch.no_grad():
+            for m in self.mlp.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.2)
+                    nn.init.zeros_(m.bias)
+
+        # Learnable film_scale: softplus reparam so scale can never collapse.
+        # Init 0.5 → softplus(0.5)+0.5 ≈ 2.19, giving strong authority
+        # from the start while allowing training to grow it.
+        self.raw_film_scale = nn.Parameter(torch.tensor(0.5))
+
+        self._verbose = True
+
+    def forward(self, id_proj: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            id_proj:        [B, 96, T] block3 residual_proj output (the erasure point)
+            speaker_feats:  [B, num_tokens, 96] speaker tokens from mel_encoder
+        Returns:
+            id_proj conditioned on speaker: [B, 96, T]
+        """
+        # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
+        spk_pooled = speaker_feats.mean(dim=1)
+
+        # Generate FiLM parameters
+        film_params = self.mlp(spk_pooled)                       # [B, target_channels * 2]
+        gamma, beta = film_params.chunk(2, dim=-1)               # [B, target_channels] each
+
+        # Learnable scale (softplus reparam, always > 0.5)
+        film_scale = F.softplus(self.raw_film_scale) + 0.5
+
+        # Scale + ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
+        gamma = F.elu(gamma * film_scale)
+        beta  = beta * film_scale
+
+        # Reshape for broadcasting over temporal dim: [B, C, 1]
+        gamma = gamma.unsqueeze(-1)
+        beta  = beta.unsqueeze(-1)
+
+        if self._verbose:
+            g = gamma.squeeze(-1)  # [B, C]
+            b = beta.squeeze(-1)
+            print(f"[b3_id_film] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
+                  f"min={g.min():.4f}, max={g.max():.4f}")
+            print(f"[b3_id_film] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
+                  f"min={b.min():.4f}, max={b.max():.4f}")
+            print(f"[b3_id_film] film_scale: {film_scale.item():.4f}")
+            print(f"[b3_id_film] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
+
+        # Apply FiLM: id_proj * (1 + gamma) + beta
+        id_proj = id_proj * (1.0 + gamma) + beta
+        return id_proj
+
+
+# --------------------------------------------------------------------------- #
 #  Decoder                                                                    #
 # --------------------------------------------------------------------------- #
 class MobileNetDecoder(nn.Module):
@@ -336,6 +418,16 @@ class MobileNetDecoder(nn.Module):
         # tokens → 2-layer MLP → gamma/beta for 96 channels.  ELU guard
         # on gamma, conservative gain=0.1 init for near-identity start.
         self.speaker_film = SpeakerFiLM(
+            speaker_dim=config.speaker_projection_dim,     # 96
+            target_channels=channel_progression[-1],       # 96
+        )
+
+        # Block3 identity-path FiLM: conditioned at the residual_proj output,
+        # the localized speaker erasure point (cent_cos jumps from ~0.67 to
+        # ~0.87).  Applied directly after 192→96 residual_proj, before the
+        # residual sum — no GroupNorm between injection and usage.
+        # Identity-path-only per consensus; body path only if audit shows need.
+        self.block3_id_film = Block3IdentityFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[-1],       # 96
         )
@@ -452,11 +544,38 @@ class MobileNetDecoder(nn.Module):
         should_return_feats = return_intermediate or self.return_feats
         intermediate: List[torch.Tensor] = []
 
-        # Process blocks (upsampling now happens inside blocks)
+        # Process blocks — block3 is decomposed to inject identity-path FiLM
+        # after residual_proj (192→96), the localized speaker erasure point.
         for i, blk in enumerate(self.blocks):
-
           x_before = x
-          x = blk(x)  # Block now handles its own upsampling
+
+          if i == 3 and speaker_feats is not None and self.block3_id_film is not None:
+              # ── Decompose block3 to inject FiLM at residual_proj output ──
+              identity = x
+              # No upsample for block3 (upsample_stages[3] = False)
+              if blk.upsample_first is not None:
+                  x = blk.upsample_first(x)
+                  identity = blk.upsample_first(identity)
+              # Body path
+              body = blk.block(x)
+              if blk._verbose:
+                  print(f"[Block] After block: shape={body.shape}, mean={body.mean():.4f}, std={body.std():.4f}")
+              # Identity projection: 192→96 (the erasure point)
+              if blk.residual_proj is not None:
+                  id_proj = blk.residual_proj(identity)
+              else:
+                  id_proj = identity
+              # ── INJECT: speaker-conditioned FiLM at identity projection output ──
+              id_proj = self.block3_id_film(id_proj, speaker_feats)
+              if self._verbose:
+                  self._check(id_proj, "b3_id_film")
+              # Residual sum: id_scale * id_proj + body_scale * body
+              x = blk.residual_identity_scale * id_proj + blk.residual_scale * body
+              if blk._verbose:
+                  print(f"[Block] After residual (id_scale={blk.residual_identity_scale:.2f}, body_scale={blk.residual_scale}): shape={x.shape}, mean={x.mean():.4f}, std={x.std():.4f}")
+          else:
+              x = blk(x)
+
           self._check(x, f"block {i}")
           
           if should_return_feats:
