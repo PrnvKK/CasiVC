@@ -160,7 +160,7 @@ class TrainingConfig:
   # Speaker classifier head at decoder bottleneck
   classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID (block2 + block3)
   mel_classifier_weight: float = 0.0   # disabled: per-frame mel Conv1d CE caused upstream regression
-  pooled_mel_ce_weight: float = 0.2    # gated pooled CE: detach(prebias) + bias_only → trains MelSpeakerAffine directly; safe at 0.2 because gradient is isolated to bias MLP
+  pooled_mel_ce_weight: float = 0.0    # disabled: pooled CE gradient competes with new spk_film_classifier; MelSpeakerAffine kept as passive backup
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
