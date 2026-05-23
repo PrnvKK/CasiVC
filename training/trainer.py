@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from torch.cuda.amp import GradScaler, autocast
 
@@ -353,7 +354,7 @@ class Trainer:
       # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0}
+        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0}
         num_batches = 0
 
         pbar = tqdm(self.train_loader, desc=f"Train | epoch {self.start_epoch}", leave=False)
@@ -378,8 +379,9 @@ class Trainer:
 
             # Forward pass - NOW USES ref_audio and optionally precomputed features
             classifier_weight = getattr(self.train_cfg, 'classifier_weight', 0.0)
-            mel_classifier_weight = getattr(self.train_cfg, 'mel_classifier_weight', 0.1)
-            need_bottleneck = (classifier_weight > 0 or mel_classifier_weight > 0) and self.model.speaker_classifier is not None
+            mel_classifier_weight = 0.0   # per-frame mel Conv1d CE remains disabled
+            pooled_mel_ce_weight = getattr(self.train_cfg, 'pooled_mel_ce_weight', 0.0)
+            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None)
             
             pred_mel, _, aux = self.model(
                 ref_audio=ref_audio,
@@ -479,6 +481,20 @@ class Trainer:
                         _, pred_mel_cls = mel_logits.max(dim=1)
                         acc_mel = (pred_mel_cls == target_expanded_mel).float().mean().item()
                         print(f"[MEL_CLASSIFIER] ce={ce_mel.item():.4f}, self_accuracy={acc_mel:.4f}")
+
+            # --- Pooled mel-bias CE (self-pair): gated gradient to bias MLP only ---
+            if pooled_mel_ce_weight > 0 and aux is not None and "pooled_mel_logits" in aux:
+                pooled_logits = aux["pooled_mel_logits"]  # [B, N] — already pooled over time
+                ce_pooled_mel = F.cross_entropy(pooled_logits, target_idx)  # [B, N] vs [B]
+                total = total + pooled_mel_ce_weight * ce_pooled_mel
+                loss_accum["classifier"] += ce_pooled_mel.item()
+                with torch.no_grad():
+                    _, pred_pooled = pooled_logits.max(dim=1)
+                    acc_pooled = (pred_pooled == target_idx).float().mean().item()
+                    loss_accum["pooled_ce_acc"] += acc_pooled
+                    loss_accum["pooled_ce_cnt"] += 1
+                if num_batches == 0:
+                    print(f"[POOLED_MEL_CE] weight={pooled_mel_ce_weight}, ce={ce_pooled_mel.item():.4f}, self_accuracy={acc_pooled:.4f}")
             
             print(f"[LOSS_DEBUG] stft_weight={stft_weight:.4f}, "
             f"raw_stft={losses.get('stft', 0):.4f}, "
@@ -565,6 +581,18 @@ class Trainer:
                         target_mel_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_melc)
                         ce_mel_cross = self.classifier_loss_fn(mel_logits_cross, target_mel_rolled)
                         total = total + mel_classifier_weight * ce_mel_cross
+
+                    # --- Pooled mel-bias CE on cross-pair (gated) ---
+                    if pooled_mel_ce_weight > 0 and aux_cross is not None and "pooled_mel_logits" in aux_cross:
+                        pooled_logits_cross = aux_cross["pooled_mel_logits"]  # [B, N]
+                        ce_pooled_cross = F.cross_entropy(pooled_logits_cross, target_idx_rolled)
+                        total = total + pooled_mel_ce_weight * ce_pooled_cross
+                        loss_accum["classifier"] += ce_pooled_cross.item()
+                        with torch.no_grad():
+                            _, pred_pooled_cross = pooled_logits_cross.max(dim=1)
+                            acc_pooled_cross = (pred_pooled_cross == target_idx_rolled).float().mean().item()
+                            loss_accum["pooled_ce_acc"] += acc_pooled_cross
+                            loss_accum["pooled_ce_cnt"] += 1
                     
                     if num_batches == 0:
                         rolled_ids = [speaker_ids[(i+1) % B] for i in range(B)]
@@ -922,7 +950,7 @@ class Trainer:
             val_loss   = self._validate()
 
             print(
-                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | var={train_loss.get('var', 0.0):.3f} | cls={train_loss.get('classifier', 0.0):.3f} | ent_h={train_loss.get('entropy', 0.0):.3f} | gam_h={train_loss.get('gamma', 0.0):.3f} | total={train_loss['total']:.3f}"
+                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | var={train_loss.get('var', 0.0):.3f} | cls={train_loss.get('classifier', 0.0):.3f} | ent_h={train_loss.get('entropy', 0.0):.3f} | gam_h={train_loss.get('gamma', 0.0):.3f} | total={train_loss['total']:.3f} | pooled_ce_acc={train_loss.get('pooled_ce_acc', 0.0)/max(1, train_loss.get('pooled_ce_cnt', 1)):.3f}"
             )
             print(
                 f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | var={val_loss.get('var', 0.0):.3f} | total={val_loss['total']:.3f}"

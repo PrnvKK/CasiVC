@@ -157,6 +157,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder._verbose = False
     model.decoder.speaker_film._verbose = False
     model.decoder.block3_id_film._verbose = False
+    model.decoder.adapter_speaker_film._verbose = False
+    model.decoder.mel_speaker_affine._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -218,7 +220,11 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         adapter_AA = model.decoder.adapter(resampled_AA.transpose(1, 2))
         adapter_AB = model.decoder.adapter(resampled_AB.transpose(1, 2))
 
-        x_AA, x_AB = adapter_AA, adapter_AB
+        # ── Adapter-entry speaker FiLM ──
+        adapter_film_AA = model.decoder.adapter_speaker_film(adapter_AA, spk_A_t)
+        adapter_film_AB = model.decoder.adapter_speaker_film(adapter_AB, spk_B_t)
+
+        x_AA, x_AB = adapter_film_AA, adapter_film_AB
         for i, blk in enumerate(model.decoder.blocks):
             if i == 3:
                 # ── Block3 decomposed: identity vs body vs sum ──
@@ -267,13 +273,33 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         # ── Speaker FiLM: re-inject speaker identity before mel_proj ──
         film_AA = model.decoder.speaker_film(block3_AA, spk_A_t)
         film_AB = model.decoder.speaker_film(block3_AB, spk_B_t)
-        mel_film_AA = model.decoder.mel_proj(film_AA)
-        mel_film_AB = model.decoder.mel_proj(film_AB)
+
+        # ── mel_proj: raw 96→80 projection (the terminal erasure point) ──
+        mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
+        mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
+
+        # ── mel_scaled: after out_scale (pre-spkr-bias, pre-clamp) ──
+        out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5
+        mel_band_mean_AA = mel_proj_raw_AA.mean(dim=-1, keepdim=True)
+        mel_band_mean_AB = mel_proj_raw_AB.mean(dim=-1, keepdim=True)
+        mel_centered_AA = mel_proj_raw_AA - mel_band_mean_AA
+        mel_centered_AB = mel_proj_raw_AB - mel_band_mean_AB
+        mel_scaled_AA = mel_centered_AA * out_scale + mel_band_mean_AA + model.decoder.out_bias
+        mel_scaled_AB = mel_centered_AB * out_scale + mel_band_mean_AB + model.decoder.out_bias
+
+        # ── mel_spk_affine: speaker-conditioned bias AFTER out_scale ──
+        mel_affine_AA = model.decoder.mel_speaker_affine(mel_scaled_AA, spk_A_t)
+        mel_affine_AB = model.decoder.mel_speaker_affine(mel_scaled_AB, spk_B_t)
+
+        # ── mel_scaled_final: after clamp (final model output) ──
+        mel_final_AA = torch.clamp(mel_affine_AA, min=-11.5, max=2.0)
+        mel_final_AB = torch.clamp(mel_affine_AB, min=-11.5, max=2.0)
 
         stages = [
             ("cross_attn", fused_AA, fused_AB),
             ("resampler", resampled_AA, resampled_AB),
             ("adapter", adapter_AA, adapter_AB),
+            ("adapter_film", adapter_film_AA, adapter_film_AB),
             ("block0", block0_AA, block0_AB),
             ("block2", block2_AA, block2_AB),
             ("b3_identity", b3_id_AA, b3_id_AB),        # raw residual_proj output (the erasure point)
@@ -281,9 +307,12 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("b3_body", b3_body_AA, b3_body_AB),
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
-            ("mel_proj", mel_film_AA, mel_film_AB),
+            ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # raw 96→80 (the erasure point)
+            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after out_scale (pre-spkr-bias)
+            ("mel_spk_affine", mel_affine_AA, mel_affine_AB),      # after speaker bias
+            ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
         ]
-        print(f"  {'Stage':<14} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
+        print(f"  {'Stage':<17} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
         for name, aa, ab in stages:
             l1 = (aa - ab).abs().mean().item()
             cos = torch.nn.functional.cosine_similarity(aa.flatten(), ab.flatten(), dim=0).item()
@@ -293,7 +322,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             cos_cent = torch.nn.functional.cosine_similarity(aa_c, ab_c, dim=0).item()
             sa, sb = aa.std().item(), ab.std().item()
             ratio = sb / (sa + 1e-8)
-            print(f"  {name:<14} {l1:>9.4f} {cos:>9.4f} {cos_cent:>9.4f} {sa:>8.4f} {sb:>8.4f} {ratio:>8.3f}")
+            print(f"  {name:<17} {l1:>9.4f} {cos:>9.4f} {cos_cent:>9.4f} {sa:>8.4f} {sb:>8.4f} {ratio:>8.3f}")
     print("="*70)
     # ═══════════════════════════════════════════════════════════════════
 
@@ -303,6 +332,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder._verbose = True
     model.decoder.speaker_film._verbose = True
     model.decoder.block3_id_film._verbose = True
+    model.decoder.adapter_speaker_film._verbose = True
+    model.decoder.mel_speaker_affine._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────
