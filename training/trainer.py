@@ -381,7 +381,7 @@ class Trainer:
             classifier_weight = getattr(self.train_cfg, 'classifier_weight', 0.0)
             mel_classifier_weight = 0.0   # per-frame mel Conv1d CE remains disabled
             pooled_mel_ce_weight = getattr(self.train_cfg, 'pooled_mel_ce_weight', 0.0)
-            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None)
+            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None or self.model.spk_film_classifier is not None)
             
             pred_mel, _, aux = self.model(
                 ref_audio=ref_audio,
@@ -468,6 +468,22 @@ class Trainer:
                         _, pred_b3 = b3_logits.max(dim=1)
                         acc_b3 = (pred_b3 == target_expanded_b3).float().mean().item()
                         print(f"[B3_CLASSIFIER] ce={ce_b3.item():.4f}, self_accuracy={acc_b3:.4f}")
+
+            # --- Spk_film classifier CE (self-pair): supervises post-speaker_film features ---
+            # Provides direct speaker-discriminative gradient to speaker_film —
+            # the exact missing ingredient that left it near-identity.
+            if need_bottleneck and aux is not None and "spk_film_classifier_logits" in aux:
+                sf_logits = aux["spk_film_classifier_logits"]  # [B, N, T]
+                T_sf = sf_logits.size(-1)
+                target_expanded_sf = target_idx.unsqueeze(1).expand(-1, T_sf)
+                ce_sf = self.classifier_loss_fn(sf_logits, target_expanded_sf)
+                total = total + classifier_weight * ce_sf
+                loss_accum["classifier"] += ce_sf.item()
+                if num_batches == 0:
+                    with torch.no_grad():
+                        _, pred_sf = sf_logits.max(dim=1)
+                        acc_sf = (pred_sf == target_expanded_sf).float().mean().item()
+                        print(f"[SPK_FILM_CLASSIFIER] ce={ce_sf.item():.4f}, self_accuracy={acc_sf:.4f}")
 
             # --- Mel-output classifier CE (self-pair): prevents mel_proj erasure ---
             if mel_classifier_weight > 0 and aux is not None and "mel_classifier_logits" in aux:
@@ -573,6 +589,15 @@ class Trainer:
                         ce_b3_cross = self.classifier_loss_fn(b3_logits_cross, target_b3_rolled)
                         total = total + classifier_weight * ce_b3_cross
                         loss_accum["classifier"] += ce_b3_cross.item()
+
+                    # --- Spk_film classifier CE on cross-pair ---
+                    if need_bottleneck and aux_cross is not None and "spk_film_classifier_logits" in aux_cross:
+                        sf_logits_cross = aux_cross["spk_film_classifier_logits"]  # [B, N, T]
+                        T_sfc = sf_logits_cross.size(-1)
+                        target_sf_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_sfc)
+                        ce_sf_cross = self.classifier_loss_fn(sf_logits_cross, target_sf_rolled)
+                        total = total + classifier_weight * ce_sf_cross
+                        loss_accum["classifier"] += ce_sf_cross.item()
 
                     # --- Mel-output classifier CE on cross-pair ---
                     if mel_classifier_weight > 0 and aux_cross is not None and "mel_classifier_logits" in aux_cross:

@@ -184,11 +184,24 @@ class HubertVCModel(nn.Module):
             nn.init.xavier_uniform_(self.pooled_mel_classifier.weight, gain=0.2)
             nn.init.zeros_(self.pooled_mel_classifier.bias)
             print(f"[HubertVCModel] Pooled mel classifier: Linear(80, {num_speakers}) → {num_speakers * 81:,} params")
+
+            # Spk_film classifier: supervises post-mel_proj features (80-dim mel)
+            # to force mel_proj to preserve speaker information.
+            # Previous 96-dim placement (pre-mel_proj) failed because the classifier
+            # read pre-existing speaker signal from b3_id_film upstream as a shortcut,
+            # leaving speaker_film near-identity. Post-mel_proj placement eliminates
+            # the shortcut because mel_proj erases speaker info — the classifier MUST
+            # push mel_proj to preserve it. Same classifier_weight=0.3 as block2/3.
+            self.spk_film_classifier = nn.Conv1d(80, num_speakers, kernel_size=1)
+            nn.init.xavier_uniform_(self.spk_film_classifier.weight)
+            nn.init.zeros_(self.spk_film_classifier.bias)
+            print(f"[HubertVCModel] Spk_film classifier: Conv1d(80, {num_speakers}, k=1) → {num_speakers * 81:,} params")
         else:
             self.speaker_classifier = None
             self.block3_classifier = None
             self.mel_classifier = None
             self.pooled_mel_classifier = None
+            self.spk_film_classifier = None
 
         # 2. Sanity-check overall parameter budget
         trainables = sum(p.numel() for p in self.parameters()
@@ -364,7 +377,7 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         # Force FP32 for decoder to avoid NaN gradients
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            if return_bottleneck and (self.speaker_classifier is not None or self.pooled_mel_classifier is not None):
+            if return_bottleneck and (self.speaker_classifier is not None or self.pooled_mel_classifier is not None or self.spk_film_classifier is not None):
                 pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True, speaker_feats=speaker_feats)
             else:
                 pred_mel = self.decoder(resampled_features.float(), speaker_feats=speaker_feats)  # [B, 80, T_hubert]
@@ -476,6 +489,18 @@ class HubertVCModel(nn.Module):
                 mel_pooled = mel_for_ce.mean(dim=-1)  # [B, 80] pooled over time
                 pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)  # [B, num_speakers]
                 aux["pooled_mel_logits"] = pooled_mel_logits
+
+            # Spk_film classifier (post-mel_proj): forces mel_proj to preserve
+            # speaker information. Taps at prebias_mel (intermediate[-2]) which is
+            # the 80-dim mel AFTER out_scale, BEFORE mel_speaker_affine.
+            # CE gradient flows: classifier → prebias_mel → out_scale → mel_proj →
+            # speaker_film → speaker tokens. This directly counters mel_proj's
+            # L1-driven tendency to erase speaker variation.
+            if self.spk_film_classifier is not None and len(intermediate) > 5:
+                spk_film_feats = intermediate[-2]  # [B, 80, T] prebias_mel (post-out_scale)
+                spk_film_feats = F.avg_pool1d(spk_film_feats, kernel_size=3, stride=1, padding=1)
+                spk_film_logits = self.spk_film_classifier(spk_film_feats)  # [B, num_speakers, T]
+                aux["spk_film_classifier_logits"] = spk_film_logits
         
         return pred_mel, loss_dict, aux
 
