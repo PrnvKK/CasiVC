@@ -176,10 +176,19 @@ class HubertVCModel(nn.Module):
             nn.init.xavier_uniform_(self.mel_classifier.weight)
             nn.init.zeros_(self.mel_classifier.bias)
             print(f"[HubertVCModel] Mel classifier: Conv1d(80, {num_speakers}, k=1) → {num_speakers * 81:,} params")
+
+            # Pooled mel-bias classifier: time-pooled → Linear(80, num_speakers) → CE
+            # Operates on post-bias, pre-clamp mel to directly train MelSpeakerAffine.
+            # Pooled (not per-frame) to match time-invariant bias structure.
+            self.pooled_mel_classifier = nn.Linear(80, num_speakers)
+            nn.init.xavier_uniform_(self.pooled_mel_classifier.weight, gain=0.2)
+            nn.init.zeros_(self.pooled_mel_classifier.bias)
+            print(f"[HubertVCModel] Pooled mel classifier: Linear(80, {num_speakers}) → {num_speakers * 81:,} params")
         else:
             self.speaker_classifier = None
             self.block3_classifier = None
             self.mel_classifier = None
+            self.pooled_mel_classifier = None
 
         # 2. Sanity-check overall parameter budget
         trainables = sum(p.numel() for p in self.parameters()
@@ -355,7 +364,7 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         # Force FP32 for decoder to avoid NaN gradients
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            if return_bottleneck and self.speaker_classifier is not None:
+            if return_bottleneck and (self.speaker_classifier is not None or self.pooled_mel_classifier is not None):
                 pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True, speaker_feats=speaker_feats)
             else:
                 pred_mel = self.decoder(resampled_features.float(), speaker_feats=speaker_feats)  # [B, 80, T_hubert]
@@ -452,6 +461,21 @@ class HubertVCModel(nn.Module):
                 mel_feats = F.avg_pool1d(mel_feats, kernel_size=3, stride=1, padding=1)
                 mel_logits = self.mel_classifier(mel_feats)  # [B, num_speakers, T]
                 aux["mel_classifier_logits"] = mel_logits
+
+            # Pooled mel-bias classifier: gated CE on bias-only component
+            # mel_for_ce = prebias.detach() + bias_only
+            # This forces CE gradient to flow ONLY through the bias MLP,
+            # preventing the classifier from using residual speaker info in
+            # the content mel as a shortcut (which left the bias near-identity
+            # in the ungated version at weight 0.05).
+            if self.pooled_mel_classifier is not None and len(intermediate) > 5:
+                prebias_mel = intermediate[-2]   # [B, 80, T] before speaker bias
+                postbias_mel = intermediate[-1]  # [B, 80, T] after speaker bias
+                bias_only = postbias_mel - prebias_mel  # [B, 80, T] the speaker bias
+                mel_for_ce = prebias_mel.detach() + bias_only  # gradient only through bias
+                mel_pooled = mel_for_ce.mean(dim=-1)  # [B, 80] pooled over time
+                pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)  # [B, num_speakers]
+                aux["pooled_mel_logits"] = pooled_mel_logits
         
         return pred_mel, loss_dict, aux
 

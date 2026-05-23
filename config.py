@@ -158,8 +158,9 @@ class TrainingConfig:
   cross_pair_stats_weight: float = 2.0   # weight multiplier for cross-pair Mel Stats loss
 
   # Speaker classifier head at decoder bottleneck
-  classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID
-  mel_classifier_weight: float = 0.1   # weight for mel-output CE loss (gentle — just prevents erasure)
+  classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID (block2 + block3)
+  mel_classifier_weight: float = 0.0   # disabled: per-frame mel Conv1d CE caused upstream regression
+  pooled_mel_ce_weight: float = 0.2    # gated pooled CE: detach(prebias) + bias_only → trains MelSpeakerAffine directly; safe at 0.2 because gradient is isolated to bias MLP
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0

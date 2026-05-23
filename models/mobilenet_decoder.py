@@ -256,6 +256,86 @@ class SpeakerFiLM(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+#  Mel-Speaker Affine — time-invariant speaker conditioning after mel_proj   #
+# --------------------------------------------------------------------------- #
+
+
+class MelSpeakerAffine(nn.Module):
+    """Time-invariant speaker-conditioned bias applied AFTER out_scale.
+
+    Placed after the centered out_scale step (which dilutes any speaker
+    bias placed before it by amplifying content 2.19x without amplifying
+    speaker shift).  Now only clamp follows, so the bias is structurally
+    non-erasable.
+
+    Bias-only design: the primary speaker signature in the mel domain
+    is spectral envelope shift (formant positions, tilt, per-band mean
+    level), which a per-band bias captures.  Pooled speaker tokens
+    → 2-layer MLP → per-band bias for 80 mel bands.  Time-invariant
+    (broadcast over T).  Gain=0.2 init, learnable bias_scale with
+    softplus reparam.
+
+    Gradient path: L1 loss directly sees the bias effect on the final
+    mel (post-out_scale domain = L1 target domain), providing clearer
+    gradient than the pre-out_scale position where centering stripped
+    the bias.
+    """
+    def __init__(self, speaker_dim: int = 96, n_mel_bands: int = 80):
+        super().__init__()
+        self.speaker_dim = speaker_dim
+        self.n_mel_bands = n_mel_bands
+
+        self.mlp = nn.Sequential(
+            nn.Linear(speaker_dim, speaker_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(speaker_dim, n_mel_bands),
+        )
+
+        with torch.no_grad():
+            for m in self.mlp.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.2)
+                    nn.init.zeros_(m.bias)
+
+        # Learnable bias_scale: softplus reparam so scale can never collapse.
+        # Init 0.5 → softplus(0.5)+0.5 ≈ 2.19.
+        self.raw_bias_scale = nn.Parameter(torch.tensor(0.5))
+
+        self._verbose = True
+
+    def forward(self, mel: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            mel:           [B, 80, T] mel after out_scale (pre-clamp)
+            speaker_feats: [B, num_tokens, speaker_dim] speaker tokens
+        Returns:
+            mel + speaker-dependent per-band bias: [B, 80, T]
+        """
+        # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
+        spk_pooled = speaker_feats.mean(dim=1)
+
+        # Generate per-band bias
+        bias = self.mlp(spk_pooled)                            # [B, n_mel_bands]
+
+        # Learnable scale (softplus reparam, always > 0.5)
+        bias_scale = F.softplus(self.raw_bias_scale) + 0.5
+        bias = bias * bias_scale
+
+        # Reshape for broadcasting over temporal dim: [B, 80, 1]
+        bias = bias.unsqueeze(-1)
+
+        if self._verbose:
+            b = bias.squeeze(-1)  # [B, n_mel_bands]
+            print(f"[mel_spk_affine] bias: mean={b.mean():.4f}, std={b.std():.4f}, "
+                  f"min={b.min():.4f}, max={b.max():.4f}")
+            print(f"[mel_spk_affine] bias_scale: {bias_scale.item():.4f}")
+
+        # Apply bias-only: mel + bias
+        mel = mel + bias
+        return mel
+
+
+# --------------------------------------------------------------------------- #
 #  Block3 Identity-Path FiLM — speaker conditioning at residual_proj output  #
 # --------------------------------------------------------------------------- #
 class Block3IdentityFiLM(nn.Module):
@@ -422,6 +502,15 @@ class MobileNetDecoder(nn.Module):
             target_channels=channel_progression[-1],       # 96
         )
 
+        # Adapter-entry speaker FiLM: prevents blocks 0-2 from erasing speaker
+        # info (adapter→block2 cent_cos jumps from 0.576→0.717, 71% of total
+        # unrecovered erosion).  Same pattern as b3_id_film: pooled speaker
+        # tokens → MLP → per-channel gamma/beta.  Static across time.
+        self.adapter_speaker_film = Block3IdentityFiLM(
+            speaker_dim=config.speaker_projection_dim,     # 96
+            target_channels=channel_progression[0],        # 96
+        )
+
         # Block3 identity-path FiLM: conditioned at the residual_proj output,
         # the localized speaker erasure point (cent_cos jumps from ~0.67 to
         # ~0.87).  Applied directly after 192→96 residual_proj, before the
@@ -430,6 +519,16 @@ class MobileNetDecoder(nn.Module):
         self.block3_id_film = Block3IdentityFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[-1],       # 96
+        )
+
+        # Post-mel_proj speaker affine: time-invariant per-band EQ applied
+        # AFTER the 96→80 projection, where nothing downstream (out_scale,
+        # clamp) can strip speaker identity.  Targets the terminal erasure
+        # point (spk_film 0.723 → mel_proj 0.846, +0.122).  Same pattern
+        # as SpeakerFiLM but operates on 80 mel bands, static across time.
+        self.mel_speaker_affine = MelSpeakerAffine(
+            speaker_dim=config.speaker_projection_dim,     # 96
+            n_mel_bands=80,                                 # 80 mel bands
         )
 
         # Per-band output scale — SOFTPLUS reparametrised so scale can NEVER collapse.
@@ -538,6 +637,12 @@ class MobileNetDecoder(nn.Module):
         # Adapter
         x = self.adapter(x)
         self._check(x, "adapter")
+
+        # Adapter-entry speaker FiLM: inject speaker identity before
+        # blocks 0-2 so they process speaker-enriched features
+        if speaker_feats is not None:
+            x = self.adapter_speaker_film(x, speaker_feats)
+            self._check(x, "adapter_film")
         
         # REMOVE old upsample_first logic entirely
         
@@ -625,6 +730,21 @@ class MobileNetDecoder(nn.Module):
         mel_post_scale_mean = mel_scaled.mean().item()
         if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
+        # ── Post-out_scale speaker bias: time-invariant per-band shift ──
+        # Injects speaker identity AFTER out_scale (which dilutes any
+        # speaker bias placed before it by amplifying content 2.19x).
+        # Only clamp follows, so the bias is structurally non-erasable.
+        # Bias-only: captures spectral envelope shift (formant, tilt).
+        # Save prebias mel (before speaker bias) for gated CE classifier
+        prebias_mel = mel_scaled
+
+        if speaker_feats is not None:
+            mel_scaled = self.mel_speaker_affine(mel_scaled, speaker_feats)
+            self._check(mel_scaled, "mel_spk_affine")
+
+        # Save post-bias, pre-clamp mel for pooled CE classifier
+        postbias_mel = mel_scaled
+
         mel = torch.clamp(mel_scaled, min=-11.5, max=2.0)
 
         clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 2.0)
@@ -634,6 +754,8 @@ class MobileNetDecoder(nn.Module):
         self._check(mel, "mel_proj")
         
         if should_return_feats:
+            intermediate.append(prebias_mel)   # pre-bias mel (for detach in gated CE)
+            intermediate.append(postbias_mel)  # post-bias, pre-clamp mel
             return mel, intermediate
         return mel
     
