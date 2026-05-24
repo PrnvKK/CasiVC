@@ -159,7 +159,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.block3_id_film._verbose = False
     model.decoder.adapter_speaker_film._verbose = False
     model.decoder.mel_speaker_affine._verbose = False
-    model.decoder.speaker_delta_proj._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -272,23 +271,31 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         film_AA = model.decoder.speaker_film(block3_AA, spk_A_t)
         film_AB = model.decoder.speaker_film(block3_AB, spk_B_t)
 
-        # ── Split-path mel_proj: anchor + speaker delta ──
-        anchor_scale = torch.nn.functional.softplus(model.decoder.raw_anchor_scale)
-        mel_anchor_AA = model.decoder.mel_proj_anchor(film_AA[:, :80, :])
-        mel_anchor_AB = model.decoder.mel_proj_anchor(film_AB[:, :80, :])
-        mel_delta_AA = model.decoder.speaker_delta_proj(film_AA, spk_A_t)
-        mel_delta_AB = model.decoder.speaker_delta_proj(film_AB, spk_B_t)
-        mel_proj_raw_AA = anchor_scale * mel_anchor_AA + mel_delta_AA
-        mel_proj_raw_AB = anchor_scale * mel_anchor_AB + mel_delta_AB
+        # ── Monolithic mel_proj: Conv1d(96→80) ──
+        mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
+        mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
 
-        # ── mel_scaled: after out_scale (pre-spkr-bias, pre-clamp) ──
-        out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5
+        # ── mel_scaled: after speaker-conditioned out_scale ──
+        base_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
+        spk_gain = torch.nn.functional.softplus(model.decoder.raw_spk_scale_gain) + 0.1
+
+        # Speaker A
+        spk_A_pooled = spk_A_t.mean(dim=1)
+        spk_raw_A = model.decoder.speaker_out_scale(spk_A_pooled)
+        spk_delta_A = 0.35 * torch.tanh(spk_gain * spk_raw_A)
+        out_scale_AA = base_scale * (1.0 + spk_delta_A.unsqueeze(-1))
+        # Speaker B
+        spk_B_pooled = spk_B_t.mean(dim=1)
+        spk_raw_B = model.decoder.speaker_out_scale(spk_B_pooled)
+        spk_delta_B = 0.35 * torch.tanh(spk_gain * spk_raw_B)
+        out_scale_AB = base_scale * (1.0 + spk_delta_B.unsqueeze(-1))
+
         mel_band_mean_AA = mel_proj_raw_AA.mean(dim=-1, keepdim=True)
         mel_band_mean_AB = mel_proj_raw_AB.mean(dim=-1, keepdim=True)
         mel_centered_AA = mel_proj_raw_AA - mel_band_mean_AA
         mel_centered_AB = mel_proj_raw_AB - mel_band_mean_AB
-        mel_scaled_AA = mel_centered_AA * out_scale + mel_band_mean_AA + model.decoder.out_bias
-        mel_scaled_AB = mel_centered_AB * out_scale + mel_band_mean_AB + model.decoder.out_bias
+        mel_scaled_AA = mel_centered_AA * out_scale_AA + mel_band_mean_AA + model.decoder.out_bias
+        mel_scaled_AB = mel_centered_AB * out_scale_AB + mel_band_mean_AB + model.decoder.out_bias
 
         # ── mel_spk_affine: speaker-conditioned bias AFTER out_scale ──
         mel_affine_AA = model.decoder.mel_speaker_affine(mel_scaled_AA, spk_A_t)
@@ -310,9 +317,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("b3_body", b3_body_AA, b3_body_AB),
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
-            ("mel_anchor", mel_anchor_AA, mel_anchor_AB),  # anchor path only (identity-like)
-            ("mel_delta", mel_delta_AA, mel_delta_AB),     # speaker delta path only
-            ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # anchor + delta combined
+            ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # monolithic Conv1d(96→80)
             ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after out_scale (pre-spkr-bias)
             ("mel_spk_affine", mel_affine_AA, mel_affine_AB),      # after speaker bias
             ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
@@ -339,7 +344,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.block3_id_film._verbose = True
     model.decoder.adapter_speaker_film._verbose = True
     model.decoder.mel_speaker_affine._verbose = True
-    model.decoder.speaker_delta_proj._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────
