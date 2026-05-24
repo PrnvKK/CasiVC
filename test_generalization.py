@@ -159,6 +159,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.block3_id_film._verbose = False
     model.decoder.adapter_speaker_film._verbose = False
     model.decoder.mel_speaker_affine._verbose = False
+    model.decoder.speaker_delta_proj._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -267,16 +268,18 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             if i == 2:
                 block2_AA, block2_AB = x_AA.clone(), x_AB.clone()
 
-        mel_AA = model.decoder.mel_proj(block3_AA)
-        mel_AB = model.decoder.mel_proj(block3_AB)
-
         # ── Speaker FiLM: re-inject speaker identity before mel_proj ──
         film_AA = model.decoder.speaker_film(block3_AA, spk_A_t)
         film_AB = model.decoder.speaker_film(block3_AB, spk_B_t)
 
-        # ── mel_proj: raw 96→80 projection (the terminal erasure point) ──
-        mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
-        mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
+        # ── Split-path mel_proj: anchor + speaker delta ──
+        anchor_scale = torch.nn.functional.softplus(model.decoder.raw_anchor_scale)
+        mel_anchor_AA = model.decoder.mel_proj_anchor(film_AA[:, :80, :])
+        mel_anchor_AB = model.decoder.mel_proj_anchor(film_AB[:, :80, :])
+        mel_delta_AA = model.decoder.speaker_delta_proj(film_AA, spk_A_t)
+        mel_delta_AB = model.decoder.speaker_delta_proj(film_AB, spk_B_t)
+        mel_proj_raw_AA = anchor_scale * mel_anchor_AA + mel_delta_AA
+        mel_proj_raw_AB = anchor_scale * mel_anchor_AB + mel_delta_AB
 
         # ── mel_scaled: after out_scale (pre-spkr-bias, pre-clamp) ──
         out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5
@@ -307,7 +310,9 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("b3_body", b3_body_AA, b3_body_AB),
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
-            ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # raw 96→80 (the erasure point)
+            ("mel_anchor", mel_anchor_AA, mel_anchor_AB),  # anchor path only (identity-like)
+            ("mel_delta", mel_delta_AA, mel_delta_AB),     # speaker delta path only
+            ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # anchor + delta combined
             ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after out_scale (pre-spkr-bias)
             ("mel_spk_affine", mel_affine_AA, mel_affine_AB),      # after speaker bias
             ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
@@ -334,6 +339,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.block3_id_film._verbose = True
     model.decoder.adapter_speaker_film._verbose = True
     model.decoder.mel_speaker_affine._verbose = True
+    model.decoder.speaker_delta_proj._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────

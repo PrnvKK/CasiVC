@@ -185,10 +185,10 @@ class SpeakerFiLM(nn.Module):
     jumps from ~0.49 to ~0.75) by re-injecting speaker identity right
     before mel_proj.  Speaker tokens are pooled → 2-layer MLP → (gamma,
     beta) for 96 channels.  ELU on gamma ensures (1+gamma) ≥ 0
-    (inversion guard, consistent with cross_attn).  Small gain=0.1 init
-    ensures near-identity start; model learns scale through training.
+    (inversion guard, consistent with cross_attn).
     """
-    def __init__(self, speaker_dim: int = 96, target_channels: int = 96):
+    def __init__(self, speaker_dim: int = 96, target_channels: int = 96,
+                 mlp_gain: float = 0.3, raw_film_scale_init: float = 0.0):
         super().__init__()
         self.speaker_dim = speaker_dim
         self.target_channels = target_channels
@@ -199,18 +199,19 @@ class SpeakerFiLM(nn.Module):
             nn.Linear(speaker_dim, target_channels * 2),
         )
 
-        # Conservative init: near-identity start (gamma ≈ 0, beta ≈ 0)
+        # Init: gain raised from 0.1 → 0.3 to give SpeakerFiLM more
+        # authority from the start.  Previous 0.1 was too conservative —
+        # model learned to suppress it (film_scale dropped to 1.02).
         with torch.no_grad():
             for m in self.mlp.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                    nn.init.xavier_uniform_(m.weight, gain=mlp_gain)
                     nn.init.zeros_(m.bias)
 
         # Learnable film_scale: softplus reparam so scale can never collapse.
-        # Matches cross_attn's raw_film_scale pattern.  Init -0.5 →
-        # softplus(-0.5)+0.5 ≈ 1.13, giving the FiLM meaningful
-        # authority from the start while allowing training to grow it.
-        self.raw_film_scale = nn.Parameter(torch.tensor(-0.5))
+        # Init raised from -0.5 → 0.0: softplus(0)+0.5 ≈ 1.19 (was 1.13).
+        # Target: gamma std 0.06-0.10 (currently 0.0213).
+        self.raw_film_scale = nn.Parameter(torch.tensor(raw_film_scale_init))
 
         self._verbose = True
 
@@ -243,6 +244,7 @@ class SpeakerFiLM(nn.Module):
         if self._verbose:
             g = gamma.squeeze(-1)  # [B, C]
             b = beta.squeeze(-1)
+            self._last_gamma_std = g.std().item()  # stored for audit
             print(f"[speaker_film] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
                   f"min={g.min():.4f}, max={g.max():.4f}")
             print(f"[speaker_film] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
@@ -348,10 +350,11 @@ class Block3IdentityFiLM(nn.Module):
     residual sum, outside any normalization layer.
 
     Same pattern as SpeakerFiLM: pooled speaker tokens → 2-layer MLP →
-    gamma/beta for 96 channels, ELU guard on gamma, gain=0.1 init,
+    gamma/beta for target_channels channels, ELU guard on gamma,
     learnable film_scale with softplus reparam.
     """
-    def __init__(self, speaker_dim: int = 96, target_channels: int = 96):
+    def __init__(self, speaker_dim: int = 96, target_channels: int = 96,
+                 mlp_gain: float = 0.2, raw_film_scale_init: float = 0.5):
         super().__init__()
         self.speaker_dim = speaker_dim
         self.target_channels = target_channels
@@ -362,17 +365,19 @@ class Block3IdentityFiLM(nn.Module):
             nn.Linear(speaker_dim, target_channels * 2),
         )
 
-        # Conservative init: near-identity start (gamma ≈ 0, beta ≈ 0)
+        # Configurable init: near-identity start (gamma ≈ 0, beta ≈ 0)
         with torch.no_grad():
             for m in self.mlp.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.2)
+                    nn.init.xavier_uniform_(m.weight, gain=mlp_gain)
                     nn.init.zeros_(m.bias)
 
         # Learnable film_scale: softplus reparam so scale can never collapse.
-        # Init 0.5 → softplus(0.5)+0.5 ≈ 2.19, giving strong authority
-        # from the start while allowing training to grow it.
-        self.raw_film_scale = nn.Parameter(torch.tensor(0.5))
+        # Init value is configurable per-instance.  softplus(x)+0.5 gives:
+        #   raw_film_scale_init=0.5  → ≈2.19 (strong, for b3_id_film)
+        #   raw_film_scale_init=0.0  → ≈1.19 (moderate, for adapter_film)
+        #   raw_film_scale_init=-0.5 → ≈1.13 (conservative)
+        self.raw_film_scale = nn.Parameter(torch.tensor(raw_film_scale_init))
 
         self._verbose = True
 
@@ -415,6 +420,84 @@ class Block3IdentityFiLM(nn.Module):
         # Apply FiLM: id_proj * (1 + gamma) + beta
         id_proj = id_proj * (1.0 + gamma) + beta
         return id_proj
+
+
+class SpeakerDeltaProj(nn.Module):
+    """Speaker-conditioned residual path for the split mel projection.
+
+    Computes a speaker-dependent 80-dim mel delta from the full 96-dim
+    decoder features and pooled speaker tokens.  This delta is added to
+    the anchor (identity) path, structurally separating content
+    reconstruction from speaker-modulated spectral shaping.
+
+    Architecture: concat(x_pooled, speaker_pooled) → 2-layer MLP → 80-dim delta.
+    The x input provides per-frame spectral structure; the speaker input
+    routes the delta toward the target voice.  Both temporal and
+    speaker conditioning are present, unlike MelSpeakerAffine's
+    time-invariant bias-only design.
+    """
+    def __init__(self, feature_dim: int = 96, speaker_dim: int = 96,
+                 n_mel_bands: int = 80, mlp_gain: float = 0.2):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.speaker_dim = speaker_dim
+        self.n_mel_bands = n_mel_bands
+
+        # Concatenated input: pooled x (96) + pooled speaker (96) = 192
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim + speaker_dim, feature_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(feature_dim, n_mel_bands),
+        )
+
+        with torch.no_grad():
+            for m in self.mlp.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=mlp_gain)
+                    nn.init.zeros_(m.bias)
+
+        # Learnable delta_scale: softplus reparam, init small.
+        # raw_delta_scale=0.0 → softplus(0) ≈ 0.69.  This means the delta
+        # path starts contributing ~0.69 * (small MLP output) ≈ modest.
+        # Training grows it as speaker modulation proves useful for L1.
+        self.raw_delta_scale = nn.Parameter(torch.tensor(0.0))
+
+        self._verbose = True
+
+    def forward(self, x: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:              [B, 96, T] decoder features (post-SpeakerFiLM)
+            speaker_feats:  [B, num_tokens, 96] speaker tokens
+        Returns:
+            per-band speaker-conditioned delta: [B, 80, T]
+        """
+        B, C, T = x.shape
+
+        # Pool speaker tokens: mean over token dim → [B, 96]
+        spk_pooled = speaker_feats.mean(dim=1)  # [B, 96]
+
+        # Per-frame: pool x features and concatenate with speaker
+        # x is [B, 96, T]; pool over T for global context, but also
+        # keep per-frame structure by processing each frame.
+        # Efficient approach: broadcast speaker to all frames.
+        spk_expanded = spk_pooled.unsqueeze(-1).expand(B, self.speaker_dim, T)  # [B, 96, T]
+        combined = torch.cat([x, spk_expanded], dim=1)  # [B, 192, T]
+        combined = combined.permute(0, 2, 1)  # [B, T, 192]
+
+        delta = self.mlp(combined)  # [B, T, 80]
+        delta = delta.permute(0, 2, 1)  # [B, 80, T]
+
+        # Learnable scale
+        delta_scale = F.softplus(self.raw_delta_scale) + 0.1  # always > 0.1
+        delta = delta * delta_scale
+
+        if self._verbose:
+            print(f"[speaker_delta_proj] delta_scale: {delta_scale.item():.4f}")
+            print(f"[speaker_delta_proj] delta: mean={delta.mean():.4f}, std={delta.std():.4f}, "
+                  f"min={delta.min():.4f}, max={delta.max():.4f}")
+
+        return delta
 
 
 # --------------------------------------------------------------------------- #
@@ -468,29 +551,58 @@ class MobileNetDecoder(nn.Module):
             )
         self.blocks = nn.ModuleList(blocks)
         
-        # Output projection (unchanged)
-        self.mel_proj = nn.Conv1d(
-            channel_progression[-1],  # 80 channels
+        # ── Split-path mel projection ──────────────────────────────────────
+        # Replaces monolithic mel_proj with two-path design:
+        #   mel = anchor_scale * mel_anchor(x[:, :80, :]) + delta_scale * speaker_delta_proj(x, speaker_feats)
+        #
+        # Anchor path: identity-like projection on first 80 channels provides
+        # stable L1 reconstruction shortcut (same as before).
+        # Delta path: speaker-conditioned projection from all 96 channels +
+        # pooled speaker tokens → 80-dim spectral delta that carries timbre.
+        #
+        # This structurally prevents mel_proj from erasing speaker identity
+        # (raw cosine jumps from 0.61 → 0.97 with monolithic projection)
+        # because the delta path is architecturally committed to speaker-
+        # dependent output — L1 cannot minimize it to identity.
+
+        # Anchor path: Conv1d on first 80 channels only
+        self.mel_proj_anchor = nn.Conv1d(
+            channel_progression[-1] - 16,  # 80 input channels
             80,  # target mel bands
-            kernel_size=1, 
+            kernel_size=1,
             bias=True
         )
-        
-        # Compromise init for 96→80 mel_proj.
-        # Identity anchor on first 80 channels preserves L1 stability and mel
-        # variance scale (σ≈1.68), preventing the upstream regression seen with
-        # full Xavier (gain=1.0, no identity). Channels 80-95 use Xavier(gain=0.5)
-        # — 5× stronger than old gain=0.1 so the gradient can recruit them for
-        # speaker-dependent structure without destabilizing training dynamics.
-        # Hypothesis: this stops channels 80-95 starvation while keeping the
-        # L1 anchor that blocks 0-2 need to converge.
+        # Identity init for anchor: [80, 80] = I, bias = -4.5
+        with torch.no_grad():
+            anchor_weight = self.mel_proj_anchor.weight.squeeze(-1)  # [80, 80]
+            nn.init.eye_(anchor_weight)
+        if self.mel_proj_anchor.bias is not None:
+            nn.init.constant_(self.mel_proj_anchor.bias, -4.5)
+
+        # Learnable anchor_scale: softplus reparam, init near 0.95.
+        # raw_anchor_scale = 0.461 → softplus(0.461) ≈ 0.95.
+        # Training adjusts the balance between anchor and delta.
+        self.raw_anchor_scale = nn.Parameter(torch.tensor(0.461))
+
+        # Speaker-conditioned delta path
+        self.speaker_delta_proj = SpeakerDeltaProj(
+            feature_dim=channel_progression[-1],   # 96
+            speaker_dim=config.speaker_projection_dim,  # 96
+            n_mel_bands=80,
+            mlp_gain=0.2,
+        )
+
+        # Retain old mel_proj as attribute (unused in forward) so that
+        # loading old checkpoints with strict=False won't fail on missing key.
+        self.mel_proj = nn.Conv1d(
+            channel_progression[-1], 80, kernel_size=1, bias=True
+        )
         with torch.no_grad():
             weight_mat = self.mel_proj.weight.squeeze(-1)  # [80, 96]
             nn.init.xavier_uniform_(weight_mat, gain=0.5)
             weight_mat[:, :80] = torch.eye(80)
         if self.mel_proj.bias is not None:
-            #nn.init.zeros_(self.mel_proj.bias)
-            nn.init.constant_(self.mel_proj.bias, -4.5)  # Initialize in the unnormalized log-mel domain
+            nn.init.constant_(self.mel_proj.bias, -4.5)
 
         # Speaker-conditioned FiLM at block3 output: re-injects speaker
         # identity right before mel_proj, directly targeting the cent_cos
@@ -504,21 +616,25 @@ class MobileNetDecoder(nn.Module):
 
         # Adapter-entry speaker FiLM: prevents blocks 0-2 from erasing speaker
         # info (adapter→block2 cent_cos jumps from 0.576→0.717, 71% of total
-        # unrecovered erosion).  Same pattern as b3_id_film: pooled speaker
-        # tokens → MLP → per-channel gamma/beta.  Static across time.
+        # unrecovered erosion).  Strengthened with mlp_gain=0.3 and
+        # raw_film_scale_init=0.0 (softplus(0)+0.5 ≈ 1.19) to give it more
+        # authority than the default b3_id_film settings.
         self.adapter_speaker_film = Block3IdentityFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[0],        # 96
+            mlp_gain=0.3,
+            raw_film_scale_init=0.0,
         )
 
         # Block3 identity-path FiLM: conditioned at the residual_proj output,
-        # the localized speaker erasure point (cent_cos jumps from ~0.67 to
-        # ~0.87).  Applied directly after 192→96 residual_proj, before the
-        # residual sum — no GroupNorm between injection and usage.
-        # Identity-path-only per consensus; body path only if audit shows need.
+        # the localized speaker erasure point.  Keeps existing gain=0.2 and
+        # raw_film_scale_init=0.5 (strong authority) — this module is already
+        # working (cent_cos 0.689→0.507), don't over-tune it.
         self.block3_id_film = Block3IdentityFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[-1],       # 96
+            mlp_gain=0.2,
+            raw_film_scale_init=0.5,
         )
 
         # Post-mel_proj speaker affine: time-invariant per-band EQ applied
@@ -694,7 +810,20 @@ class MobileNetDecoder(nn.Module):
             x = self.speaker_film(x, speaker_feats)
             self._check(x, "spk_film")
 
-        mel = self.mel_proj(x)
+        # ── Split-path mel projection ──────────────────────────────────
+        # anchor_scale * mel_proj_anchor(x[:, :80, :]) + speaker_delta_proj(x, speaker_feats)
+        # The anchor path provides stable L1 reconstruction via identity-like
+        # projection on first 80 channels.  The delta path injects speaker-
+        # conditioned spectral shaping from all 96 channels + speaker tokens.
+        anchor_scale = F.softplus(self.raw_anchor_scale)  # always > 0
+        mel_anchor = self.mel_proj_anchor(x[:, :80, :])  # [B, 80, T]
+
+        if speaker_feats is not None:
+            mel_delta = self.speaker_delta_proj(x, speaker_feats)  # [B, 80, T]
+        else:
+            mel_delta = torch.zeros_like(mel_anchor)
+
+        mel = anchor_scale * mel_anchor + mel_delta
 
         # ── Decoder output diagnostics ──────────────────────────────────
         # We log three stages separately: (1) raw conv output, (2) after
@@ -715,6 +844,7 @@ class MobileNetDecoder(nn.Module):
 
         mel_pre_scale_std = mel.std().item()
         mel_pre_scale_mean = mel.mean().item()
+        if v: print(f"[decoder] mel_anchor_scale: {anchor_scale.item():.4f}")
         if v: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
         # DECOUPLED SCALING: center per-band temporal mean so out_scale is a PURE variance knob.
@@ -750,6 +880,24 @@ class MobileNetDecoder(nn.Module):
         clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 2.0)
         clamp_pct = clamp_mask.float().mean().item() * 100
         if v: print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
+
+        # ── Column-norm audit for split-path ──
+        if v:
+            anchor_w = self.mel_proj_anchor.weight.squeeze(-1)  # [80, 80]
+            delta_mlp_w = None
+            for m in self.speaker_delta_proj.mlp.modules():
+                if isinstance(m, nn.Linear) and m.out_features == 80:
+                    delta_mlp_w = m.weight  # [80, 192]
+                    break
+            if delta_mlp_w is not None:
+                # L2 norms of delta output rows (how much each mel band gets from delta path)
+                delta_row_norms = delta_mlp_w.norm(dim=1)  # [80]
+                print(f"[audit] delta_proj output row L2 norms: mean={delta_row_norms.mean():.4f}, "
+                      f"max={delta_row_norms.max():.4f}, min={delta_row_norms.min():.4f}")
+            anchor_row_norms = anchor_w.norm(dim=1)  # [80]
+            print(f"[audit] anchor_proj output row L2 norms: mean={anchor_row_norms.mean():.4f}, "
+                      f"max={anchor_row_norms.max():.4f}, min={anchor_row_norms.min():.4f}")
+            print(f"[audit] speaker_film gamma std: {getattr(self.speaker_film, '_last_gamma_std', 'N/A')}")
 
         self._check(mel, "mel_proj")
         

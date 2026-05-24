@@ -122,7 +122,7 @@ class ModelConfig:
         default_factory=lambda: [False, False, True, True]  # Reverted: SE on block3 provides some speaker-dependent reweighting; removing it made b3_body worse
     )
 
-    block3_residual_scale: float = 0.5  # Reduce body contribution at block3 only; body (cent_cos 0.90) dominates sum over identity (cent_cos 0.74)
+    block3_residual_scale: float = 0.35  # Reduced from 0.5: body branch (cent_cos 0.83) dilutes identity-FiLM path (cent_cos 0.51). 0.35 preserves body gradient while reducing dilution.
 
     mobilenet_upsample_stages: List[bool] = field(
     default_factory=lambda: [False, False, False, False]
