@@ -575,6 +575,8 @@ class MobileNetDecoder(nn.Module):
         self.speaker_film = SpeakerFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[-1],       # 96
+            mlp_gain=0.5,
+            raw_film_scale_init=0.5,
         )
 
         # Adapter-entry speaker FiLM: prevents blocks 0-2 from erasing speaker
@@ -631,7 +633,7 @@ class MobileNetDecoder(nn.Module):
             bias=True,
         )
         with torch.no_grad():
-            nn.init.zeros_(self.speaker_out_scale.weight)
+            nn.init.xavier_uniform_(self.speaker_out_scale.weight, gain=0.3)
             nn.init.zeros_(self.speaker_out_scale.bias)
         self.raw_spk_scale_gain = nn.Parameter(torch.tensor(0.0))  # softplus(0)+0.1≈0.79
 
