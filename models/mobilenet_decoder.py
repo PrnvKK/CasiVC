@@ -417,8 +417,11 @@ class Block3IdentityFiLM(nn.Module):
             print(f"[b3_id_film] film_scale: {film_scale.item():.4f}")
             print(f"[b3_id_film] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
 
-        # Apply FiLM: id_proj * (1 + gamma) + beta
-        id_proj = id_proj * (1.0 + gamma) + beta
+        # Normalized-input residual FiLM: per-channel instance-norm before
+        # gamma/beta so modulation depth is speaker-independent.  Additive
+        # residual preserves the original signal's temporal structure.
+        id_norm = (id_proj - id_proj.mean(dim=-1, keepdim=True)) / (id_proj.std(dim=-1, keepdim=True) + 1e-6)
+        id_proj = id_proj + id_norm * gamma + beta
         return id_proj
 
 
