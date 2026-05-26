@@ -263,24 +263,24 @@ class SpeakerFiLM(nn.Module):
 
 
 class MelSpeakerAffine(nn.Module):
-    """Time-invariant speaker-conditioned bias applied AFTER out_scale.
+    """Speaker-conditioned FiLM applied AFTER out_scale.
 
-    Placed after the centered out_scale step (which dilutes any speaker
-    bias placed before it by amplifying content 2.19x without amplifying
-    speaker shift).  Now only clamp follows, so the bias is structurally
-    non-erasable.
+    Scale+shift (FiLM) design: the speaker signature in the mel domain
+    includes both spectral envelope shift (formant positions, tilt, per-band
+    mean level) AND per-band variance differences (σ-ratio asymmetry between
+    speakers).  The previous bias-only design could only shift means, which
+    was structurally insufficient — cent_cos barely moved (0.7718→0.7681).
 
-    Bias-only design: the primary speaker signature in the mel domain
-    is spectral envelope shift (formant positions, tilt, per-band mean
-    level), which a per-band bias captures.  Pooled speaker tokens
-    → 2-layer MLP → per-band bias for 80 mel bands.  Time-invariant
-    (broadcast over T).  Gain=0.2 init, learnable bias_scale with
-    softplus reparam.
+    FiLM: mel * (1 + gamma) + beta
+    - gamma: per-band scaling (addresses σ-ratio asymmetry between speakers)
+    - beta: per-band shift (addresses spectral envelope / timbre shift)
+    - ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
 
-    Gradient path: L1 loss directly sees the bias effect on the final
-    mel (post-out_scale domain = L1 target domain), providing clearer
-    gradient than the pre-out_scale position where centering stripped
-    the bias.
+    This is the ONLY speaker-injection point after both mel_proj and out_scale,
+    so the modulation cannot be diluted by either erasure point.  Pooled
+    speaker tokens → 2-layer MLP → gamma/beta for 80 mel bands.
+    Time-invariant (broadcast over T).  Gain=0.2 init, learnable film_scale
+    with softplus reparam.  Near-identity start (gamma ≈ 0, beta ≈ 0).
     """
     def __init__(self, speaker_dim: int = 96, n_mel_bands: int = 80):
         super().__init__()
@@ -290,7 +290,7 @@ class MelSpeakerAffine(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(speaker_dim, speaker_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(speaker_dim, n_mel_bands),
+            nn.Linear(speaker_dim, n_mel_bands * 2),  # gamma + beta
         )
 
         with torch.no_grad():
@@ -299,9 +299,9 @@ class MelSpeakerAffine(nn.Module):
                     nn.init.xavier_uniform_(m.weight, gain=0.2)
                     nn.init.zeros_(m.bias)
 
-        # Learnable bias_scale: softplus reparam so scale can never collapse.
-        # Init 0.5 → softplus(0.5)+0.5 ≈ 2.19.
-        self.raw_bias_scale = nn.Parameter(torch.tensor(0.5))
+        # Learnable film_scale: softplus reparam so scale can never collapse.
+        # Init 0.0 → softplus(0)+0.5 ≈ 1.19 (modest authority, near-identity start).
+        self.raw_film_scale = nn.Parameter(torch.tensor(0.0))
 
         self._verbose = True
 
@@ -311,29 +311,39 @@ class MelSpeakerAffine(nn.Module):
             mel:           [B, 80, T] mel after out_scale (pre-clamp)
             speaker_feats: [B, num_tokens, speaker_dim] speaker tokens
         Returns:
-            mel + speaker-dependent per-band bias: [B, 80, T]
+            mel * (1 + gamma) + beta: [B, 80, T]
         """
         # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
         spk_pooled = speaker_feats.mean(dim=1)
 
-        # Generate per-band bias
-        bias = self.mlp(spk_pooled)                            # [B, n_mel_bands]
+        # Generate FiLM parameters
+        film_params = self.mlp(spk_pooled)                       # [B, n_mel_bands * 2]
+        gamma, beta = film_params.chunk(2, dim=-1)               # [B, n_mel_bands] each
 
         # Learnable scale (softplus reparam, always > 0.5)
-        bias_scale = F.softplus(self.raw_bias_scale) + 0.5
-        bias = bias * bias_scale
+        film_scale = F.softplus(self.raw_film_scale) + 0.5
+
+        # Scale + ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
+        gamma = F.elu(gamma * film_scale)
+        beta  = beta * film_scale
 
         # Reshape for broadcasting over temporal dim: [B, 80, 1]
-        bias = bias.unsqueeze(-1)
+        gamma = gamma.unsqueeze(-1)
+        beta  = beta.unsqueeze(-1)
 
         if self._verbose:
-            b = bias.squeeze(-1)  # [B, n_mel_bands]
-            print(f"[mel_spk_affine] bias: mean={b.mean():.4f}, std={b.std():.4f}, "
+            g = gamma.squeeze(-1)  # [B, 80]
+            b = beta.squeeze(-1)
+            self._last_gamma_std = g.std().item()  # stored for audit
+            print(f"[mel_spk_affine] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
+                  f"min={g.min():.4f}, max={g.max():.4f}")
+            print(f"[mel_spk_affine] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
                   f"min={b.min():.4f}, max={b.max():.4f}")
-            print(f"[mel_spk_affine] bias_scale: {bias_scale.item():.4f}")
+            print(f"[mel_spk_affine] film_scale: {film_scale.item():.4f}")
+            print(f"[mel_spk_affine] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
 
-        # Apply bias-only: mel + bias
-        mel = mel + bias
+        # Apply FiLM: mel * (1 + gamma) + beta
+        mel = mel * (1.0 + gamma) + beta
         return mel
 
 
@@ -600,15 +610,17 @@ class MobileNetDecoder(nn.Module):
         self.block3_id_film = Block3IdentityFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[-1],       # 96
-            mlp_gain=0.2,
+            mlp_gain=0.5,
             raw_film_scale_init=0.5,
         )
 
-        # Post-mel_proj speaker affine: time-invariant per-band EQ applied
-        # AFTER the 96→80 projection, where nothing downstream (out_scale,
-        # clamp) can strip speaker identity.  Targets the terminal erasure
-        # point (spk_film 0.723 → mel_proj 0.846, +0.122).  Same pattern
-        # as SpeakerFiLM but operates on 80 mel bands, static across time.
+        # Post-out_scale speaker FiLM: scale+shift applied AFTER both
+        # mel_proj and out_scale, where nothing downstream except clamp
+        # can strip speaker identity.  Previous bias-only design could
+        # only shift spectral means — insufficient to fix σ-ratio
+        # asymmetry (cent_cos barely moved 0.7718→0.7681).  FiLM gives
+        # per-band scaling (gamma) to address variance + shift (beta)
+        # for timbre.  Only injection point after both erasure points.
         self.mel_speaker_affine = MelSpeakerAffine(
             speaker_dim=config.speaker_projection_dim,     # 96
             n_mel_bands=80,                                 # 80 mel bands
@@ -849,12 +861,13 @@ class MobileNetDecoder(nn.Module):
         mel_post_scale_mean = mel_scaled.mean().item()
         if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
-        # ── Post-out_scale speaker bias: time-invariant per-band shift ──
+        # ── Post-out_scale speaker FiLM: scale+shift after both erasure points ──
         # Injects speaker identity AFTER out_scale (which dilutes any
-        # speaker bias placed before it by amplifying content 2.19x).
-        # Only clamp follows, so the bias is structurally non-erasable.
-        # Bias-only: captures spectral envelope shift (formant, tilt).
-        # Save prebias mel (before speaker bias) for gated CE classifier
+        # speaker modulation placed before it by amplifying content 2.16x).
+        # Only clamp follows, so the FiLM is structurally non-erasable.
+        # FiLM (gamma+beta): per-band scaling fixes σ-ratio asymmetry,
+        # per-band shift fixes spectral envelope (formant, tilt).
+        # Save pre-FiLM mel for gated CE classifier
         prebias_mel = mel_scaled
 
         if speaker_feats is not None:
