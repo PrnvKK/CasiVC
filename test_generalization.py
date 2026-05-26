@@ -79,6 +79,42 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
     print("✅ Model loaded.")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # DIAGNOSTIC 2: mel_proj weight channel utilization
+    # ═══════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("🔬 DIAGNOSTIC 2: mel_proj weight channel utilization")
+    print("="*70)
+    with torch.no_grad():
+        w = model.decoder.mel_proj.weight  # [80, 96, 1]
+        w_norm = w.squeeze(-1).norm(p=2, dim=0)  # [96] per-input-channel L2
+        low_chans = w_norm[:80]   # channels 0-79 (identity-init)
+        high_chans = w_norm[80:]  # channels 80-95 (zero-init)
+        print(f"  Input channels 0-79:  mean L2={low_chans.mean():.6f}, max={low_chans.max():.6f}, min={low_chans.min():.6f}")
+        print(f"  Input channels 80-95: mean L2={high_chans.mean():.6f}, max={high_chans.max():.6f}, min={high_chans.min():.6f}")
+        ratio = high_chans.mean() / (low_chans.mean() + 1e-8)
+        print(f"  Ratio (80-95 / 0-79): {ratio:.4f}")
+        # Per-output-channel breakdown: how much weight goes to 80-95 vs 0-79
+        w_mat = w.squeeze(-1)  # [80, 96]
+        w_to_lo = w_mat[:, :80].norm(p=2, dim=1)  # [80] per output chan
+        w_to_hi = w_mat[:, 80:].norm(p=2, dim=1)  # [80]
+        print(f"  Per-output-channel weight to ch 0-79:  mean={w_to_lo.mean():.6f}, max={w_to_lo.max():.6f}")
+        print(f"  Per-output-channel weight to ch 80-95: mean={w_to_hi.mean():.6f}, max={w_to_hi.max():.6f}")
+        # How many output channels have meaningful high-channel utilization?
+        n_active = (w_to_hi > 0.01).sum().item()
+        print(f"  Output channels with |w_hi| > 0.01: {n_active}/80")
+        print(f"  [VERDICT] ", end="")
+        if w_to_hi.max() < 0.005:
+            print("Channels 80-95 are DEAD. Gradient starvation via identity shortcut confirmed.")
+        elif ratio < 0.05:
+            print("Channels 80-95 are SEVERELY STARVED. Near-zero recruitment.")
+        elif ratio < 0.2:
+            print("Channels 80-95 are WEAK. Partial recruitment, gradient competition with identity path.")
+        else:
+            print("Channels 80-95 are ACTIVE. Erosion has a different cause.")
+    print("="*70)
+
     # ── Speaker Space Diagnostic ─────────────────────────────────────────
     print("\n[SPEAKER SPACE DIAGNOSTIC]")
     with torch.no_grad():
@@ -271,6 +307,71 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         film_AA = model.decoder.speaker_film(block3_AA, spk_A_t)
         film_AB = model.decoder.speaker_film(block3_AB, spk_B_t)
 
+        # ═══════════════════════════════════════════════════════════════
+        # DIAGNOSTIC 1: Per-channel speaker divergence at spk_film output
+        # ═══════════════════════════════════════════════════════════════
+        print("\n" + "-"*60)
+        print("🔬 DIAGNOSTIC 1: Per-channel speaker divergence at spk_film")
+        print("-"*60)
+        chan_diff = (film_AA - film_AB).abs().mean(dim=-1).squeeze(0)  # [96]
+        _, rank_order = chan_diff.sort(descending=True)
+        low_diff = chan_diff[:80]   # channels 0-79 (identity path)
+        high_diff = chan_diff[80:]  # channels 80-95 (zero-init path)
+        print(f"  Mean divergence ch 0-79:  {low_diff.mean():.6f}")
+        print(f"  Mean divergence ch 80-95: {high_diff.mean():.6f}")
+        print(f"  Ratio (80-95 / 0-79):     {high_diff.mean()/(low_diff.mean()+1e-8):.4f}")
+        top16 = set(rank_order[:16].tolist())
+        in_high = sum(1 for i in top16 if i >= 80)
+        print(f"  Top-16 channels: {in_high}/16 are in range 80-95")
+        print(f"  Top-16 channel indices (sorted): {sorted(top16)}")
+        print(f"  Top-10 per-channel divergences:")
+        for rank_idx, ch_idx in enumerate(rank_order[:10].tolist()):
+            zone = " ← ZERO-INIT (80-95)" if ch_idx >= 80 else ""
+            print(f"    #{rank_idx+1}: ch {ch_idx:3d}  div={chan_diff[ch_idx]:.6f}{zone}")
+        print(f"  [VERDICT] ", end="")
+        if in_high >= 8:
+            print("Speaker info CONCENTRATED in ch 80-95. Identity-init mel_proj is structurally wrong.")
+        elif in_high >= 3:
+            print("Speaker info MIXED across channel groups. mel_proj partially usable but erodes high channels.")
+        else:
+            print("Speaker info in ch 0-79. mel_proj identity path should preserve it. Erosion has different cause.")
+
+        # ═══════════════════════════════════════════════════════════════
+        # DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj input
+        # ═══════════════════════════════════════════════════════════════
+        print("\n" + "-"*60)
+        print("🔬 DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj input")
+        print("-"*60)
+        # Normal path cent_cos
+        mel_norm_AA = model.decoder.mel_proj(film_AA)
+        mel_norm_AB = model.decoder.mel_proj(film_AB)
+        aa_c_n = mel_norm_AA.flatten() - mel_norm_AA.flatten().mean()
+        ab_c_n = mel_norm_AB.flatten() - mel_norm_AB.flatten().mean()
+        cos_norm = torch.nn.functional.cosine_similarity(aa_c_n, ab_c_n, dim=0).item()
+        # Ablated: zero out channels 80-95 before mel_proj
+        film_AA_abl = film_AA.clone()
+        film_AB_abl = film_AB.clone()
+        film_AA_abl[:, 80:, :] = 0.0
+        film_AB_abl[:, 80:, :] = 0.0
+        mel_abl_AA = model.decoder.mel_proj(film_AA_abl)
+        mel_abl_AB = model.decoder.mel_proj(film_AB_abl)
+        aa_c_a = mel_abl_AA.flatten() - mel_abl_AA.flatten().mean()
+        ab_c_a = mel_abl_AB.flatten() - mel_abl_AB.flatten().mean()
+        cos_abl = torch.nn.functional.cosine_similarity(aa_c_a, ab_c_a, dim=0).item()
+        print(f"  Normal    mel_proj_raw cent_cos: {cos_norm:.4f}")
+        print(f"  Ablated   mel_proj_raw cent_cos: {cos_abl:.4f}")
+        delta = cos_abl - cos_norm
+        print(f"  Delta (ablated - normal):         {delta:+.4f}")
+        print(f"  [VERDICT] ", end="")
+        if abs(delta) < 0.02:
+            print("Channels 80-95 contribute NEGLIGIBLE speaker info at mel_proj. Functionally dead.")
+        elif delta > 0.05:
+            print("Channels 80-95 carry speaker info — ablation IMPROVES separation (suggests noise from dead channels).")
+        elif delta < -0.02:
+            print("Channels 80-95 carry speaker info — ablation WORSENS separation. mel_proj has partially learned to use them.")
+        else:
+            print(f"Channels 80-95 have MARGINAL contribution (|Δ|={abs(delta):.3f}).")
+
         # ── Monolithic mel_proj: Conv1d(96→80) ──
         mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
         mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
@@ -373,6 +474,108 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("  [force_gamma reset \u2192 None, normal mode restored]")
     print("="*70)
     # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    # ═══════════════════════════════════════════════════════════════════
+    # DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)
+    # ═══════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("🔬 DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)")
+    print("="*70)
+
+    # Suppress verbose prints during gradient pass
+    saved_verbose = {}
+    for name in ['_verbose', 'cross_attn', 'decoder', 'speaker_film',
+                 'block3_id_film', 'adapter_speaker_film', 'mel_speaker_affine']:
+        if name == '_verbose':
+            saved_verbose[name] = model._verbose
+            model._verbose = False
+        elif name == 'cross_attn':
+            saved_verbose[name] = model.cross_attn._verbose
+            model.cross_attn._verbose = False
+        elif name == 'decoder':
+            saved_verbose[name] = model.decoder._verbose
+            model.decoder._verbose = False
+            for blk in model.decoder.blocks:
+                blk._verbose = False
+        elif name == 'speaker_film':
+            saved_verbose[name] = model.decoder.speaker_film._verbose
+            model.decoder.speaker_film._verbose = False
+        elif name == 'block3_id_film':
+            saved_verbose[name] = model.decoder.block3_id_film._verbose
+            model.decoder.block3_id_film._verbose = False
+        elif name == 'adapter_speaker_film':
+            saved_verbose[name] = model.decoder.adapter_speaker_film._verbose
+            model.decoder.adapter_speaker_film._verbose = False
+        elif name == 'mel_speaker_affine':
+            saved_verbose[name] = model.decoder.mel_speaker_affine._verbose
+            model.decoder.mel_speaker_affine._verbose = False
+
+    aff = model.decoder.mel_speaker_affine
+
+    # Freeze all model parameters, enable grad only on mel_spk_affine
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in aff.parameters():
+        p.requires_grad = True
+
+    # Forward: A→A self-reconstruction with grad tracking
+    pred_AA_grad, _, _ = model(ref_A.unsqueeze(0), [content_A])
+    gt_mel_grad = extract_mel_spectrogram(content_A, sample_rate=audio_cfg.sample_rate).unsqueeze(0).to(device)
+
+    # Trim to min length
+    min_len = min(pred_AA_grad.shape[-1], gt_mel_grad.shape[-1])
+    pred_AA_grad = pred_AA_grad[:, :, :min_len]
+    gt_mel_grad = gt_mel_grad[:, :, :min_len]
+
+    # L1 loss + backward
+    l1_loss = torch.nn.functional.l1_loss(pred_AA_grad, gt_mel_grad)
+    l1_loss.backward()
+
+    # Log gradient norms
+    mlp0 = aff.mlp[0]   # Linear(96, 96)
+    mlp2 = aff.mlp[2]   # Linear(96, 160)
+    print(f"  L1 loss value: {l1_loss.item():.6f}")
+    print(f"  --- Gradient norms (L2) ---")
+    if mlp0.weight.grad is not None:
+        print(f"  mlp[0].weight (96→96):       {mlp0.weight.grad.norm():.6f}")
+    else:
+        print(f"  mlp[0].weight (96→96):       NO GRADIENT")
+    if mlp2.weight.grad is not None:
+        gamma_grad_w = mlp2.weight.grad[:, :80]   # cols 0-79  → gamma
+        beta_grad_w  = mlp2.weight.grad[:, 80:]   # cols 80-159 → beta
+        print(f"  mlp[2].weight (96→160):      {mlp2.weight.grad.norm():.6f}")
+        print(f"    gamma half (cols 0-79):    {gamma_grad_w.norm():.6f}")
+        print(f"    beta half  (cols 80-159):  {beta_grad_w.norm():.6f}")
+        print(f"    gamma/beta gradient ratio:  {gamma_grad_w.norm()/(beta_grad_w.norm()+1e-8):.4f}")
+    else:
+        print(f"  mlp[2].weight (96→160):      NO GRADIENT")
+    if mlp2.bias.grad is not None:
+        gamma_grad_b = mlp2.bias.grad[:80]
+        beta_grad_b  = mlp2.bias.grad[80:]
+        print(f"  mlp[2].bias (160):           {mlp2.bias.grad.norm():.6f}")
+        print(f"    gamma half:                {gamma_grad_b.norm():.6f}")
+        print(f"    beta half:                 {beta_grad_b.norm():.6f}")
+    if aff.raw_film_scale.grad is not None:
+        fs_grad_val = aff.raw_film_scale.grad.item()
+        print(f"  raw_film_scale grad:         {fs_grad_val:+.6f}")
+        print(f"  [VERDICT] ", end="")
+        if fs_grad_val < -0.0001:
+            print("L1 PUSHES film_scale DOWN. Homeostasis confirmed — L1 actively suppresses gamma authority.")
+        elif fs_grad_val > 0.0001:
+            print("L1 pushes film_scale UP. Homeostasis hypothesis WRONG — something else suppresses gamma.")
+        else:
+            print("L1 gradient on film_scale is NEAR ZERO. Gamma timid for a different reason (e.g., gradient magnitude too small overall).")
+    else:
+        print(f"  raw_film_scale grad:         NO GRADIENT")
+        print(f"  [VERDICT] Cannot determine — check requires_grad on raw_film_scale.")
+
+    # Cleanup
+    model.zero_grad()
+    for p in aff.parameters():
+        p.requires_grad = False
+    # Restore model to eval-appropriate state (params stay frozen)
+    del pred_AA_grad, gt_mel_grad, l1_loss
+    print("="*70)
 
     print("\n" + "="*60)
     print("\U0001f4cb LISTENING GUIDE:")
