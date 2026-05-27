@@ -376,20 +376,10 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
         mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
 
-        # ── mel_scaled: after speaker-conditioned out_scale ──
-        base_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
-        spk_gain = torch.nn.functional.softplus(model.decoder.raw_spk_scale_gain) + 0.1
-
-        # Speaker A
-        spk_A_pooled = spk_A_t.mean(dim=1)
-        spk_raw_A = model.decoder.speaker_out_scale(spk_A_pooled)
-        spk_delta_A = 0.35 * torch.tanh(spk_gain * spk_raw_A)
-        out_scale_AA = base_scale * (1.0 + spk_delta_A.unsqueeze(-1))
-        # Speaker B
-        spk_B_pooled = spk_B_t.mean(dim=1)
-        spk_raw_B = model.decoder.speaker_out_scale(spk_B_pooled)
-        spk_delta_B = 0.35 * torch.tanh(spk_gain * spk_raw_B)
-        out_scale_AB = base_scale * (1.0 + spk_delta_B.unsqueeze(-1))
+        # ── mel_scaled: after unconditioned out_scale ──
+        out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
+        out_scale_AA = out_scale
+        out_scale_AB = out_scale
 
         mel_band_mean_AA = mel_proj_raw_AA.mean(dim=-1, keepdim=True)
         mel_band_mean_AB = mel_proj_raw_AB.mean(dim=-1, keepdim=True)
