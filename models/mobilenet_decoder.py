@@ -263,24 +263,17 @@ class SpeakerFiLM(nn.Module):
 
 
 class MelSpeakerAffine(nn.Module):
-    """Speaker-conditioned FiLM applied AFTER out_scale.
+    """Speaker residual delta applied AFTER out_scale.
 
-    Scale+shift (FiLM) design: the speaker signature in the mel domain
-    includes both spectral envelope shift (formant positions, tilt, per-band
-    mean level) AND per-band variance differences (σ-ratio asymmetry between
-    speakers).  The previous bias-only design could only shift means, which
-    was structurally insufficient — cent_cos barely moved (0.7718→0.7681).
-
-    FiLM: mel * (1 + gamma) + beta
-    - gamma: per-band scaling (addresses σ-ratio asymmetry between speakers)
-    - beta: per-band shift (addresses spectral envelope / timbre shift)
-    - ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
-
-    This is the ONLY speaker-injection point after both mel_proj and out_scale,
-    so the modulation cannot be diluted by either erasure point.  Pooled
-    speaker tokens → 2-layer MLP → gamma/beta for 80 mel bands.
-    Time-invariant (broadcast over T).  Gain=0.2 init, learnable film_scale
-    with softplus reparam.  Near-identity start (gamma ≈ 0, beta ≈ 0).
+    Instead of a full FiLM (scale+shift) that scales the entire mel
+    (which can homogenize content across speakers to satisfy L1), this
+    module purely learns an ADDITIVE spectral envelope shift per speaker.
+    
+    mel = mel + delta_scale * tanh(speaker_raw)
+    
+    This gives the speaker module a much cleaner mathematical role: 
+    add target-speaker spectral characteristics without rescaling the 
+    underlying content dynamics.
     """
     def __init__(self, speaker_dim: int = 96, n_mel_bands: int = 80):
         super().__init__()
@@ -290,7 +283,7 @@ class MelSpeakerAffine(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(speaker_dim, speaker_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(speaker_dim, n_mel_bands * 2),  # gamma + beta
+            nn.Linear(speaker_dim, n_mel_bands),  # speaker_raw
         )
 
         with torch.no_grad():
@@ -299,9 +292,9 @@ class MelSpeakerAffine(nn.Module):
                     nn.init.xavier_uniform_(m.weight, gain=0.2)
                     nn.init.zeros_(m.bias)
 
-        # Learnable film_scale: softplus reparam so scale can never collapse.
-        # Init 0.0 → softplus(0)+0.5 ≈ 1.19 (modest authority, near-identity start).
-        self.raw_film_scale = nn.Parameter(torch.tensor(0.0))
+        # Learnable amplitude for the delta.
+        # softplus(0) + 0.1 ≈ 0.79 max amplitude.
+        self.raw_delta_scale = nn.Parameter(torch.tensor(0.0))
 
         self._verbose = True
 
@@ -311,39 +304,32 @@ class MelSpeakerAffine(nn.Module):
             mel:           [B, 80, T] mel after out_scale (pre-clamp)
             speaker_feats: [B, num_tokens, speaker_dim] speaker tokens
         Returns:
-            mel * (1 + gamma) + beta: [B, 80, T]
+            mel + speaker_delta: [B, 80, T]
         """
         # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
         spk_pooled = speaker_feats.mean(dim=1)
 
-        # Generate FiLM parameters
-        film_params = self.mlp(spk_pooled)                       # [B, n_mel_bands * 2]
-        gamma, beta = film_params.chunk(2, dim=-1)               # [B, n_mel_bands] each
+        # Generate raw delta
+        speaker_raw = self.mlp(spk_pooled)                       # [B, 80]
 
-        # Learnable scale (softplus reparam, always > 1.0)
-        film_scale = F.softplus(self.raw_film_scale) + 1.0
-
-        # Scale + ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
-        gamma = F.elu(gamma * film_scale)
-        beta  = beta * film_scale
+        # Learnable scale (softplus reparam, min 0.1 authority)
+        delta_scale = F.softplus(self.raw_delta_scale) + 0.1
+        
+        # Bounded additive delta
+        speaker_delta = delta_scale * torch.tanh(speaker_raw)    # [B, 80]
 
         # Reshape for broadcasting over temporal dim: [B, 80, 1]
-        gamma = gamma.unsqueeze(-1)
-        beta  = beta.unsqueeze(-1)
+        speaker_delta = speaker_delta.unsqueeze(-1)
 
         if self._verbose:
-            g = gamma.squeeze(-1)  # [B, 80]
-            b = beta.squeeze(-1)
-            self._last_gamma_std = g.std().item()  # stored for audit
-            print(f"[mel_spk_affine] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
-                  f"min={g.min():.4f}, max={g.max():.4f}")
-            print(f"[mel_spk_affine] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
-                  f"min={b.min():.4f}, max={b.max():.4f}")
-            print(f"[mel_spk_affine] film_scale: {film_scale.item():.4f}")
-            print(f"[mel_spk_affine] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
+            d = speaker_delta.squeeze(-1)  # [B, 80]
+            self._last_gamma_std = d.std().item()  # stored for audit to prevent crash
+            print(f"[mel_spk_affine] delta_scale: {delta_scale.item():.4f}")
+            print(f"[mel_spk_affine] speaker_delta: mean={d.mean():.4f}, std={d.std():.4f}, "
+                  f"min={d.min():.4f}, max={d.max():.4f}")
 
-        # Apply FiLM: mel * (1 + gamma) + beta
-        mel = mel * (1.0 + gamma) + beta
+        # Additive residual
+        mel = mel + speaker_delta
         return mel
 
 

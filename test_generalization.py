@@ -523,7 +523,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
 
     # Log gradient norms
     mlp0 = aff.mlp[0]   # Linear(96, 96)
-    mlp2 = aff.mlp[2]   # Linear(96, 160)
+    mlp2 = aff.mlp[2]   # Linear(96, 80)
     print(f"  L1 loss value: {l1_loss.item():.6f}")
     print(f"  --- Gradient norms (L2) ---")
     if mlp0.weight.grad is not None:
@@ -531,33 +531,25 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     else:
         print(f"  mlp[0].weight (96→96):       NO GRADIENT")
     if mlp2.weight.grad is not None:
-        gamma_grad_w = mlp2.weight.grad[:, :80]   # cols 0-79  → gamma
-        beta_grad_w  = mlp2.weight.grad[:, 80:]   # cols 80-159 → beta
-        print(f"  mlp[2].weight (96→160):      {mlp2.weight.grad.norm():.6f}")
-        print(f"    gamma half (cols 0-79):    {gamma_grad_w.norm():.6f}")
-        print(f"    beta half  (cols 80-159):  {beta_grad_w.norm():.6f}")
-        print(f"    gamma/beta gradient ratio:  {gamma_grad_w.norm()/(beta_grad_w.norm()+1e-8):.4f}")
+        print(f"  mlp[2].weight (96→80):       {mlp2.weight.grad.norm():.6f}")
     else:
-        print(f"  mlp[2].weight (96→160):      NO GRADIENT")
+        print(f"  mlp[2].weight (96→80):       NO GRADIENT")
     if mlp2.bias.grad is not None:
-        gamma_grad_b = mlp2.bias.grad[:80]
-        beta_grad_b  = mlp2.bias.grad[80:]
-        print(f"  mlp[2].bias (160):           {mlp2.bias.grad.norm():.6f}")
-        print(f"    gamma half:                {gamma_grad_b.norm():.6f}")
-        print(f"    beta half:                 {beta_grad_b.norm():.6f}")
-    if aff.raw_film_scale.grad is not None:
-        fs_grad_val = aff.raw_film_scale.grad.item()
-        print(f"  raw_film_scale grad:         {fs_grad_val:+.6f}")
+        print(f"  mlp[2].bias (80):            {mlp2.bias.grad.norm():.6f}")
+    
+    if hasattr(aff, 'raw_delta_scale') and aff.raw_delta_scale.grad is not None:
+        ds_grad_val = aff.raw_delta_scale.grad.item()
+        print(f"  raw_delta_scale grad:        {ds_grad_val:+.6f}")
         print(f"  [VERDICT] ", end="")
-        if fs_grad_val < -0.0001:
-            print("L1 PUSHES film_scale DOWN. Homeostasis confirmed — L1 actively suppresses gamma authority.")
-        elif fs_grad_val > 0.0001:
-            print("L1 pushes film_scale UP. Homeostasis hypothesis WRONG — something else suppresses gamma.")
+        if ds_grad_val < -0.0001:
+            print("L1 PUSHES delta_scale DOWN. L1 actively suppresses speaker envelope shifts.")
+        elif ds_grad_val > 0.0001:
+            print("L1 pushes delta_scale UP. L1 actually wants more spectral shift.")
         else:
-            print("L1 gradient on film_scale is NEAR ZERO. Gamma timid for a different reason (e.g., gradient magnitude too small overall).")
+            print("L1 gradient on delta_scale is NEAR ZERO.")
     else:
-        print(f"  raw_film_scale grad:         NO GRADIENT")
-        print(f"  [VERDICT] Cannot determine — check requires_grad on raw_film_scale.")
+        print(f"  raw_delta_scale grad:        NO GRADIENT (or missing)")
+        print(f"  [VERDICT] Cannot determine.")
 
     # Cleanup
     model.zero_grad()
