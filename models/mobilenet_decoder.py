@@ -320,8 +320,8 @@ class MelSpeakerAffine(nn.Module):
         film_params = self.mlp(spk_pooled)                       # [B, n_mel_bands * 2]
         gamma, beta = film_params.chunk(2, dim=-1)               # [B, n_mel_bands] each
 
-        # Learnable scale (softplus reparam, always > 0.5)
-        film_scale = F.softplus(self.raw_film_scale) + 0.5
+        # Learnable scale (softplus reparam, always > 1.0)
+        film_scale = F.softplus(self.raw_film_scale) + 1.0
 
         # Scale + ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
         gamma = F.elu(gamma * film_scale)
@@ -640,20 +640,8 @@ class MobileNetDecoder(nn.Module):
         # independently of variance scaling.
         self.out_bias = nn.Parameter(torch.zeros(1, 80, 1))
 
-        # Speaker-conditioned out_scale modulation: a lightweight MLP that
-        # injects per-band scaling deltas per speaker, targeting the largest
-        # remaining erasure point (mel_proj_raw → mel_scaled: +0.226 cent_cos).
-        # Zero-initialised so behaviour starts identical to current.
-        # Learnable bounded gain via tanh + softplus reparametrisation.
-        self.speaker_out_scale = nn.Linear(
-            config.speaker_projection_dim,  # 96 (pooled speaker tokens)
-            80,                              # per-band modulation delta
-            bias=True,
-        )
-        with torch.no_grad():
-            nn.init.xavier_uniform_(self.speaker_out_scale.weight, gain=0.3)
-            nn.init.zeros_(self.speaker_out_scale.bias)
-        self.raw_spk_scale_gain = nn.Parameter(torch.tensor(0.0))  # softplus(0)+0.1≈0.79
+        # Speaker-conditioned out_scale modulation removed to prevent gradient competition
+        # with mel_spk_affine. out_scale is now purely an unconditional variance amplifier.
 
         self._verbose = True  # set False to suppress per-call debug prints
 
@@ -824,15 +812,7 @@ class MobileNetDecoder(nn.Module):
         # Speaker-conditioned modulation injects per-band scaling deltas bounded
         # by ±0.35 via tanh, blending a learnable gain with a zero-init MLP
         # so behaviour starts identical to the unconditional out_scale.
-        base_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
-        if speaker_feats is not None:
-            spk_pooled = speaker_feats.mean(dim=1)            # [B, 96]
-            spk_raw = self.speaker_out_scale(spk_pooled)      # [B, 80]
-            spk_gain = F.softplus(self.raw_spk_scale_gain) + 0.1
-            spk_delta = 0.35 * torch.tanh(spk_gain * spk_raw) # bounded ±0.35
-            out_scale = base_scale * (1.0 + spk_delta.unsqueeze(-1))  # [B, 80, 1]
-        else:
-            out_scale = base_scale
+        out_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
 
         out_bias_vals  = self.out_bias.squeeze()            # [80]
         out_scale_vals = out_scale.squeeze()                # [B, 80] or [80]
@@ -841,9 +821,6 @@ class MobileNetDecoder(nn.Module):
             print(f"[decoder] out_scale (softplus+1.5): mean={out_scale_vals.float().mean().item():.4f}, "
                   f"min={out_scale_vals.float().min().item():.4f}, max={out_scale_vals.float().max().item():.4f}")
             print(f"[decoder] raw_out_scale: mean={self.raw_out_scale.mean().item():.4f}")
-            if speaker_feats is not None:
-                print(f"[decoder] spk_out_scale gain: {spk_gain.item():.4f}, "
-                      f"delta mean={spk_delta.mean().item():.4f}, std={spk_delta.std().item():.4f}")
             print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
                   f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
 
