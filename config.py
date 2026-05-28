@@ -147,7 +147,7 @@ class TrainingConfig:
   lambda_spk: float = 1.0      # Weight for the new Speaker Identity loss.
   """
 
-  lambda_mel: float = 5.0      # was 45 — prevents memorizing exact mels, allows generalization
+  lambda_mel: float = 4.0      # relaxed from 5.0 so speaker-envelope shifts are not over-punished by self L1
   lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
   lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
   lambda_var: float = 30.0     # Raised from 4.0 to overcome L1 dominance and force the learnable scale to grow
@@ -155,10 +155,10 @@ class TrainingConfig:
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
   cross_pair_prob: float = 1.0           # probability of applying cross-pair in a batch (increased for decisive diagnostic)
-  cross_pair_stats_weight: float = 2.0   # weight multiplier for cross-pair Mel Stats loss
+  cross_pair_stats_weight: float = 5.0   # stronger zero-shot timbre pressure
 
   # Speaker classifier head at decoder bottleneck
-  classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID (block2 + block3)
+  classifier_weight: float = 0.8         # stronger speaker-preservation pressure through decoder/mel stages
   mel_classifier_weight: float = 0.0   # disabled: per-frame mel Conv1d CE caused upstream regression
   pooled_mel_ce_weight: float = 0.0    # disabled: pooled CE gradient competes with new spk_film_classifier; MelSpeakerAffine kept as passive backup
 
