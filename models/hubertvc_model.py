@@ -177,9 +177,8 @@ class HubertVCModel(nn.Module):
             nn.init.zeros_(self.mel_classifier.bias)
             print(f"[HubertVCModel] Mel classifier: Conv1d(80, {num_speakers}, k=1) → {num_speakers * 81:,} params")
 
-            # Pooled mel-bias classifier: time-pooled → Linear(80, num_speakers) → CE
-            # Operates on post-bias, pre-clamp mel to directly train MelSpeakerAffine.
-            # Pooled (not per-frame) to match time-invariant bias structure.
+            # Pooled mel classifier: time-pooled -> Linear(80, num_speakers) -> CE.
+            # Disabled by default; retained only for optional mel-level supervision.
             self.pooled_mel_classifier = nn.Linear(80, num_speakers)
             nn.init.xavier_uniform_(self.pooled_mel_classifier.weight, gain=0.2)
             nn.init.zeros_(self.pooled_mel_classifier.bias)
@@ -492,7 +491,7 @@ class HubertVCModel(nn.Module):
 
             # Spk_film classifier (post-mel_proj): forces mel_proj to preserve
             # speaker information. Taps at prebias_mel (intermediate[-2]) which is
-            # the 80-dim mel AFTER out_scale, BEFORE mel_speaker_affine.
+            # the 80-dim mel AFTER out_scale, before clamp.
             # CE gradient flows: classifier → prebias_mel → out_scale → mel_proj →
             # speaker_film → speaker tokens. This directly counters mel_proj's
             # L1-driven tendency to erase speaker variation.

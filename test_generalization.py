@@ -89,8 +89,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     with torch.no_grad():
         w = model.decoder.mel_proj.weight  # [80, 96, 1]
         w_norm = w.squeeze(-1).norm(p=2, dim=0)  # [96] per-input-channel L2
-        low_chans = w_norm[:80]   # channels 0-79 (identity-init)
-        high_chans = w_norm[80:]  # channels 80-95 (zero-init)
+        low_chans = w_norm[:80]   # channels 0-79
+        high_chans = w_norm[80:]  # channels 80-95
         print(f"  Input channels 0-79:  mean L2={low_chans.mean():.6f}, max={low_chans.max():.6f}, min={low_chans.min():.6f}")
         print(f"  Input channels 80-95: mean L2={high_chans.mean():.6f}, max={high_chans.max():.6f}, min={high_chans.min():.6f}")
         ratio = high_chans.mean() / (low_chans.mean() + 1e-8)
@@ -106,11 +106,11 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Output channels with |w_hi| > 0.01: {n_active}/80")
         print(f"  [VERDICT] ", end="")
         if w_to_hi.max() < 0.005:
-            print("Channels 80-95 are DEAD. Gradient starvation via identity shortcut confirmed.")
+            print("Channels 80-95 are DEAD. Tail-channel speaker signal is blocked.")
         elif ratio < 0.05:
             print("Channels 80-95 are SEVERELY STARVED. Near-zero recruitment.")
         elif ratio < 0.2:
-            print("Channels 80-95 are WEAK. Partial recruitment, gradient competition with identity path.")
+            print("Channels 80-95 are WEAK. Tail-channel speaker signal is underused.")
         else:
             print("Channels 80-95 are ACTIVE. Erosion has a different cause.")
     print("="*70)
@@ -194,7 +194,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.speaker_film._verbose = False
     model.decoder.block3_id_film._verbose = False
     model.decoder.adapter_speaker_film._verbose = False
-    model.decoder.mel_speaker_affine._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -316,7 +315,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         chan_diff = (film_AA - film_AB).abs().mean(dim=-1).squeeze(0)  # [96]
         _, rank_order = chan_diff.sort(descending=True)
         low_diff = chan_diff[:80]   # channels 0-79 (identity path)
-        high_diff = chan_diff[80:]  # channels 80-95 (zero-init path)
+        high_diff = chan_diff[80:]  # channels 80-95 (tail channels)
         print(f"  Mean divergence ch 0-79:  {low_diff.mean():.6f}")
         print(f"  Mean divergence ch 80-95: {high_diff.mean():.6f}")
         print(f"  Ratio (80-95 / 0-79):     {high_diff.mean()/(low_diff.mean()+1e-8):.4f}")
@@ -326,11 +325,11 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Top-16 channel indices (sorted): {sorted(top16)}")
         print(f"  Top-10 per-channel divergences:")
         for rank_idx, ch_idx in enumerate(rank_order[:10].tolist()):
-            zone = " ← ZERO-INIT (80-95)" if ch_idx >= 80 else ""
+            zone = " <- tail ch 80-95" if ch_idx >= 80 else ""
             print(f"    #{rank_idx+1}: ch {ch_idx:3d}  div={chan_diff[ch_idx]:.6f}{zone}")
         print(f"  [VERDICT] ", end="")
         if in_high >= 8:
-            print("Speaker info CONCENTRATED in ch 80-95. Identity-init mel_proj is structurally wrong.")
+            print("Speaker info CONCENTRATED in ch 80-95. mel_proj must preserve tail-channel speaker signal.")
         elif in_high >= 3:
             print("Speaker info MIXED across channel groups. mel_proj partially usable but erodes high channels.")
         else:
@@ -388,13 +387,9 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_scaled_AA = mel_centered_AA * out_scale_AA + mel_band_mean_AA + model.decoder.out_bias
         mel_scaled_AB = mel_centered_AB * out_scale_AB + mel_band_mean_AB + model.decoder.out_bias
 
-        # ── mel_spk_affine: speaker-conditioned bias AFTER out_scale ──
-        mel_affine_AA = model.decoder.mel_speaker_affine(mel_scaled_AA, spk_A_t)
-        mel_affine_AB = model.decoder.mel_speaker_affine(mel_scaled_AB, spk_B_t)
-
         # ── mel_scaled_final: after clamp (final model output) ──
-        mel_final_AA = torch.clamp(mel_affine_AA, min=-11.5, max=2.0)
-        mel_final_AB = torch.clamp(mel_affine_AB, min=-11.5, max=2.0)
+        mel_final_AA = torch.clamp(mel_scaled_AA, min=-11.5, max=2.0)
+        mel_final_AB = torch.clamp(mel_scaled_AB, min=-11.5, max=2.0)
 
         stages = [
             ("cross_attn", fused_AA, fused_AB),
@@ -409,8 +404,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
             ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # monolithic Conv1d(96→80)
-            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after out_scale (pre-spkr-bias)
-            ("mel_spk_affine", mel_affine_AA, mel_affine_AB),      # after speaker bias
+            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after out_scale
             ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
         ]
         print(f"  {'Stage':<17} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
@@ -434,7 +428,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.speaker_film._verbose = True
     model.decoder.block3_id_film._verbose = True
     model.decoder.adapter_speaker_film._verbose = True
-    model.decoder.mel_speaker_affine._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────
@@ -465,99 +458,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("="*70)
     # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-    # ═══════════════════════════════════════════════════════════════════
-    # DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)
-    # ═══════════════════════════════════════════════════════════════════
-    print("\n" + "="*70)
-    print("🔬 DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)")
-    print("="*70)
-
-    # Suppress verbose prints during gradient pass
-    saved_verbose = {}
-    for name in ['_verbose', 'cross_attn', 'decoder', 'speaker_film',
-                 'block3_id_film', 'adapter_speaker_film', 'mel_speaker_affine']:
-        if name == '_verbose':
-            saved_verbose[name] = model._verbose
-            model._verbose = False
-        elif name == 'cross_attn':
-            saved_verbose[name] = model.cross_attn._verbose
-            model.cross_attn._verbose = False
-        elif name == 'decoder':
-            saved_verbose[name] = model.decoder._verbose
-            model.decoder._verbose = False
-            for blk in model.decoder.blocks:
-                blk._verbose = False
-        elif name == 'speaker_film':
-            saved_verbose[name] = model.decoder.speaker_film._verbose
-            model.decoder.speaker_film._verbose = False
-        elif name == 'block3_id_film':
-            saved_verbose[name] = model.decoder.block3_id_film._verbose
-            model.decoder.block3_id_film._verbose = False
-        elif name == 'adapter_speaker_film':
-            saved_verbose[name] = model.decoder.adapter_speaker_film._verbose
-            model.decoder.adapter_speaker_film._verbose = False
-        elif name == 'mel_speaker_affine':
-            saved_verbose[name] = model.decoder.mel_speaker_affine._verbose
-            model.decoder.mel_speaker_affine._verbose = False
-
-    aff = model.decoder.mel_speaker_affine
-
-    # Freeze all model parameters, enable grad only on mel_spk_affine
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in aff.parameters():
-        p.requires_grad = True
-
-    # Forward: A→A self-reconstruction with grad tracking
-    pred_AA_grad, _, _ = model(ref_A.unsqueeze(0), [content_A])
-    gt_mel_grad = extract_mel_spectrogram(content_A, sample_rate=audio_cfg.sample_rate).unsqueeze(0).to(device)
-
-    # Trim to min length
-    min_len = min(pred_AA_grad.shape[-1], gt_mel_grad.shape[-1])
-    pred_AA_grad = pred_AA_grad[:, :, :min_len]
-    gt_mel_grad = gt_mel_grad[:, :, :min_len]
-
-    # L1 loss + backward
-    l1_loss = torch.nn.functional.l1_loss(pred_AA_grad, gt_mel_grad)
-    l1_loss.backward()
-
-    # Log gradient norms
-    mlp0 = aff.mlp[0]   # Linear(96, 96)
-    mlp2 = aff.mlp[2]   # Linear(96, 80)
-    print(f"  L1 loss value: {l1_loss.item():.6f}")
-    print(f"  --- Gradient norms (L2) ---")
-    if mlp0.weight.grad is not None:
-        print(f"  mlp[0].weight (96→96):       {mlp0.weight.grad.norm():.6f}")
-    else:
-        print(f"  mlp[0].weight (96→96):       NO GRADIENT")
-    if mlp2.weight.grad is not None:
-        print(f"  mlp[2].weight (96→80):       {mlp2.weight.grad.norm():.6f}")
-    else:
-        print(f"  mlp[2].weight (96→80):       NO GRADIENT")
-    if mlp2.bias.grad is not None:
-        print(f"  mlp[2].bias (80):            {mlp2.bias.grad.norm():.6f}")
-    
-    if hasattr(aff, 'raw_delta_scale') and aff.raw_delta_scale.grad is not None:
-        ds_grad_val = aff.raw_delta_scale.grad.item()
-        print(f"  raw_delta_scale grad:        {ds_grad_val:+.6f}")
-        print(f"  [VERDICT] ", end="")
-        if ds_grad_val < -0.0001:
-            print("L1 PUSHES delta_scale DOWN. L1 actively suppresses speaker envelope shifts.")
-        elif ds_grad_val > 0.0001:
-            print("L1 pushes delta_scale UP. L1 actually wants more spectral shift.")
-        else:
-            print("L1 gradient on delta_scale is NEAR ZERO.")
-    else:
-        print(f"  raw_delta_scale grad:        NO GRADIENT (or missing)")
-        print(f"  [VERDICT] Cannot determine.")
-
-    # Cleanup
-    model.zero_grad()
-    for p in aff.parameters():
-        p.requires_grad = False
-    # Restore model to eval-appropriate state (params stay frozen)
-    del pred_AA_grad, gt_mel_grad, l1_loss
-    print("="*70)
 
     print("\n" + "="*60)
     print("\U0001f4cb LISTENING GUIDE:")
