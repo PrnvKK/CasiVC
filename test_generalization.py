@@ -78,7 +78,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.eval()
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
-    print("✅ Model loaded.")
+    model.decoder.spk_out_scale.disabled = True
+    print("✅ Model loaded with spk_out_scale disabled for inference.")
 
     # ═══════════════════════════════════════════════════════════════════
     # DIAGNOSTIC 2: mel_proj weight channel utilization
@@ -194,6 +195,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.speaker_film._verbose = False
     model.decoder.block3_id_film._verbose = False
     model.decoder.adapter_speaker_film._verbose = False
+    model.decoder.spk_out_scale._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -375,10 +377,10 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
         mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
 
-        # ── mel_scaled: after unconditioned out_scale ──
-        out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
-        out_scale_AA = out_scale
-        out_scale_AB = out_scale
+        # ── mel_scaled: after speaker-conditioned out_scale ──
+        base_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
+        out_scale_AA = model.decoder.spk_out_scale(base_scale, spk_A_t)  # [1, 80, 1]
+        out_scale_AB = model.decoder.spk_out_scale(base_scale, spk_B_t)  # [1, 80, 1]
 
         mel_band_mean_AA = mel_proj_raw_AA.mean(dim=-1, keepdim=True)
         mel_band_mean_AB = mel_proj_raw_AB.mean(dim=-1, keepdim=True)
@@ -388,8 +390,65 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_scaled_AB = mel_centered_AB * out_scale_AB + mel_band_mean_AB + model.decoder.out_bias
 
         # ── mel_scaled_final: after clamp (final model output) ──
+        # mel_speaker_affine DISABLED: no longer in forward pass
         mel_final_AA = torch.clamp(mel_scaled_AA, min=-11.5, max=2.0)
         mel_final_AB = torch.clamp(mel_scaled_AB, min=-11.5, max=2.0)
+
+        print("\n" + "-"*60)
+        print("🔬 DIAGNOSTIC 5: Per-band std ratio A vs B before/after out_scale")
+        print("-" * 60)
+        std_raw_A = mel_proj_raw_AA.std(dim=-1).squeeze(0)
+        std_raw_B = mel_proj_raw_AB.std(dim=-1).squeeze(0)
+        std_scaled_A = mel_scaled_AA.std(dim=-1).squeeze(0)
+        std_scaled_B = mel_scaled_AB.std(dim=-1).squeeze(0)
+        ratio_raw = std_raw_A / (std_raw_B + 1e-8)
+        ratio_scaled = std_scaled_A / (std_scaled_B + 1e-8)
+        print(f"  Mean per-band std ratio (A/B) BEFORE out_scale (mel_proj_raw): {ratio_raw.mean():.4f}")
+        print(f"  Mean per-band std ratio (A/B) AFTER  out_scale (mel_scaled):   {ratio_scaled.mean():.4f}")
+        print("-" * 60)
+
+        print("\n" + "-"*60)
+        print("🔬 DIAGNOSTIC 6: Spectral Tilt / Per-band Mean Error vs GT")
+        print("-" * 60)
+        
+        # Quick forward pass for BB to get intermediate mels
+        cont_B_t = model.info_bottleneck(model.hubert_proj(model.hubert([content_B.to(device)])))
+        fused_BB = model.cross_attn(cont_B_t, spk_B_t)
+        tgt_len_B = gt_mel_B.shape[-1]
+        resampled_BB = model.temporal_resampler(fused_BB, target_length=tgt_len_B)
+        adapter_BB = model.decoder.adapter(resampled_BB.transpose(1, 2))
+        adapter_film_BB = model.decoder.adapter_speaker_film(adapter_BB, spk_B_t)
+        b0_BB = model.decoder.blocks[0](adapter_film_BB)
+        b1_BB = model.decoder.blocks[1](b0_BB)
+        b2_BB = model.decoder.blocks[2](b1_BB)
+        b3_body_BB = model.decoder.blocks[3].block(b2_BB)
+        b3_id_BB = model.decoder.blocks[3].residual_proj(b2_BB)
+        b3_id_film_BB = model.decoder.block3_id_film(b3_id_BB, spk_B_t)
+        block3_BB = model.decoder.blocks[3].residual_identity_scale * b3_id_film_BB + model.decoder.blocks[3].residual_scale * b3_body_BB
+        film_BB = model.decoder.speaker_film(block3_BB, spk_B_t)
+        mel_proj_raw_BB = model.decoder.mel_proj(film_BB)
+        mel_band_mean_BB = mel_proj_raw_BB.mean(dim=-1, keepdim=True)
+        mel_centered_BB = mel_proj_raw_BB - mel_band_mean_BB
+        out_scale_BB = model.decoder.spk_out_scale(base_scale, spk_B_t)
+        mel_scaled_BB = mel_centered_BB * out_scale_BB + mel_band_mean_BB + model.decoder.out_bias
+        
+        def get_tilt(pred, gt):
+            T = min(pred.shape[-1], gt.shape[-1])
+            p_mean = pred.squeeze(0)[:, :T].mean(dim=-1)
+            g_mean = gt.to(device)[:, :T].mean(dim=-1)
+            err = (p_mean - g_mean).abs()
+            return err.mean().item(), err[:40].mean().item(), err[40:].mean().item()
+
+        raw_AA_all, raw_AA_lo, raw_AA_hi = get_tilt(mel_proj_raw_AA, gt_mel_A)
+        scl_AA_all, scl_AA_lo, scl_AA_hi = get_tilt(mel_scaled_AA, gt_mel_A)
+        raw_BB_all, raw_BB_lo, raw_BB_hi = get_tilt(mel_proj_raw_BB, gt_mel_B)
+        scl_BB_all, scl_BB_lo, scl_BB_hi = get_tilt(mel_scaled_BB, gt_mel_B)
+
+        print(f"  A→A (Man)   | BEFORE out_scale:  All={raw_AA_all:.3f}, Lo(0-39)={raw_AA_lo:.3f}, Hi(40-79)={raw_AA_hi:.3f}")
+        print(f"  A→A (Man)   | AFTER  out_scale:  All={scl_AA_all:.3f}, Lo(0-39)={scl_AA_lo:.3f}, Hi(40-79)={scl_AA_hi:.3f}")
+        print(f"  B→B (Woman) | BEFORE out_scale:  All={raw_BB_all:.3f}, Lo(0-39)={raw_BB_lo:.3f}, Hi(40-79)={raw_BB_hi:.3f}")
+        print(f"  B→B (Woman) | AFTER  out_scale:  All={scl_BB_all:.3f}, Lo(0-39)={scl_BB_lo:.3f}, Hi(40-79)={scl_BB_hi:.3f}")
+        print("-" * 60)
 
         stages = [
             ("cross_attn", fused_AA, fused_AB),
@@ -404,7 +463,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
             ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # monolithic Conv1d(96→80)
-            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after out_scale
+            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after speaker-conditioned out_scale
             ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
         ]
         print(f"  {'Stage':<17} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
@@ -428,6 +487,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.speaker_film._verbose = True
     model.decoder.block3_id_film._verbose = True
     model.decoder.adapter_speaker_film._verbose = True
+    model.decoder.spk_out_scale._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────
