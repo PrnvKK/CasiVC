@@ -465,7 +465,12 @@ class VCGeneratorLoss(nn.Module):
                     T_common = min(pred_mel.size(-1), gt_mel.size(-1))
                     pred_std = pred_mel[:, :, :T_common].std(dim=-1)  # [B, 80]
                     tgt_std = gt_mel[:, :, :T_common].std(dim=-1)
-                l_var = F.l1_loss(pred_std, tgt_std)
+                l1_var = F.l1_loss(pred_std, tgt_std)
+                compression = F.relu(tgt_std - pred_std)
+                compression_penalty = compression.mean()
+                overexpansion = F.relu(pred_std - 1.10 * tgt_std)
+                overexpansion_penalty = overexpansion.mean()
+                l_var = l1_var + 2.0 * compression_penalty + 0.5 * overexpansion_penalty
                 outs["var"] = self.cfg.lambda_var * l_var
             except Exception as exc:
                 raise RuntimeError(f"Variance loss failed: {exc}") from exc

@@ -474,18 +474,12 @@ class HubertVCModel(nn.Module):
                 mel_logits = self.mel_classifier(mel_feats)  # [B, num_speakers, T]
                 aux["mel_classifier_logits"] = mel_logits
 
-            # Pooled mel-bias classifier: gated CE on bias-only component
-            # mel_for_ce = prebias.detach() + bias_only
-            # This forces CE gradient to flow ONLY through the bias MLP,
-            # preventing the classifier from using residual speaker info in
-            # the content mel as a shortcut (which left the bias near-identity
-            # in the ungated version at weight 0.05).
+            # Pooled mel CE: direct speaker supervision on mel_proj output.
+            # Sends CE gradient straight through mel_proj to force it to
+            # preserve speaker variation (counters L1-driven averaging).
             if self.pooled_mel_classifier is not None and len(intermediate) > 5:
-                prebias_mel = intermediate[-2]   # [B, 80, T] before speaker bias
-                postbias_mel = intermediate[-1]  # [B, 80, T] after speaker bias
-                bias_only = postbias_mel - prebias_mel  # [B, 80, T] the speaker bias
-                mel_for_ce = prebias_mel.detach() + bias_only  # gradient only through bias
-                mel_pooled = mel_for_ce.mean(dim=-1)  # [B, 80] pooled over time
+                prebias_mel = intermediate[-2]   # [B, 80, T] post-out_scale
+                mel_pooled = prebias_mel.mean(dim=-1)  # [B, 80]
                 pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)  # [B, num_speakers]
                 aux["pooled_mel_logits"] = pooled_mel_logits
 
