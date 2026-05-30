@@ -263,17 +263,16 @@ class SpeakerFiLM(nn.Module):
 
 
 class MelSpeakerAffine(nn.Module):
-    """Speaker residual delta applied AFTER out_scale.
+    """Speaker-conditioned FiLM applied AFTER out_scale (pre-clamp).
 
-    Instead of a full FiLM (scale+shift) that scales the entire mel
-    (which can homogenize content across speakers to satisfy L1), this
-    module purely learns an ADDITIVE spectral envelope shift per speaker.
-    
-    mel = mel + delta_scale * tanh(speaker_raw)
-    
-    This gives the speaker module a much cleaner mathematical role: 
-    add target-speaker spectral characteristics without rescaling the 
-    underlying content dynamics.
+    Previous additive-only design could only shift spectral means — it
+    could NOT fix per-speaker variance ratio (σ-ratio stuck at ~0.88).
+    Full FiLM (scale+shift) gives per-band gamma to address dynamic
+    range and per-band beta to address spectral tilt / formant shape.
+
+    mel = mel * (1 + gamma) + beta
+    gamma: ELU-bounded so (1+gamma) ≥ 0 (inversion guard)
+    beta:  bounded by film_scale (additive shift, no explosion risk)
     """
     def __init__(self, speaker_dim: int = 96, n_mel_bands: int = 80):
         super().__init__()
@@ -283,7 +282,7 @@ class MelSpeakerAffine(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(speaker_dim, speaker_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(speaker_dim, n_mel_bands),  # speaker_raw
+            nn.Linear(speaker_dim, n_mel_bands * 2),
         )
 
         with torch.no_grad():
@@ -292,9 +291,7 @@ class MelSpeakerAffine(nn.Module):
                     nn.init.xavier_uniform_(m.weight, gain=0.2)
                     nn.init.zeros_(m.bias)
 
-        # Learnable amplitude for the delta.
-        # softplus(0) + 0.1 ≈ 0.79 max amplitude.
-        self.raw_delta_scale = nn.Parameter(torch.tensor(0.0))
+        self.raw_film_scale = nn.Parameter(torch.tensor(0.0))
 
         self._verbose = True
 
@@ -304,32 +301,35 @@ class MelSpeakerAffine(nn.Module):
             mel:           [B, 80, T] mel after out_scale (pre-clamp)
             speaker_feats: [B, num_tokens, speaker_dim] speaker tokens
         Returns:
-            mel + speaker_delta: [B, 80, T]
+            FiLM-conditioned mel: [B, 80, T]
         """
-        # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
         spk_pooled = speaker_feats.mean(dim=1)
 
-        # Generate raw delta
-        speaker_raw = self.mlp(spk_pooled)                       # [B, 80]
+        film_params = self.mlp(spk_pooled)
+        gamma, beta = film_params.chunk(2, dim=-1)
 
-        # Learnable scale (softplus reparam, min 0.1 authority)
-        delta_scale = F.softplus(self.raw_delta_scale) + 0.1
-        
-        # Bounded additive delta
-        speaker_delta = delta_scale * torch.tanh(speaker_raw)    # [B, 80]
+        film_scale = F.softplus(self.raw_film_scale) + 0.5
 
-        # Reshape for broadcasting over temporal dim: [B, 80, 1]
-        speaker_delta = speaker_delta.unsqueeze(-1)
+        gamma = F.elu(gamma * film_scale)
+        beta = beta * film_scale
+
+        gamma = gamma.unsqueeze(-1)
+        beta = beta.unsqueeze(-1)
 
         if self._verbose:
-            d = speaker_delta.squeeze(-1)  # [B, 80]
-            self._last_gamma_std = d.std().item()  # stored for audit to prevent crash
-            print(f"[mel_spk_affine] delta_scale: {delta_scale.item():.4f}")
-            print(f"[mel_spk_affine] speaker_delta: mean={d.mean():.4f}, std={d.std():.4f}, "
-                  f"min={d.min():.4f}, max={d.max():.4f}")
+            g = gamma.squeeze(-1)
+            b = beta.squeeze(-1)
+            self._last_gamma_std = g.std().item()
+            self._last_beta_std = b.std().item()
+            self._last_film_scale = film_scale.item()
+            print(f"[mel_spk_affine] film_scale: {film_scale.item():.4f}")
+            print(f"[mel_spk_affine] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
+                  f"min={g.min():.4f}, max={g.max():.4f}")
+            print(f"[mel_spk_affine] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
+                  f"min={b.min():.4f}, max={b.max():.4f}")
+            print(f"[mel_spk_affine] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
 
-        # Additive residual
-        mel = mel + speaker_delta
+        mel = mel * (1.0 + gamma) + beta
         return mel
 
 
@@ -615,19 +615,23 @@ class MobileNetDecoder(nn.Module):
             n_mel_bands=80,                                 # 80 mel bands
         )
 
-        # Per-band output scale — SOFTPLUS reparametrised so scale can NEVER collapse.
-        # Previously out_scale=1.0 (linear) was pulled back toward 1.0 by L1 mel loss
-        # faster than lambda_var=30 could push it up, leaving mel σ at 1.4 vs target 2.5.
-        # Now: out_scale = softplus(raw_out_scale) + 1.5  →  always > 1.5, init ≈ 2.19
-        # This gives variance loss a structural head-start it cannot lose to L1 regression.
-        self.raw_out_scale = nn.Parameter(torch.zeros(1, 80, 1))  # softplus(0) ≈ 0.693 → scale init ≈ 2.19
+        self.raw_out_scale = nn.Parameter(torch.zeros(1, 80, 1))
 
-        # Per-band output bias: handles spectral tilt / per-band mean offset
-        # independently of variance scaling.
         self.out_bias = nn.Parameter(torch.zeros(1, 80, 1))
 
-        # Speaker-conditioned out_scale modulation removed to prevent gradient competition
-        # with mel_spk_affine. out_scale is now purely an unconditional variance amplifier.
+        self.out_scale_spk_mlp = nn.Sequential(
+            nn.Linear(config.speaker_projection_dim, config.speaker_projection_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(config.speaker_projection_dim, 80),
+        )
+        with torch.no_grad():
+            for m in self.out_scale_spk_mlp.modules():
+                if isinstance(m, nn.Linear):
+                    if m.out_features == 80:
+                        nn.init.xavier_uniform_(m.weight, gain=0.01)
+                    else:
+                        nn.init.xavier_uniform_(m.weight, gain=0.2)
+                    nn.init.zeros_(m.bias)
 
         self._verbose = True  # set False to suppress per-call debug prints
 
@@ -789,43 +793,49 @@ class MobileNetDecoder(nn.Module):
         # (mel_speaker_affine after out_scale).
         mel = self.mel_proj(x)  # [B, 80, T]
 
-        # ── Decoder output diagnostics ──────────────────────────────────
-        # We log three stages separately: (1) raw conv output, (2) after
-        # per-band out_scale, (3) after clamp.  This isolates whether the
-        # mel variance deficit comes from the conv backbone, insufficient
-        # out_scale growth, or clamp compression.
-        # Compute effective out_scale via softplus reparametrisation (always > 1.5).
-        # Speaker-conditioned modulation injects per-band scaling deltas bounded
-        # by ±0.35 via tanh, blending a learnable gain with a zero-init MLP
-        # so behaviour starts identical to the unconditional out_scale.
-        out_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
+        # ── Speaker-conditioned out_scale ──────────────────────────────────
+        # Base scale is unconditional (global anchor, preserves existing behaviour).
+        # Speaker delta adds per-band variance correction: B needs more amplitude
+        # than A (σ-ratio was stuck at ~0.88-0.93). Bounded by ±0.25 via tanh
+        # so the delta cannot invert any band or blow up. Init near zero (gain=0.01
+        # on last layer) so first epoch is almost identical to unconditional-only.
+        base_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
+
+        if speaker_feats is not None:
+            spk_pooled = speaker_feats.mean(dim=1)                          # [B, 96]
+            spk_delta_raw = self.out_scale_spk_mlp(spk_pooled)             # [B, 80]
+            spk_delta = 0.25 * torch.tanh(spk_delta_raw)                   # [B, 80], bounded [-0.25, 0.25]
+            out_scale = base_scale * (1.0 + spk_delta.unsqueeze(-1))       # [B, 80, 1]
+        else:
+            out_scale = base_scale                                         # [1, 80, 1]
+            spk_delta = None
 
         out_bias_vals  = self.out_bias.squeeze()            # [80]
-        out_scale_vals = out_scale.squeeze()                # [B, 80] or [80]
-        v = self._verbose
-        if v:
-            print(f"[decoder] out_scale (softplus+1.5): mean={out_scale_vals.float().mean().item():.4f}, "
+        if self._verbose:
+            out_scale_vals = out_scale.squeeze()
+            if out_scale_vals.dim() == 1:
+                out_scale_vals = out_scale_vals.unsqueeze(0)
+            print(f"[decoder] out_scale (base+spk): mean={out_scale_vals.float().mean().item():.4f}, "
                   f"min={out_scale_vals.float().min().item():.4f}, max={out_scale_vals.float().max().item():.4f}")
             print(f"[decoder] raw_out_scale: mean={self.raw_out_scale.mean().item():.4f}")
+            if spk_delta is not None:
+                d = spk_delta.detach()
+                print(f"[decoder] spk_delta: mean={d.mean().item():.4f}, std={d.std().item():.4f}, "
+                      f"min={d.min().item():.4f}, max={d.max().item():.4f}")
             print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
                   f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
 
         mel_pre_scale_std = mel.std().item()
         mel_pre_scale_mean = mel.mean().item()
-        if v: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
+        if self._verbose: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
         # DECOUPLED SCALING: center per-band temporal mean so out_scale is a PURE variance knob.
-        # Previously: mel * out_scale + bias  →  increasing out_scale also shifts mean,
-        # causing L1 gradient to fight the variance gradient (net ≈ 0, scale frozen).
-        # Now: out_scale only amplifies the deviation from each band's own mean.
-        # L1 gradient on out_scale ≈ 0 (centered input is symmetric around 0).
-        # Variance gradient is uncontested → raw_out_scale can grow freely.
-        mel_band_mean = mel.mean(dim=-1, keepdim=True)       # [B, 80, 1] per-band temporal mean
-        mel_centered  = mel - mel_band_mean                   # zero-mean per band per utterance
+        mel_band_mean = mel.mean(dim=-1, keepdim=True)
+        mel_centered  = mel - mel_band_mean
         mel_scaled    = mel_centered * out_scale + mel_band_mean + self.out_bias
         mel_post_scale_std = mel_scaled.std().item()
         mel_post_scale_mean = mel_scaled.mean().item()
-        if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
+        if self._verbose: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
         # ── Post-out_scale speaker FiLM: scale+shift after both erasure points ──
         # Injects speaker identity AFTER out_scale (which dilutes any
@@ -847,10 +857,10 @@ class MobileNetDecoder(nn.Module):
 
         clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 2.0)
         clamp_pct = clamp_mask.float().mean().item() * 100
-        if v: print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
+        if self._verbose: print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
 
         # ── Decoder output audit ──
-        if v:
+        if self._verbose:
             print(f"[audit] speaker_film gamma std: {getattr(self.speaker_film, '_last_gamma_std', 'N/A')}")
 
         self._check(mel, "mel_proj")

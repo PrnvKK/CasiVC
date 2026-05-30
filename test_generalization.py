@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn.functional as F
 import torchaudio
 import argparse
 from pathlib import Path
@@ -343,10 +344,26 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
         mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
 
-        # ── mel_scaled: after unconditioned out_scale ──
-        out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
-        out_scale_AA = out_scale
-        out_scale_AB = out_scale
+        # ── mel_scaled: after speaker-conditioned out_scale ──
+        base_scale = F.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
+        spk_A_pooled = spk_A_t.mean(dim=1)
+        spk_B_pooled = spk_B_t.mean(dim=1)
+        spk_delta_raw_A = model.decoder.out_scale_spk_mlp(spk_A_pooled)  # [B, 80]
+        spk_delta_raw_B = model.decoder.out_scale_spk_mlp(spk_B_pooled)
+        spk_delta_A = 0.25 * torch.tanh(spk_delta_raw_A)
+        spk_delta_B = 0.25 * torch.tanh(spk_delta_raw_B)
+        out_scale_AA = base_scale * (1.0 + spk_delta_A.unsqueeze(-1))
+        out_scale_AB = base_scale * (1.0 + spk_delta_B.unsqueeze(-1))
+
+        print(f"\n  [out_scale spk_delta AUDIT]")
+        print(f"  spk_delta_A: mean={spk_delta_A.mean():.4f}, std={spk_delta_A.std():.4f}, "
+              f"min={spk_delta_A.min():.4f}, max={spk_delta_A.max():.4f}")
+        print(f"  spk_delta_B: mean={spk_delta_B.mean():.4f}, std={spk_delta_B.std():.4f}, "
+              f"min={spk_delta_B.min():.4f}, max={spk_delta_B.max():.4f}")
+        print(f"  spk_delta L1 divergence (A vs B): {(spk_delta_A - spk_delta_B).abs().mean():.6f}")
+        print(f"  out_scale_A: mean={out_scale_AA.mean():.4f}, min={out_scale_AA.min():.4f}, max={out_scale_AA.max():.4f}")
+        print(f"  out_scale_B: mean={out_scale_AB.mean():.4f}, min={out_scale_AB.min():.4f}, max={out_scale_AB.max():.4f}")
+        print(f"  out_scale ratio B/A: {(out_scale_AB.mean() / out_scale_AA.mean()).item():.4f}")
 
         mel_band_mean_AA = mel_proj_raw_AA.mean(dim=-1, keepdim=True)
         mel_band_mean_AB = mel_proj_raw_AB.mean(dim=-1, keepdim=True)
@@ -355,7 +372,30 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_scaled_AA = mel_centered_AA * out_scale_AA + mel_band_mean_AA + model.decoder.out_bias
         mel_scaled_AB = mel_centered_AB * out_scale_AB + mel_band_mean_AB + model.decoder.out_bias
 
-        # ── mel_spk_affine: speaker-conditioned bias AFTER out_scale ──
+        # ── mel_spk_affine: FiLM (scale+shift) AFTER out_scale ──
+        # spk_A_pooled / spk_B_pooled already computed above
+        aff = model.decoder.mel_speaker_affine
+        with torch.no_grad():
+            film_params_A = aff.mlp(spk_A_pooled)
+            film_params_B = aff.mlp(spk_B_pooled)
+            gamma_A, beta_A = film_params_A.chunk(2, dim=-1)
+            gamma_B, beta_B = film_params_B.chunk(2, dim=-1)
+            film_scale_val = (F.softplus(aff.raw_film_scale) + 0.5).item()
+            gamma_A_scaled = F.elu(gamma_A * film_scale_val)
+            gamma_B_scaled = F.elu(gamma_B * film_scale_val)
+            beta_A_scaled = beta_A * film_scale_val
+            beta_B_scaled = beta_B * film_scale_val
+            print(f"\n  [mel_spk_affine FiLM DIVERGENCE AUDIT]")
+            print(f"  film_scale: {film_scale_val:.4f}")
+            print(f"  gamma divergence (L1 per band): {(gamma_A_scaled - gamma_B_scaled).abs().mean():.6f}")
+            print(f"  gamma_A: mean={gamma_A_scaled.mean():.4f}, std={gamma_A_scaled.std():.4f}")
+            print(f"  gamma_B: mean={gamma_B_scaled.mean():.4f}, std={gamma_B_scaled.std():.4f}")
+            print(f"  (1+gamma)_A: mean={(1+gamma_A_scaled).mean():.4f}, range=[{(1+gamma_A_scaled).min():.4f}, {(1+gamma_A_scaled).max():.4f}]")
+            print(f"  (1+gamma)_B: mean={(1+gamma_B_scaled).mean():.4f}, range=[{(1+gamma_B_scaled).min():.4f}, {(1+gamma_B_scaled).max():.4f}]")
+            print(f"  beta divergence  (L1 per band): {(beta_A_scaled - beta_B_scaled).abs().mean():.6f}")
+            print(f"  beta_A:  mean={beta_A_scaled.mean():.4f}, std={beta_A_scaled.std():.4f}")
+            print(f"  beta_B:  mean={beta_B_scaled.mean():.4f}, std={beta_B_scaled.std():.4f}")
+
         mel_affine_AA = model.decoder.mel_speaker_affine(mel_scaled_AA, spk_A_t)
         mel_affine_AB = model.decoder.mel_speaker_affine(mel_scaled_AB, spk_B_t)
 
@@ -420,10 +460,10 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     # ═══════════════════════════════════════════════════════════════════
-    # DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)
+    # DIAGNOSTIC 3: mel_spk_affine FiLM gradient decomposition (L1 loss)
     # ═══════════════════════════════════════════════════════════════════
     print("\n" + "="*70)
-    print("🔬 DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)")
+    print("🔬 DIAGNOSTIC 3: mel_spk_affine FiLM gradient decomposition (L1 loss)")
     print("="*70)
 
     # Suppress verbose prints during gradient pass
@@ -455,11 +495,14 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             model.decoder.mel_speaker_affine._verbose = False
 
     aff = model.decoder.mel_speaker_affine
+    osc = model.decoder.out_scale_spk_mlp
 
-    # Freeze all model parameters, enable grad only on mel_spk_affine
+    # Freeze all model parameters, enable grad on mel_spk_affine + out_scale_spk_mlp
     for p in model.parameters():
         p.requires_grad = False
     for p in aff.parameters():
+        p.requires_grad = True
+    for p in osc.parameters():
         p.requires_grad = True
 
     # Forward: A→A self-reconstruction with grad tracking
@@ -477,29 +520,47 @@ def test_generalization(checkpoint_path: str, output_dir: str):
 
     # Log gradient norms
     mlp0 = aff.mlp[0]   # Linear(96, 96)
-    mlp2 = aff.mlp[2]   # Linear(96, 80)
+    mlp2 = aff.mlp[2]   # Linear(96, 160) — gamma(80) + beta(80)
     print(f"  L1 loss value: {l1_loss.item():.6f}")
     print(f"  --- Gradient norms (L2) ---")
     if mlp0.weight.grad is not None:
-        print(f"  mlp[0].weight (96→96):       {mlp0.weight.grad.norm():.6f}")
+        print(f"  mlp[0].weight (96→96):        {mlp0.weight.grad.norm():.6f}")
     else:
-        print(f"  mlp[0].weight (96→96):       NO GRADIENT")
+        print(f"  mlp[0].weight (96→96):        NO GRADIENT")
     if mlp2.weight.grad is not None:
-        print(f"  mlp[2].weight (96→80):       {mlp2.weight.grad.norm():.6f}")
+        print(f"  mlp[2].weight (96→160):        {mlp2.weight.grad.norm():.6f}")
     else:
-        print(f"  mlp[2].weight (96→80):       NO GRADIENT")
+        print(f"  mlp[2].weight (96→160):        NO GRADIENT")
     if mlp2.bias.grad is not None:
-        print(f"  mlp[2].bias (80):            {mlp2.bias.grad.norm():.6f}")
+        print(f"  mlp[2].bias (160):             {mlp2.bias.grad.norm():.6f}")
     
-    if hasattr(aff, 'raw_delta_scale') and aff.raw_delta_scale.grad is not None:
-        ds_grad_val = aff.raw_delta_scale.grad.item()
-        print(f"  raw_delta_scale grad:        {ds_grad_val:+.6f}")
+    if hasattr(aff, 'raw_film_scale') and aff.raw_film_scale.grad is not None:
+        fs_grad_val = aff.raw_film_scale.grad.item()
+        print(f"  raw_film_scale grad:          {fs_grad_val:+.6f}")
     else:
-        print(f"  raw_delta_scale grad:        NO GRADIENT (or missing)")
+        print(f"  raw_film_scale grad:          NO GRADIENT (or missing)")
+
+    print(f"  --- out_scale_spk_mlp gradient norms (L2) ---")
+    osc0 = osc[0]  # Linear(96, 96)
+    osc2 = osc[2]  # Linear(96, 80)
+    if osc0.weight.grad is not None:
+        print(f"  osc_mlp[0].weight (96→96):    {osc0.weight.grad.norm():.6f}")
+    else:
+        print(f"  osc_mlp[0].weight (96→96):    NO GRADIENT")
+    if osc2.weight.grad is not None:
+        print(f"  osc_mlp[2].weight (96→80):    {osc2.weight.grad.norm():.6f}")
+    else:
+        print(f"  osc_mlp[2].weight (96→80):    NO GRADIENT")
+    if osc2.bias.grad is not None:
+        print(f"  osc_mlp[2].bias (80):         {osc2.bias.grad.norm():.6f}")
+    else:
+        print(f"  osc_mlp[2].bias (80):         NO GRADIENT")
 
     # Cleanup
     model.zero_grad()
     for p in aff.parameters():
+        p.requires_grad = False
+    for p in osc.parameters():
         p.requires_grad = False
     # Restore model to eval-appropriate state (params stay frozen)
     del pred_AA_grad, gt_mel_grad, l1_loss
