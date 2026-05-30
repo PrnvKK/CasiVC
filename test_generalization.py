@@ -78,6 +78,16 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.eval()
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
+    model._verbose = False
+    model.cross_attn._verbose = False
+    model.decoder._verbose = False
+    model.decoder.speaker_film._verbose = False
+    model.decoder.block3_id_film._verbose = False
+    model.decoder.adapter_speaker_film._verbose = False
+    model.decoder.mel_speaker_affine._verbose = False
+    for blk in model.decoder.blocks:
+        blk._verbose = False
+    model.mel_encoder._verbose = False
     print("✅ Model loaded.")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -104,15 +114,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         # How many output channels have meaningful high-channel utilization?
         n_active = (w_to_hi > 0.01).sum().item()
         print(f"  Output channels with |w_hi| > 0.01: {n_active}/80")
-        print(f"  [VERDICT] ", end="")
-        if w_to_hi.max() < 0.005:
-            print("Channels 80-95 are DEAD. Gradient starvation via identity shortcut confirmed.")
-        elif ratio < 0.05:
-            print("Channels 80-95 are SEVERELY STARVED. Near-zero recruitment.")
-        elif ratio < 0.2:
-            print("Channels 80-95 are WEAK. Partial recruitment, gradient competition with identity path.")
-        else:
-            print("Channels 80-95 are ACTIVE. Erosion has a different cause.")
     print("="*70)
 
     # ── Speaker Space Diagnostic ─────────────────────────────────────────
@@ -126,42 +127,25 @@ def test_generalization(checkpoint_path: str, output_dir: str):
 
         cos_sim = torch.nn.functional.cosine_similarity(vec_A, vec_B, dim=-1)
         l2_dist = torch.norm(vec_A - vec_B, p=2)
-        diff = (vec_A - vec_B).abs()
-        top5 = diff.squeeze().topk(5)
 
         print(f"  Cosine similarity (Man vs Woman): {cos_sim.item():.4f}")
         print(f"  L2 distance       (Man vs Woman): {l2_dist.item():.4f}")
-        print(f"  Top-5 most different dims values:  {[round(v, 4) for v in top5.values.tolist()]}")
-        print(f"  Top-5 most different dims indices:  {top5.indices.tolist()}")
-        print(f"  [VERDICT] ", end="")
-        if cos_sim.item() > 0.90:
-            print("Speaker space is COLLAPSED. Tanh is compressing Man/Woman into the same region.")
-        elif cos_sim.item() > 0.50:
-            print("Partial separation. Speaker info is weak but present.")
-        else:
-            print("Speaker space is WELL-SEPARATED. Problem is training task (no cross-pair training).")
 
         # ── Per-token diversity audit ─────────────────────────────────────
         print("\n[PER-TOKEN DIVERSITY AUDIT]")
         for speaker_label, spk_feats in [("A (Man)", spk_A), ("B (Woman)", spk_B)]:
             tokens = spk_feats[0]  # [8, 96]
             print(f"  Speaker {speaker_label}:")
-            token_l2 = torch.norm(tokens, dim=-1)  # [8]
-            token_means = tokens.mean(dim=-1)       # [8]
-            token_stds  = tokens.std(dim=-1)        # [8]
-            print(f"    Token L2 norms:  [{', '.join(f'{v:.3f}' for v in token_l2.tolist())}]")
-            print(f"    Token means:     [{', '.join(f'{v:.3f}' for v in token_means.tolist())}]")
-            print(f"    Token stds:      [{', '.join(f'{v:.3f}' for v in token_stds.tolist())}]")
             # Inter-token cosine similarity (lower = more diverse)
             tokens_norm = torch.nn.functional.normalize(tokens, dim=-1)  # [8, 96]
             cos_matrix = tokens_norm @ tokens_norm.T  # [8, 8]
             off_diag = cos_matrix[~torch.eye(8, dtype=torch.bool, device=tokens.device)]
-            print(f"    Inter-token cosine: mean={off_diag.mean():.4f}, max={off_diag.max():.4f} (lower=more diverse)")
+            print(f"    Inter-token cosine: mean={off_diag.mean():.4f}, max={off_diag.max():.4f}")
             # Effective rank (should now be >> 8/96)
             _, S, _ = torch.svd(tokens)
             ev = (S**2) / (S**2).sum()
             rank_95 = (ev.cumsum(0) < 0.95).sum().item() + 1
-            print(f"    Effective rank (95% var): {rank_95}/8  |  Singular values: [{', '.join(f'{v:.2f}' for v in S.tolist())}]")
+            print(f"    Effective rank (95% var): {rank_95}/8")
         # ─────────────────────────────────────────────────────────────────
     print()
 
@@ -328,14 +312,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         for rank_idx, ch_idx in enumerate(rank_order[:10].tolist()):
             zone = " ← ZERO-INIT (80-95)" if ch_idx >= 80 else ""
             print(f"    #{rank_idx+1}: ch {ch_idx:3d}  div={chan_diff[ch_idx]:.6f}{zone}")
-        print(f"  [VERDICT] ", end="")
-        if in_high >= 8:
-            print("Speaker info CONCENTRATED in ch 80-95. Identity-init mel_proj is structurally wrong.")
-        elif in_high >= 3:
-            print("Speaker info MIXED across channel groups. mel_proj partially usable but erodes high channels.")
-        else:
-            print("Speaker info in ch 0-79. mel_proj identity path should preserve it. Erosion has different cause.")
-
         # ═══════════════════════════════════════════════════════════════
         # DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj input
         # ═══════════════════════════════════════════════════════════════
@@ -362,15 +338,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Ablated   mel_proj_raw cent_cos: {cos_abl:.4f}")
         delta = cos_abl - cos_norm
         print(f"  Delta (ablated - normal):         {delta:+.4f}")
-        print(f"  [VERDICT] ", end="")
-        if abs(delta) < 0.02:
-            print("Channels 80-95 contribute NEGLIGIBLE speaker info at mel_proj. Functionally dead.")
-        elif delta > 0.05:
-            print("Channels 80-95 carry speaker info — ablation IMPROVES separation (suggests noise from dead channels).")
-        elif delta < -0.02:
-            print("Channels 80-95 carry speaker info — ablation WORSENS separation. mel_proj has partially learned to use them.")
-        else:
-            print(f"Channels 80-95 have MARGINAL contribution (|Δ|={abs(delta):.3f}).")
 
         # ── Monolithic mel_proj: Conv1d(96→80) ──
         mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
@@ -427,18 +394,6 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("="*70)
     # ═══════════════════════════════════════════════════════════════════
 
-    # ── Re-enable verbose for forced-gamma diagnostic ────────────────
-    model._verbose = True
-    model.cross_attn._verbose = True
-    model.decoder._verbose = True
-    model.decoder.speaker_film._verbose = True
-    model.decoder.block3_id_film._verbose = True
-    model.decoder.adapter_speaker_film._verbose = True
-    model.decoder.mel_speaker_affine._verbose = True
-    for blk in model.decoder.blocks:
-        blk._verbose = True
-    # ─────────────────────────────────────────────────────────────────
-
     # \u2500\u2500 FORCED-GAMMA DIAGNOSTIC \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     # Bypasses the mapping network. Injects constant gamma to answer:
     # "Can decoder blocks compute given strong FiLM, or are they dead?"
@@ -451,8 +406,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("\n" + "="*70)
     print("\U0001f52c FORCED-GAMMA DIAGNOSTIC (mapping network bypassed)")
     print("="*70)
-    print("  Runs A\u2192A with constant gamma injected. Beta=0. Pure residual-scale test.")
-    print("  Watch [Block] After block: std= in decoder prints above each result.\n")
+    print("  Runs A\u2192A with constant gamma injected. Beta=0.\n")
     with torch.no_grad():
         for forced_val in [0.5, 1.0]:
             print(f"  --- gamma={forced_val}  (residual scaled by {1+forced_val:.1f}x) ---")
@@ -540,16 +494,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     if hasattr(aff, 'raw_delta_scale') and aff.raw_delta_scale.grad is not None:
         ds_grad_val = aff.raw_delta_scale.grad.item()
         print(f"  raw_delta_scale grad:        {ds_grad_val:+.6f}")
-        print(f"  [VERDICT] ", end="")
-        if ds_grad_val < -0.0001:
-            print("L1 PUSHES delta_scale DOWN. L1 actively suppresses speaker envelope shifts.")
-        elif ds_grad_val > 0.0001:
-            print("L1 pushes delta_scale UP. L1 actually wants more spectral shift.")
-        else:
-            print("L1 gradient on delta_scale is NEAR ZERO.")
     else:
         print(f"  raw_delta_scale grad:        NO GRADIENT (or missing)")
-        print(f"  [VERDICT] Cannot determine.")
 
     # Cleanup
     model.zero_grad()
@@ -583,8 +529,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print(f"  A→A σ={aa_std:.4f}  |  B→B σ={bb_std:.4f}  |  A→B σ={ab_std:.4f}  |  B→A σ={ba_std:.4f}")
     deficit_aa = ((gt_A_std - aa_std) / gt_A_std) * 100
     deficit_bb = ((gt_B_std - bb_std) / gt_B_std) * 100
-    print(f"  Variance deficit (A→A vs GT A={gt_A_std:.4f}): {deficit_aa:.1f}%  {'✅ OK' if deficit_aa < 15 else '❌ Compressed'}")
-    print(f"  Variance deficit (B→B vs GT B={gt_B_std:.4f}): {deficit_bb:.1f}%  {'✅ OK' if deficit_bb < 15 else '❌ Compressed'}")
+    print(f"  Variance deficit (A→A vs GT A={gt_A_std:.4f}): {deficit_aa:.1f}%")
+    print(f"  Variance deficit (B→B vs GT B={gt_B_std:.4f}): {deficit_bb:.1f}%")
     # ──────────────────────────────────────────────────────────────────
 
 
