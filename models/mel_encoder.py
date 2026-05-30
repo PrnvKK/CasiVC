@@ -137,7 +137,7 @@ class MelEncoder(nn.Module):
         )
         # Per-token normalization: each of the 8 tokens gets its own mean/std
         self.token_norm = nn.LayerNorm(self.output_dim)  # LayerNorm(96)
-        self._verbose = True  # set False to suppress per-call debug prints
+        self._verbose = False  # set True to enable per-call debug prints
 
         self._init_projection()
         
@@ -240,34 +240,9 @@ class MelEncoder(nn.Module):
             ecapa_embeddings = self._safe_encode(ref_audio, wav_lens)
         
         v = self._verbose
-        # ============ DEBUG: RAW ECAPA EMBEDDINGS ============
-        if v: print(f"\n[ECAPA RAW EMBEDDINGS]")
-        if v: print(f"  Shape: {ecapa_embeddings.shape}")  # Should be (B, 192)
-        if v: print(f"  Mean: {ecapa_embeddings.mean().item():.4f}")
-        if v: print(f"  Std: {ecapa_embeddings.std().item():.4f}")
-        if v: print(f"  Min: {ecapa_embeddings.min().item():.4f}")
-        if v: print(f"  Max: {ecapa_embeddings.max().item():.4f}")
-        if v: print(f"  L2 Norm: {torch.norm(ecapa_embeddings, p=2, dim=-1).mean().item():.4f}")
-        
-        # Dimensionality coverage
-        dim_std = ecapa_embeddings.std(dim=0)  # Std across batch for each dim
-        active_dims = (dim_std > 0.01).sum().item()
-        if v: print(f"  Active dimensions (std > 0.01): {active_dims}/{ecapa_embeddings.shape[-1]}")
-        
-        # Check for dead dimensions (all near zero)
-        dead_dims = (ecapa_embeddings.abs().mean(dim=0) < 0.001).sum().item()
-        if v: print(f"  Dead dimensions (|mean| < 0.001): {dead_dims}/{ecapa_embeddings.shape[-1]}")
         
         if apply_projection:
             projected = self.projection(ecapa_embeddings)
-            
-            # ============ DEBUG: AFTER PROJECTION (raw, before reshape) ============
-            if v: print(f"\n[AFTER PROJECTION (raw, before reshape & per-token norm)]")
-            if v: print(f"  Shape: {projected.shape}")  # Should be (B, 8*96 = 768)
-            if v: print(f"  Mean: {projected.mean().item():.4f}")
-            if v: print(f"  Std: {projected.std().item():.4f}")
-            if v: print(f"  Min: {projected.min().item():.4f}")
-            if v: print(f"  Max: {projected.max().item():.4f}")
             
             speaker_features = projected.view(
                 batch_size, 
@@ -278,42 +253,14 @@ class MelEncoder(nn.Module):
             # Per-token LayerNorm: each of the 8 tokens independently normalized
             speaker_features = self.token_norm(speaker_features)
             
-            # ============ DEBUG: SPEAKER FEATURES (for cross-attention) ============
-            if v: print(f"\n[SPEAKER FEATURES - FINAL]")
-            if v: print(f"  Shape: {speaker_features.shape}")  # Should be (B, 64, 96)
-            if v: print(f"  Mean: {speaker_features.mean().item():.4f}")
-            if v: print(f"  Std: {speaker_features.std().item():.4f}")
-            if v: print(f"  Min: {speaker_features.min().item():.4f}")
-            if v: print(f"  Max: {speaker_features.max().item():.4f}")
-            
-            # Token diversity (are tokens different from each other?)
-            token_means = speaker_features.mean(dim=-1)  # (B, 64) - mean of each token
-            token_diversity = token_means.std(dim=-1).mean().item()
-            if v: print(f"  Token diversity (std of token means): {token_diversity:.4f}")
-            
-            # Dimension coverage across tokens
-            dim_std_per_token = speaker_features.std(dim=1).mean(dim=0)  # (96,) - std per dim across tokens
-            active_dims_tokens = (dim_std_per_token > 0.01).sum().item()
-            if v: print(f"  Active dims across tokens (std > 0.01): {active_dims_tokens}/96")
-            
-            # Check for collapsed tokens (all tokens identical)
-            token_pairwise_dist = torch.cdist(speaker_features[0], speaker_features[0], p=2)  # (64, 64)
-            avg_token_dist = token_pairwise_dist.mean().item()
-            if v: print(f"  Avg pairwise token distance (L2): {avg_token_dist:.4f}")
-            
-            # Rank check (effective dimensionality)
-            U, S, V = torch.svd(speaker_features[0])  # SVD on first sample
-            explained_variance = (S ** 2) / (S ** 2).sum()
-            cumsum_var = explained_variance.cumsum(dim=0)
-            dims_for_95 = (cumsum_var < 0.95).sum().item() + 1
-            if v: print(f"  Effective rank (95% variance): {dims_for_95}/96")
-            if v: print(f"  Singular values (top 5): {S[:5].tolist()}")
-            
-            # NaN/Inf check
-            has_nan = torch.isnan(speaker_features).any().item()
-            has_inf = torch.isinf(speaker_features).any().item()
-            if v: print(f"  Contains NaN: {has_nan}")
-            if v: print(f"  Contains Inf: {has_inf}")
+            if v:
+                has_nan = torch.isnan(speaker_features).any().item()
+                inter_tok = torch.nn.functional.normalize(speaker_features[0], dim=-1)
+                cos_mat = inter_tok @ inter_tok.T
+                off_diag = cos_mat[~torch.eye(self.num_speaker_tokens, dtype=torch.bool, device=speaker_features.device)]
+                print(f"[ECAPA] shape={speaker_features.shape} "
+                      f"μ={speaker_features.mean():.2f} σ={speaker_features.std():.3f} "
+                      f"inter_tok_cos={off_diag.mean():.3f} NaN={has_nan}")
             
         else:
             speaker_features = ecapa_embeddings

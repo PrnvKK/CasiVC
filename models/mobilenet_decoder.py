@@ -125,7 +125,7 @@ class MobileNetBlock(nn.Module):
         self.block = nn.Sequential(*layers)
         
         # ✅ ADD THIS SECTION - Residual connection handling
-        self._verbose = True  # set False to suppress per-call debug prints
+        self._verbose = False  # set True to enable per-call debug prints
         self.use_residual = True
         self.residual_scale = residual_scale
         self.residual_identity_scale = residual_identity_scale  # scale on shortcut path
@@ -148,27 +148,26 @@ class MobileNetBlock(nn.Module):
         return out
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        v = self._verbose
-        if v: print(f"[Block] Input: shape={x.shape}, mean={x.mean():.4f}, std={x.std():.4f}")
-        
         # Capture identity BEFORE any modifications
         identity = x
         
         # Apply upsampling to BOTH paths if configured
         if self.upsample_first is not None:
             x = self.upsample_first(x)
-            identity = self.upsample_first(identity)  # Now identity exists!
+            identity = self.upsample_first(identity)
         
         # Process through block
         out = self.block(x)
-        if v: print(f"[Block] After block: shape={out.shape}, mean={out.mean():.4f}, std={out.std():.4f}")
         
         # Apply residual connection
         if self.residual_proj is not None:
             identity = self.residual_proj(identity)
         
         out = self.residual_identity_scale * identity + self.residual_scale * out
-        if v: print(f"[Block] After residual (id_scale={self.residual_identity_scale:.2f}, body_scale={self.residual_scale}): shape={out.shape}, mean={out.mean():.4f}, std={out.std():.4f}")
+        
+        if self._verbose:
+            body_frac = out.std().item() / (x.std().item() + 1e-8)
+            print(f"[Block] σ_in={x.std():.3f} σ_out={out.std():.3f} body_frac={body_frac:.2f}")
         
         return out
 
@@ -213,7 +212,7 @@ class SpeakerFiLM(nn.Module):
         # Target: gamma std 0.06-0.10 (currently 0.0213).
         self.raw_film_scale = nn.Parameter(torch.tensor(raw_film_scale_init))
 
-        self._verbose = True
+        self._verbose = False
 
     def forward(self, x: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
         """
@@ -245,12 +244,9 @@ class SpeakerFiLM(nn.Module):
             g = gamma.squeeze(-1)  # [B, C]
             b = beta.squeeze(-1)
             self._last_gamma_std = g.std().item()  # stored for audit
-            print(f"[speaker_film] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
-                  f"min={g.min():.4f}, max={g.max():.4f}")
-            print(f"[speaker_film] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
-                  f"min={b.min():.4f}, max={b.max():.4f}")
-            print(f"[speaker_film] film_scale: {film_scale.item():.4f}")
-            print(f"[speaker_film] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
+            rng = (1 + g)
+            print(f"[speaker_film] γ_μ={g.mean():.3f} γ_σ={g.std():.3f} "
+                  f"(1+γ)=[{rng.min():.3f},{rng.max():.3f}] film_scale={film_scale.item():.3f}")
 
         # Apply FiLM: x * (1 + gamma) + beta
         x = x * (1.0 + gamma) + beta
@@ -263,11 +259,10 @@ class SpeakerFiLM(nn.Module):
 
 
 class MelSpeakerAffine(nn.Module):
-    """Speaker residual delta applied AFTER out_scale.
+    """Speaker-conditioned additive per-band mel delta.
 
-    Instead of a full FiLM (scale+shift) that scales the entire mel
-    (which can homogenize content across speakers to satisfy L1), this
-    module purely learns an ADDITIVE spectral envelope shift per speaker.
+    Applied after mel_proj, before out_scale centering.
+    Purely learns an ADDITIVE spectral envelope shift per speaker.
     
     mel = mel + delta_scale * tanh(speaker_raw)
     
@@ -296,12 +291,12 @@ class MelSpeakerAffine(nn.Module):
         # softplus(0) + 0.1 ≈ 0.79 max amplitude.
         self.raw_delta_scale = nn.Parameter(torch.tensor(0.0))
 
-        self._verbose = True
+        self._verbose = False
 
     def forward(self, mel: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            mel:           [B, 80, T] mel after out_scale (pre-clamp)
+            mel:           [B, 80, T] mel after mel_proj (pre-centering)
             speaker_feats: [B, num_tokens, speaker_dim] speaker tokens
         Returns:
             mel + speaker_delta: [B, 80, T]
@@ -372,7 +367,7 @@ class SpeakerOutScale(nn.Module):
         # softplus(-0.5) + 0.1 ≈ 0.57 max amplitude (was -2.0 → 0.145, too timid).
         self.raw_gain = nn.Parameter(torch.tensor(-0.5))
 
-        self._verbose = True
+        self._verbose = False
 
     def forward(self, base_scale: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
         """
@@ -441,7 +436,7 @@ class Block3IdentityFiLM(nn.Module):
         #   raw_film_scale_init=-0.5 → ≈1.13 (conservative)
         self.raw_film_scale = nn.Parameter(torch.tensor(raw_film_scale_init))
 
-        self._verbose = True
+        self._verbose = False
 
     def forward(self, id_proj: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
         """
@@ -471,13 +466,9 @@ class Block3IdentityFiLM(nn.Module):
 
         if self._verbose:
             g = gamma.squeeze(-1)  # [B, C]
-            b = beta.squeeze(-1)
-            print(f"[b3_id_film] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
-                  f"min={g.min():.4f}, max={g.max():.4f}")
-            print(f"[b3_id_film] beta:  mean={b.mean():.4f}, std={b.std():.4f}, "
-                  f"min={b.min():.4f}, max={b.max():.4f}")
-            print(f"[b3_id_film] film_scale: {film_scale.item():.4f}")
-            print(f"[b3_id_film] (1+gamma) range: [{(1+g).min():.4f}, {(1+g).max():.4f}]")
+            rng = (1 + g)
+            print(f"[b3_id_film] γ_μ={g.mean():.3f} γ_σ={g.std():.3f} "
+                  f"(1+γ)=[{rng.min():.3f},{rng.max():.3f}] film_scale={film_scale.item():.3f}")
 
         # Normalized-input residual FiLM: per-channel instance-norm before
         # gamma/beta so modulation depth is speaker-independent.  Additive
@@ -595,9 +586,8 @@ class MobileNetDecoder(nn.Module):
             n_mel_bands=80,
         )
 
-        # Mel-speaker affine: additive spectral envelope delta after
-        # out_scale. Reactivated — previously dead code (postbias_mel = mel_scaled).
-        # Now called between mel_scaled and clamp for bounded speaker timbre shift.
+        # Mel-speaker affine: per-band additive spectral envelope delta.
+        # Applied after mel_proj, before out_scale centering.
         self.mel_speaker_affine = MelSpeakerAffine(
             speaker_dim=config.speaker_projection_dim,     # 96
             n_mel_bands=80,
@@ -616,7 +606,7 @@ class MobileNetDecoder(nn.Module):
 
         # out_scale is now purely an unconditional variance amplifier.
 
-        self._verbose = True  # set False to suppress per-call debug prints
+        self._verbose = False  # set False to suppress per-call debug prints
 
 
 
@@ -690,13 +680,10 @@ class MobileNetDecoder(nn.Module):
     def _check(self, x, tag):
         """Debug check for finite values."""
         if not torch.isfinite(x).all():
-            if self._verbose:
-                print(f"❌  Non-finite values after {tag}")
-                print("    mean:", x.mean().item(), "std:", x.std().item())
+            print(f"❌  Non-finite values after {tag}  mean={x.mean().item():.4f} std={x.std().item():.4f}")
             raise RuntimeError("Stop trace here")
-        else:
-            if self._verbose:
-                print(f"✅ {tag:16s}  mean={x.mean():7.4f}  std={x.std():7.4f}")
+        elif self._verbose:
+            print(f"✅ {tag:16s}  mean={x.mean():7.4f}  std={x.std():7.4f}")
 
     
     def forward(self, fused: torch.Tensor, return_intermediate: bool = False, speaker_feats: torch.Tensor | None = None) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
@@ -775,11 +762,12 @@ class MobileNetDecoder(nn.Module):
         # (adapter_film, b3_id_film, speaker_film).
         mel = self.mel_proj(x)  # [B, 80, T]
 
-        # ── Decoder output diagnostics ──────────────────────────────────
-        # We log three stages separately: (1) raw conv output, (2) after
-        # per-band out_scale, (3) after clamp.  This isolates whether the
-        # mel variance deficit comes from the conv backbone, insufficient
-        # out_scale growth, or clamp compression.
+        # Speaker-conditioned additive mel delta: per-band tanh-bounded residual
+        # computed from speaker tokens. Purely additive — preserves content.
+        # Applied BEFORE centering so the delta survives out_scale math.
+        if speaker_feats is not None:
+            mel = self.mel_speaker_affine(mel, speaker_feats)  # [B, 80, T]
+
         # ── Speaker-conditioned out_scale ──────────────────────────────
         # base_scale is unconditional floor (softplus+1.5, always > 1.5).
         # Speaker-conditioned delta adds per-speaker variance envelope
@@ -790,19 +778,7 @@ class MobileNetDecoder(nn.Module):
         else:
             out_scale = base_scale
 
-        out_bias_vals  = self.out_bias.squeeze()            # [80]
-        out_scale_vals = out_scale.squeeze()                # [B, 80] or [80]
         v = self._verbose
-        if v:
-            print(f"[decoder] out_scale (base+spk): mean={out_scale_vals.float().mean().item():.4f}, "
-                  f"min={out_scale_vals.float().min().item():.4f}, max={out_scale_vals.float().max().item():.4f}")
-            print(f"[decoder] raw_out_scale: mean={self.raw_out_scale.mean().item():.4f}")
-            print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
-                  f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
-
-        mel_pre_scale_std = mel.std().item()
-        mel_pre_scale_mean = mel.mean().item()
-        if v: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
         # DECOUPLED SCALING: center per-band temporal mean so out_scale is a PURE variance knob.
         # Previously: mel * out_scale + bias  →  increasing out_scale also shifts mean,
@@ -813,33 +789,25 @@ class MobileNetDecoder(nn.Module):
         mel_band_mean = mel.mean(dim=-1, keepdim=True)       # [B, 80, 1] per-band temporal mean
         mel_centered  = mel - mel_band_mean                   # zero-mean per band per utterance
         mel_scaled    = mel_centered * out_scale + mel_band_mean + self.out_bias
-        mel_post_scale_std = mel_scaled.std().item()
-        mel_post_scale_mean = mel_scaled.mean().item()
-        if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
-        # mel_speaker_affine DISABLED: cent_cos rose from 0.774→0.791 through
-        # this module, actively blurring speakers. Additive deltas on already-
-        # collapsed features cannot recover what mel_proj averaged away.
         prebias_mel = mel_scaled
         postbias_mel = mel_scaled
 
-        mel = torch.clamp(mel_scaled, min=-11.5, max=2.0)
+        mel_out = torch.clamp(mel_scaled, min=-11.5, max=2.0)
 
         clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 2.0)
         clamp_pct = clamp_mask.float().mean().item() * 100
-        if v: print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
-
-        # ── Decoder output audit ──
         if v:
-            print(f"[audit] speaker_film gamma std: {getattr(self.speaker_film, '_last_gamma_std', 'N/A')}")
+            print(f"[decoder] mel: pre_μ={mel.mean():.2f} pre_σ={mel.std():.3f} → "
+                  f"post_μ={mel_out.mean():.2f} post_σ={mel_out.std():.3f} clamp={clamp_pct:.1f}%")
 
-        self._check(mel, "mel_proj")
+        self._check(mel_out, "mel_proj")
         
         if should_return_feats:
             intermediate.append(prebias_mel)   # pre-clamp mel
             intermediate.append(postbias_mel)  # same tensor; retained for aux shape compatibility
-            return mel, intermediate
-        return mel
+            return mel_out, intermediate
+        return mel_out
     
     # ---------------------------------------------------------------------- #
     #  Utilities                                                             #
