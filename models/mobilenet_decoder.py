@@ -564,7 +564,7 @@ class MobileNetDecoder(nn.Module):
             weight_mat[:, :80] = torch.eye(80)
             
             # channels 80:96 given small non-zero init to allow speaker gradients to flow
-            nn.init.xavier_normal_(weight_mat[:, 80:96], gain=0.1)
+            nn.init.xavier_normal_(weight_mat[:, 80:96], gain=0.3)
             
         if self.mel_proj.bias is not None:
             nn.init.constant_(self.mel_proj.bias, -4.5)
