@@ -292,43 +292,28 @@ class MelSpeakerAffine(nn.Module):
                     nn.init.xavier_uniform_(m.weight, gain=0.2)
                     nn.init.zeros_(m.bias)
 
-        # Learnable amplitude for the delta.
-        # softplus(0) + 0.1 ≈ 0.79 max amplitude.
         self.raw_delta_scale = nn.Parameter(torch.tensor(0.0))
 
         self._verbose = True
 
     def forward(self, mel: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            mel:           [B, 80, T] mel after out_scale (pre-clamp)
-            speaker_feats: [B, num_tokens, speaker_dim] speaker tokens
-        Returns:
-            mel + speaker_delta: [B, 80, T]
-        """
-        # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
         spk_pooled = speaker_feats.mean(dim=1)
 
-        # Generate raw delta
         speaker_raw = self.mlp(spk_pooled)                       # [B, 80]
 
-        # Learnable scale (softplus reparam, min 0.1 authority)
         delta_scale = F.softplus(self.raw_delta_scale) + 0.1
         
-        # Bounded additive delta
         speaker_delta = delta_scale * torch.tanh(speaker_raw)    # [B, 80]
 
-        # Reshape for broadcasting over temporal dim: [B, 80, 1]
         speaker_delta = speaker_delta.unsqueeze(-1)
 
         if self._verbose:
-            d = speaker_delta.squeeze(-1)  # [B, 80]
-            self._last_gamma_std = d.std().item()  # stored for audit to prevent crash
+            d = speaker_delta.squeeze(-1)
+            self._last_gamma_std = d.std().item()
             print(f"[mel_spk_affine] delta_scale: {delta_scale.item():.4f}")
             print(f"[mel_spk_affine] speaker_delta: mean={d.mean():.4f}, std={d.std():.4f}, "
                   f"min={d.min():.4f}, max={d.max():.4f}")
 
-        # Additive residual
         mel = mel + speaker_delta
         return mel
 
@@ -816,9 +801,7 @@ class MobileNetDecoder(nn.Module):
         if v: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
         # DECOUPLED SCALING: center per-band temporal mean so out_scale is a PURE variance knob.
-        # Previously: mel * out_scale + bias  →  increasing out_scale also shifts mean,
-        # causing L1 gradient to fight the variance gradient (net ≈ 0, scale frozen).
-        # Now: out_scale only amplifies the deviation from each band's own mean.
+        # out_scale only amplifies the deviation from each band's own mean.
         # L1 gradient on out_scale ≈ 0 (centered input is symmetric around 0).
         # Variance gradient is uncontested → raw_out_scale can grow freely.
         mel_band_mean = mel.mean(dim=-1, keepdim=True)       # [B, 80, 1] per-band temporal mean
