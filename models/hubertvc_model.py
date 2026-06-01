@@ -501,6 +501,13 @@ class HubertVCModel(nn.Module):
                 spk_film_feats = F.avg_pool1d(spk_film_feats, kernel_size=3, stride=1, padding=1)
                 spk_film_logits = self.spk_film_classifier(spk_film_feats)  # [B, num_speakers, T]
                 aux["spk_film_classifier_logits"] = spk_film_logits
+
+            # Expose pre-bias mel for structural gradient separation.
+            # L1 content loss in the trainer uses prebias_mel (content only),
+            # while speaker losses (stats, CE, var) use pred_mel (with speaker delta).
+            # No gradient competition — L1 stops at prebias, speaker losses work on final.
+            if len(intermediate) >= 6:
+                aux["prebias_mel"] = intermediate[-2]   # [B, 80, T] — after out_scale, before mel_speaker_affine
         
         return pred_mel, loss_dict, aux
 

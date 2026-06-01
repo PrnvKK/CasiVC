@@ -393,25 +393,31 @@ class VCGeneratorLoss(nn.Module):
 
     def forward(
         self,
-        pred_mel: torch.Tensor,             # (B, n_mel, T_mel)
+        pred_mel: torch.Tensor,             # (B, n_mel, T_mel) — final mel with speaker conditioning
         gt_mel: torch.Tensor,               # (B, n_mel, T_mel)
         pred_wave: torch.Tensor,            # (B, T_wav)
         gt_wave: torch.Tensor,              # (B, T_wav)
         gt_lengths: torch.Tensor = None,    # (B,) real mel frame counts (excludes padding)
+        content_mel: torch.Tensor = None,   # (B, n_mel, T_mel) — pre-speaker-affine mel for L1
     ) -> LossOutputs:
         """
         Computes the weighted sum of all configured losses.
+        
+        If content_mel is provided, L1 mel loss is computed on it (content only).
+        Speaker losses (stats, var) always use pred_mel (final, with speaker delta).
+        This separates L1 gradient (stops at prebias) from speaker gradient (flows
+        through speaker delta), eliminating gradient competition.
         """
         outs = LossOutputs()
 
         # --- Compute and weight each loss term ---
 
-        # Mel reconstruction loss (Raw L1)
+        # Mel reconstruction loss (Raw L1) — on content_mel if provided (gradient separation)
         if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
             try:
-                # Mask computation
-                T_common = min(pred_mel.size(-1), gt_mel.size(-1))
-                p_align = pred_mel[:, :, :T_common]
+                mel_for_l1 = content_mel if content_mel is not None else pred_mel
+                T_common = min(mel_for_l1.size(-1), gt_mel.size(-1))
+                p_align = mel_for_l1[:, :, :T_common]
                 g_align = gt_mel[:, :, :T_common]
                 
                 l_mel = self.mel_loss(p_align, g_align, lengths=gt_lengths)
