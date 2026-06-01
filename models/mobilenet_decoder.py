@@ -783,6 +783,14 @@ class MobileNetDecoder(nn.Module):
             x = self.speaker_film(x, speaker_feats)
             self._check(x, "spk_film")
 
+        # ── Channel rebalancing (gradient-decoupled): ch 80-95 carry speaker
+        # divergence but mel_proj's identity init gives ch 0-79 4x weight
+        # advantage (0.27 vs 0.99). 3x forward boost equalizes contribution,
+        # detach prevents L1 from punishing upstream FiLM through amplified
+        # backward gradient.
+        ch_high = x[:, 80:, :]
+        x[:, 80:, :] = ch_high + 2.0 * ch_high.detach()
+
         # ── Monolithic mel projection ──────────────────────────────────
         # Conv1d(96→80).  Simple single-path projection from decoder
         # output to mel bands.  Speaker identity is preserved upstream
@@ -838,7 +846,13 @@ class MobileNetDecoder(nn.Module):
         prebias_mel = mel_scaled
 
         if speaker_feats is not None:
-            mel_scaled = self.mel_speaker_affine(mel_scaled, speaker_feats)
+            # DETACH: speaker loss gradient stops at mel_speaker_affine.
+            # Cross-pair stats (weight 6.0) must NOT flow back through
+            # prebias_mel → out_scale → upstream blocks. Without this
+            # detach, cross-pair gradient tells the content path to match
+            # the target speaker while L1 pushes toward the source speaker
+            # — the exact gradient competition we're eliminating.
+            mel_scaled = self.mel_speaker_affine(prebias_mel.detach(), speaker_feats)
             self._check(mel_scaled, "mel_spk_affine")
 
         # Save post-bias, pre-clamp mel for pooled CE classifier

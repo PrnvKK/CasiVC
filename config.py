@@ -155,7 +155,7 @@ class TrainingConfig:
 
   # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
   cross_pair_prob: float = 1.0           # probability of applying cross-pair in a batch (increased for decisive diagnostic)
-  cross_pair_stats_weight: float = 2.0   # weight multiplier for cross-pair Mel Stats loss
+  cross_pair_stats_weight: float = 6.0   # raised from 2.0: equal footing with self-pair L1 (λ_mel=5.0). Forces model to match target speaker spectral shape as strongly as it reconstructs content.
 
   # Speaker classifier head at decoder bottleneck
   classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID (block2 + block3)

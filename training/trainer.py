@@ -419,7 +419,11 @@ class Trainer:
 
             # Calculate Losses
             # mel_loss gets computed with gradients. 
-            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths)
+            # Structural gradient separation: L1 on prebias_mel (content only, before speaker delta),
+            # speaker losses on pred_mel (final, with speaker conditioning).
+            # No gradient competition between L1 and speaker losses on shared parameters.
+            content_mel = aux.get("prebias_mel", None) if aux is not None else None
+            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths, content_mel=content_mel)
             
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()
