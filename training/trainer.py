@@ -418,12 +418,13 @@ class Trainer:
             pred_mel = pred_mel.to(torch.float32)
 
             # Calculate Losses
-            # mel_loss gets computed with gradients. 
-            # Structural gradient separation: L1 on prebias_mel (content only, before speaker delta),
-            # speaker losses on pred_mel (final, with speaker conditioning).
-            # No gradient competition between L1 and speaker losses on shared parameters.
+            # Three-path gradient separation:
+            #   content_mel  (raw, pre-scale)        → L1 → mel_proj → upstream
+            #   variance_mel (post-scale, pre-affine) → Variance → out_scale → upstream
+            #   pred_mel     (post-affine, final)     → Speaker → [DETACH] → speaker_affine ONLY
             content_mel = aux.get("prebias_mel", None) if aux is not None else None
-            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths, content_mel=content_mel)
+            variance_mel = aux.get("variance_mel", None) if aux is not None else None
+            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths, content_mel=content_mel, variance_mel=variance_mel)
             
             # Use ALL losses (Mel + Speaker Stats) for actual backpropagation!
             total = losses.total()

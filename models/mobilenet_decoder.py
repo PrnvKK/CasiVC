@@ -798,15 +798,11 @@ class MobileNetDecoder(nn.Module):
         # (mel_speaker_affine after out_scale).
         mel = self.mel_proj(x)  # [B, 80, T]
 
+        # ── Path 1: L1 target — raw mel, pre-scale ────────────────────
+        # L1 trains mel_proj directly. out_scale is NOT in L1's gradient path.
+        prebias_mel = mel  # [B, 80, T] — RAW, before any scaling
+
         # ── Decoder output diagnostics ──────────────────────────────────
-        # We log three stages separately: (1) raw conv output, (2) after
-        # per-band out_scale, (3) after clamp.  This isolates whether the
-        # mel variance deficit comes from the conv backbone, insufficient
-        # out_scale growth, or clamp compression.
-        # Compute effective out_scale via softplus reparametrisation (always > 1.5).
-        # Speaker-conditioned modulation injects per-band scaling deltas bounded
-        # by ±0.35 via tanh, blending a learnable gain with a zero-init MLP
-        # so behaviour starts identical to the unconditional out_scale.
         out_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
 
         out_bias_vals  = self.out_bias.squeeze()            # [80]
@@ -823,12 +819,8 @@ class MobileNetDecoder(nn.Module):
         mel_pre_scale_mean = mel.mean().item()
         if v: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
-        # DECOUPLED SCALING: center per-band temporal mean so out_scale is a PURE variance knob.
-        # Previously: mel * out_scale + bias  →  increasing out_scale also shifts mean,
-        # causing L1 gradient to fight the variance gradient (net ≈ 0, scale frozen).
-        # Now: out_scale only amplifies the deviation from each band's own mean.
-        # L1 gradient on out_scale ≈ 0 (centered input is symmetric around 0).
-        # Variance gradient is uncontested → raw_out_scale can grow freely.
+        # DECOUPLED SCALING: out_scale amplifies deviation from per-band mean.
+        # Used ONLY by variance loss (λ=30) — L1 sees raw prebias_mel above.
         mel_band_mean = mel.mean(dim=-1, keepdim=True)       # [B, 80, 1] per-band temporal mean
         mel_centered  = mel - mel_band_mean                   # zero-mean per band per utterance
         mel_scaled    = mel_centered * out_scale + mel_band_mean + self.out_bias
@@ -836,26 +828,20 @@ class MobileNetDecoder(nn.Module):
         mel_post_scale_mean = mel_scaled.mean().item()
         if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
-        # ── Post-out_scale speaker FiLM: scale+shift after both erasure points ──
-        # Injects speaker identity AFTER out_scale (which dilutes any
-        # speaker modulation placed before it by amplifying content 2.16x).
-        # Only clamp follows, so the FiLM is structurally non-erasable.
-        # FiLM (gamma+beta): per-band scaling fixes σ-ratio asymmetry,
-        # per-band shift fixes spectral envelope (formant, tilt).
-        # Save pre-FiLM mel for gated CE classifier
-        prebias_mel = mel_scaled
+        # ── Path 2: Variance target — post-scale, pre-affine ───────────
+        # Variance loss (λ=30) trains out_scale through this path.
+        # L1 gradient on out_scale ≈ 0 (centered scaling kills it),
+        # so variance gradient on out_scale is uncontested.
+        variance_mel = mel_scaled  # [B, 80, T] — variance target
 
+        # ── Path 3: Speaker target — post-affine, final output ─────────
+        # DETACH: cross-pair stats (weight 6.0) gradient stops at
+        # speaker_affine MLP. Cannot flood upstream blocks via out_scale
+        # or mel_proj, protecting FiLM modules from L1 competition.
         if speaker_feats is not None:
-            # DETACH: speaker loss gradient stops at mel_speaker_affine.
-            # Cross-pair stats (weight 6.0) must NOT flow back through
-            # prebias_mel → out_scale → upstream blocks. Without this
-            # detach, cross-pair gradient tells the content path to match
-            # the target speaker while L1 pushes toward the source speaker
-            # — the exact gradient competition we're eliminating.
-            mel_scaled = self.mel_speaker_affine(prebias_mel.detach(), speaker_feats)
+            mel_scaled = self.mel_speaker_affine(mel_scaled.detach(), speaker_feats)
             self._check(mel_scaled, "mel_spk_affine")
 
-        # Save post-bias, pre-clamp mel for pooled CE classifier
         postbias_mel = mel_scaled
 
         mel = torch.clamp(mel_scaled, min=-11.5, max=2.0)
@@ -864,15 +850,15 @@ class MobileNetDecoder(nn.Module):
         clamp_pct = clamp_mask.float().mean().item() * 100
         if v: print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
 
-        # ── Decoder output audit ──
         if v:
             print(f"[audit] speaker_film gamma std: {getattr(self.speaker_film, '_last_gamma_std', 'N/A')}")
 
         self._check(mel, "mel_proj")
         
         if should_return_feats:
-            intermediate.append(prebias_mel)   # pre-bias mel (for detach in gated CE)
-            intermediate.append(postbias_mel)  # post-bias, pre-clamp mel
+            intermediate.append(prebias_mel)   # [-3] raw mel (pre-scale) — L1 target
+            intermediate.append(variance_mel)  # [-2] post-scale, pre-affine — variance target
+            intermediate.append(postbias_mel)  # [-1] post-affine, pre-clamp — speaker target
             return mel, intermediate
         return mel
     
