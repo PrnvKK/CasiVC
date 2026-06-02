@@ -476,38 +476,30 @@ class HubertVCModel(nn.Module):
                 aux["mel_classifier_logits"] = mel_logits
 
             # Pooled mel-bias classifier: gated CE on bias-only component
-            # mel_for_ce = prebias.detach() + bias_only
-            # This forces CE gradient to flow ONLY through the bias MLP,
-            # preventing the classifier from using residual speaker info in
-            # the content mel as a shortcut (which left the bias near-identity
-            # in the ungated version at weight 0.05).
-            if self.pooled_mel_classifier is not None and len(intermediate) > 5:
-                prebias_mel = intermediate[-2]   # [B, 80, T] before speaker bias
+            # intermediate: [-3]=prebias(raw), [-2]=variance(post-scale), [-1]=postbias(post-affine)
+            if self.pooled_mel_classifier is not None and len(intermediate) > 6:
+                prebias_mel = intermediate[-3]   # [B, 80, T] raw mel, pre-scale
                 postbias_mel = intermediate[-1]  # [B, 80, T] after speaker bias
-                bias_only = postbias_mel - prebias_mel  # [B, 80, T] the speaker bias
-                mel_for_ce = prebias_mel.detach() + bias_only  # gradient only through bias
-                mel_pooled = mel_for_ce.mean(dim=-1)  # [B, 80] pooled over time
-                pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)  # [B, num_speakers]
+                bias_only = postbias_mel - prebias_mel  # [B, 80, T] scale+affine delta
+                mel_for_ce = prebias_mel.detach() + bias_only
+                mel_pooled = mel_for_ce.mean(dim=-1)
+                pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)
                 aux["pooled_mel_logits"] = pooled_mel_logits
 
-            # Spk_film classifier (post-mel_proj): forces mel_proj to preserve
-            # speaker information. Taps at prebias_mel (intermediate[-2]) which is
-            # the 80-dim mel AFTER out_scale, BEFORE mel_speaker_affine.
-            # CE gradient flows: classifier → prebias_mel → out_scale → mel_proj →
-            # speaker_film → speaker tokens. This directly counters mel_proj's
-            # L1-driven tendency to erase speaker variation.
-            if self.spk_film_classifier is not None and len(intermediate) > 5:
-                spk_film_feats = intermediate[-2]  # [B, 80, T] prebias_mel (post-out_scale)
+            # Spk_film classifier: taps variance_mel (post-out_scale, pre-affine)
+            if self.spk_film_classifier is not None and len(intermediate) > 6:
+                spk_film_feats = intermediate[-2]  # [B, 80, T] variance_mel (post-out_scale)
                 spk_film_feats = F.avg_pool1d(spk_film_feats, kernel_size=3, stride=1, padding=1)
-                spk_film_logits = self.spk_film_classifier(spk_film_feats)  # [B, num_speakers, T]
+                spk_film_logits = self.spk_film_classifier(spk_film_feats)
                 aux["spk_film_classifier_logits"] = spk_film_logits
 
-            # Expose pre-bias mel for structural gradient separation.
-            # L1 content loss in the trainer uses prebias_mel (content only),
-            # while speaker losses (stats, CE, var) use pred_mel (with speaker delta).
-            # No gradient competition — L1 stops at prebias, speaker losses work on final.
-            if len(intermediate) >= 6:
-                aux["prebias_mel"] = intermediate[-2]   # [B, 80, T] — after out_scale, before mel_speaker_affine
+            # Three-path gradient separation: expose all intermediate mels
+            #   prebias_mel  (raw, pre-scale)             → L1 target
+            #   variance_mel (post-scale, pre-affine)      → variance target (trains out_scale)
+            #   postbias_mel (post-scale, post-affine)     → speaker stats (detach protected)
+            if len(intermediate) >= 7:
+                aux["prebias_mel"]   = intermediate[-3]   # raw mel — L1 target
+                aux["variance_mel"]  = intermediate[-2]   # post-scale, pre-affine — variance target
         
         return pred_mel, loss_dict, aux
 
