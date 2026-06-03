@@ -550,23 +550,16 @@ class MobileNetDecoder(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         
         # ── Monolithic mel projection ───────────────────────────────────────
-        # Conv1d(96→80). Identity init on first 80 channels for stable L1
-        # reconstruction shortcut; channels 80:96 are zero-initialised but
-        # fully learnable — they grow only if they reduce L1 loss, eliminating
-        # the perverse dynamic where Xavier noise on untrained channels inflates
-        # cent_cos when upstream FiLM separation improves.
+        # Conv1d(96→80). Uniform Xavier init on ALL 96 channels (gain=1.0).
+        # No identity shortcut — structural gradient asymmetry eliminated.
+        # All channels compete equally for L1 gradient.  The 3x detach boost
+        # on ch 80-95 gives speaker channels a mild forward advantage without
+        # backward amplification.
         self.mel_proj = nn.Conv1d(
             channel_progression[-1], 80, kernel_size=1, bias=True
         )
         with torch.no_grad():
-            weight_mat = self.mel_proj.weight.squeeze(-1)  # [80, 96]
-            weight_mat.zero_()
-            weight_mat[:, :80] = torch.eye(80)
-            
-            # channels 80:96 — gain raised 0.1→0.5 to give speaker-carrying channels
-            # more initial weight to compete against the identity shortcut (ch 0-79)
-            nn.init.xavier_normal_(weight_mat[:, 80:96], gain=0.5)
-            
+            nn.init.xavier_normal_(self.mel_proj.weight.squeeze(-1), gain=1.0)
         if self.mel_proj.bias is not None:
             nn.init.constant_(self.mel_proj.bias, -4.5)
 
