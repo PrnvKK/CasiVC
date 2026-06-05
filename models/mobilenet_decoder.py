@@ -575,8 +575,8 @@ class MobileNetDecoder(nn.Module):
         self.speaker_film = SpeakerFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[-1],       # 96
-            mlp_gain=0.5,
-            raw_film_scale_init=0.5,
+            mlp_gain=1.0,
+            raw_film_scale_init=0.8,
         )
 
         # Adapter-entry speaker FiLM: prevents blocks 0-2 from erasing speaker
@@ -586,8 +586,8 @@ class MobileNetDecoder(nn.Module):
         self.adapter_speaker_film = Block3IdentityFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[0],        # 96
-            mlp_gain=0.3,
-            raw_film_scale_init=0.0,
+            mlp_gain=0.5,
+            raw_film_scale_init=0.25,
         )
 
         # Block3 identity-path FiLM: conditioned at the residual_proj output,
@@ -597,8 +597,8 @@ class MobileNetDecoder(nn.Module):
         self.block3_id_film = Block3IdentityFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             target_channels=channel_progression[-1],       # 96
-            mlp_gain=0.5,
-            raw_film_scale_init=0.5,
+            mlp_gain=1.0,
+            raw_film_scale_init=0.8,
         )
 
         # Post-out_scale speaker FiLM: scale+shift applied AFTER both
@@ -799,7 +799,29 @@ class MobileNetDecoder(nn.Module):
         if speaker_feats is not None:
             spk_pooled = speaker_feats.mean(dim=1)       # [B, 96]
             spk_input = spk_pooled.unsqueeze(-1).expand(-1, -1, x.shape[-1])  # [B, 96, T]
-            mel_speaker = self.mel_proj_speaker(spk_input)  # [B, 80, T] — CE-only, time-invariant
+            mel_speaker_base = self.mel_proj_speaker(spk_input)  # [B, 80, T] — time-invariant base
+
+            # ── Content-gated modulation (prevents robotic fixed-filter sound) ──
+            # Time-invariant speaker delta sounds unnatural: same spectral shift
+            # applied to every frame regardless of phoneme. Solution: modulate
+            # delta strength by per-frame content energy. Vowels (high energy)
+            # get full speaker timbre; silence gets none; consonants get partial.
+            # Detach on mel_content prevents CE gradient entering content path.
+            frame_energy = mel_content.detach().abs().mean(dim=1, keepdim=True)  # [B, 1, T]
+            energy_norm = frame_energy / (frame_energy.mean(dim=-1, keepdim=True) + 1e-6)
+            gate = energy_norm.clamp(0, 3.0)  # [B, 1, T] — capped to prevent explosions
+            mel_speaker = mel_speaker_base * gate  # [B, 80, T] — content-gated delta
+
+            # ── Magnitude cap: delta capped to 20% of content std ──────
+            # Without this, CE pushes delta σ above content σ (σ_spk=1.11
+            # vs σ_cont=1.05 at 60ep) — the delta REPLACES content rather
+            # than converting it. Detach: CE gradient flows through
+            # mel_proj_speaker to learn WHICH bands to modulate, but within
+            # a fixed budget. Works at any dataset scale.
+            spk_std = mel_speaker.std(dim=-1, keepdim=True).detach()
+            cont_std = mel_content.detach().std(dim=-1, keepdim=True)
+            spk_scale = (0.2 * cont_std / (spk_std + 1e-6)).clamp(max=1.0)
+            mel_speaker = mel_speaker * spk_scale
         else:
             mel_speaker = torch.zeros_like(mel_content)
 
