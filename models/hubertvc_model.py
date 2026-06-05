@@ -476,30 +476,37 @@ class HubertVCModel(nn.Module):
                 aux["mel_classifier_logits"] = mel_logits
 
             # Pooled mel-bias classifier: gated CE on bias-only component
-            # intermediate: [-3]=prebias(raw), [-2]=variance(post-scale), [-1]=postbias(post-affine)
-            if self.pooled_mel_classifier is not None and len(intermediate) > 6:
-                prebias_mel = intermediate[-3]   # [B, 80, T] raw mel, pre-scale
-                postbias_mel = intermediate[-1]  # [B, 80, T] after speaker bias
-                bias_only = postbias_mel - prebias_mel  # [B, 80, T] scale+affine delta
-                mel_for_ce = prebias_mel.detach() + bias_only
+            # bias_only = postbias_mel - spk_film_mel isolates the affine delta.
+            # Detach on spk_film_mel prevents CE gradient from leaking into
+            # mel_proj / out_scale — gradient reaches ONLY mel_speaker_affine MLP.
+            # intermediate: [-4]=prebias(raw), [-3]=variance(post-scale),
+            #               [-2]=spk_film_mel, [-1]=postbias(post-affine)
+            if self.pooled_mel_classifier is not None and len(intermediate) > 7:
+                spk_film_mel_ce = intermediate[-2]   # [B, 80, T] pre-affine
+                postbias_mel = intermediate[-1]       # [B, 80, T] post-affine
+                bias_only = postbias_mel - spk_film_mel_ce  # delta from affine only
+                mel_for_ce = spk_film_mel_ce.detach() + bias_only
                 mel_pooled = mel_for_ce.mean(dim=-1)
                 pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)
                 aux["pooled_mel_logits"] = pooled_mel_logits
 
-            # Spk_film classifier: taps variance_mel (post-out_scale, pre-affine)
-            if self.spk_film_classifier is not None and len(intermediate) > 6:
-                spk_film_feats = intermediate[-2]  # [B, 80, T] variance_mel (post-out_scale)
+            # Spk_film classifier: taps spk_film_mel (post-out_scale + speaker delta, pre-affine)
+            # Now reads from the post-speaker-delta tensor so CE gradient trains
+            # mel_proj_speaker directly (content path is detached upstream).
+            if self.spk_film_classifier is not None and len(intermediate) > 7:
+                spk_film_feats = intermediate[-2]  # [B, 80, T] spk_film_mel
                 spk_film_feats = F.avg_pool1d(spk_film_feats, kernel_size=3, stride=1, padding=1)
                 spk_film_logits = self.spk_film_classifier(spk_film_feats)
                 aux["spk_film_classifier_logits"] = spk_film_logits
 
             # Three-path gradient separation: expose all intermediate mels
-            #   prebias_mel  (raw, pre-scale)             → L1 target
-            #   variance_mel (post-scale, pre-affine)      → variance target (trains out_scale)
-            #   postbias_mel (post-scale, post-affine)     → speaker stats (detach protected)
-            if len(intermediate) >= 7:
-                aux["prebias_mel"]   = intermediate[-3]   # raw mel — L1 target
-                aux["variance_mel"]  = intermediate[-2]   # post-scale, pre-affine — variance target
+            #   prebias_mel   (raw, pre-scale)              → L1 target (mel_proj_content)
+            #   variance_mel  (post-scale, pre-speaker-delta) → variance target (trains out_scale)
+            #   spk_film_mel  (post-speaker-delta)           → CE target (trains mel_proj_speaker)
+            #   postbias_mel  (post-scale, post-affine)      → speaker stats (detach protected)
+            if len(intermediate) >= 8:
+                aux["prebias_mel"]   = intermediate[-4]   # raw mel (content path) — L1 target
+                aux["variance_mel"]  = intermediate[-3]   # post-scale, pre-speaker-delta — variance target
         
         return pred_mel, loss_dict, aux
 
