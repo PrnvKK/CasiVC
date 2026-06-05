@@ -232,6 +232,67 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}")
         print("\u2705 Saved B\u2192A")
 
+        # ═══════════════════════════════════════════════════════════════
+        # 🔬 SPK_SIM: Speaker similarity from ECAPA embeddings on audio
+        # ═══════════════════════════════════════════════════════════════
+        print("\n" + "="*70)
+        print("🔬 SPK_SIM: ECAPA speaker similarity on vocoded waveforms")
+        print("="*70)
+        # Extract ECAPA embeddings from vocoded waveforms
+        def get_spk_emb(wave_1d):
+            w = wave_1d.unsqueeze(0).to(device)
+            return model.mel_encoder.extract_speaker_features(w, apply_projection=False)  # [1, 192]
+        
+        with torch.no_grad():
+            emb_A = get_spk_emb(wave_AA).squeeze()     # self-recon A→A
+            emb_B = get_spk_emb(wave_BB).squeeze()     # self-recon B→B  
+            emb_AB = get_spk_emb(wave_AB).squeeze()    # cross A→B (target: B)
+            emb_BA = get_spk_emb(wave_BA).squeeze()    # cross B→A (target: A)
+            
+            # Reference embeddings from original content audio (vocoded)
+            emb_gt_A = model.mel_encoder.extract_speaker_features(
+                content_A.unsqueeze(0).to(device), apply_projection=False
+            ).squeeze()
+            emb_gt_B = model.mel_encoder.extract_speaker_features(
+                content_B.unsqueeze(0).to(device), apply_projection=False
+            ).squeeze()
+            
+            def cos_sim(a, b):
+                return torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item()
+            
+            print(f"\n  {'Comparison':<30} {'Cos Sim':>8}  {'Target':<8}")
+            print(f"  {'─'*30} {'─'*8}  {'─'*8}")
+            
+            aa = cos_sim(emb_A, emb_gt_A)
+            bb = cos_sim(emb_B, emb_gt_B)
+            print(f"  {'A→A vs GT_A (self-recon)':<30} {aa:>8.4f}  {'>0.85':>8}")
+            print(f"  {'B→B vs GT_B (self-recon)':<30} {bb:>8.4f}  {'>0.85':>8}")
+            
+            ab = cos_sim(emb_AB, emb_gt_B)
+            ba = cos_sim(emb_BA, emb_gt_A)
+            print(f"  {'A→B vs GT_B (conversion)':<30} {ab:>8.4f}  {'>0.60':>8}")
+            print(f"  {'B→A vs GT_A (conversion)':<30} {ba:>8.4f}  {'>0.60':>8}")
+            
+            leak_ab = cos_sim(emb_AB, emb_gt_A)
+            leak_ba = cos_sim(emb_BA, emb_gt_B)
+            print(f"  {'A→B vs GT_A (source leak)':<30} {leak_ab:>8.4f}  {'<0.30':>8}")
+            print(f"  {'B→A vs GT_B (source leak)':<30} {leak_ba:>8.4f}  {'<0.30':>8}")
+            
+            # If conversions are better than self-recons (unlikely but possible)
+            if ab > aa: print(f"  ⚠️  A→B MORE similar to B than A→A is to A — over-conversion?")
+            if ba > bb: print(f"  ⚠️  B→A MORE similar to A than B→B is to B — over-conversion?")
+            
+            print(f"\n  [VERDICT] ", end="")
+            if ab > 0.60 and leak_ab < 0.30 and ba > 0.60 and leak_ba < 0.30:
+                print("✅ Voice conversion working — high target sim, low source leak")
+            elif ab < 0.40 or ba < 0.40:
+                print("❌ Voice conversion FAILED — output not matching target speaker")
+            elif leak_ab > 0.40 or leak_ba > 0.40:
+                print("❌ Source speaker LEAKING — model outputs source identity")
+            else:
+                print("⚠️  Partial conversion — check individual scores above")
+        print("="*70)
+
     # ═══════════════════════════════════════════════════════════════════
     # STAGE-DELTA AUDIT: A-voice vs B-voice divergence at each pipeline stage
     # ═══════════════════════════════════════════════════════════════════
@@ -364,8 +425,15 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         # Also check speaker path contribution (reads broadcast speaker tokens now)
         spk_pooled_AA = spk_A_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AA.shape[-1])  # [1, 96, T]
         spk_pooled_AB = spk_B_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AB.shape[-1])
-        mel_spk_AA = model.decoder.mel_proj_speaker(spk_pooled_AA)
-        mel_spk_AB = model.decoder.mel_proj_speaker(spk_pooled_AB)
+        mel_spk_base_d4_AA = model.decoder.mel_proj_speaker(spk_pooled_AA)
+        mel_spk_base_d4_AB = model.decoder.mel_proj_speaker(spk_pooled_AB)
+        # Apply content-gated modulation (match decoder forward)
+        fe_d4_AA = mel_norm_AA.detach().abs().mean(dim=1, keepdim=True)
+        fe_d4_AB = mel_norm_AB.detach().abs().mean(dim=1, keepdim=True)
+        en_d4_AA = fe_d4_AA / (fe_d4_AA.mean(dim=-1, keepdim=True) + 1e-6)
+        en_d4_AB = fe_d4_AB / (fe_d4_AB.mean(dim=-1, keepdim=True) + 1e-6)
+        mel_spk_AA = mel_spk_base_d4_AA * en_d4_AA.clamp(0, 3.0)
+        mel_spk_AB = mel_spk_base_d4_AB * en_d4_AB.clamp(0, 3.0)
         aa_c_s = mel_spk_AA.flatten() - mel_spk_AA.flatten().mean()
         ab_c_s = mel_spk_AB.flatten() - mel_spk_AB.flatten().mean()
         cos_spk = torch.nn.functional.cosine_similarity(aa_c_s, ab_c_s, dim=0).item()
@@ -388,8 +456,18 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         # Speaker path now reads broadcast speaker tokens (clean identity, not x)
         spk_pooled_A2 = spk_A_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AA.shape[-1])
         spk_pooled_B2 = spk_B_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AB.shape[-1])
-        mel_spk_AA = model.decoder.mel_proj_speaker(spk_pooled_A2)
-        mel_spk_AB = model.decoder.mel_proj_speaker(spk_pooled_B2)
+        mel_spk_base_AA = model.decoder.mel_proj_speaker(spk_pooled_A2)
+        mel_spk_base_AB = model.decoder.mel_proj_speaker(spk_pooled_B2)
+
+        # ── Content-gated modulation (match decoder forward exactly) ──
+        frame_energy_AA = mel_proj_raw_AA.detach().abs().mean(dim=1, keepdim=True)
+        frame_energy_AB = mel_proj_raw_AB.detach().abs().mean(dim=1, keepdim=True)
+        energy_norm_AA = frame_energy_AA / (frame_energy_AA.mean(dim=-1, keepdim=True) + 1e-6)
+        energy_norm_AB = frame_energy_AB / (frame_energy_AB.mean(dim=-1, keepdim=True) + 1e-6)
+        gate_AA = energy_norm_AA.clamp(0, 3.0)
+        gate_AB = energy_norm_AB.clamp(0, 3.0)
+        mel_spk_AA = mel_spk_base_AA * gate_AA
+        mel_spk_AB = mel_spk_base_AB * gate_AB
 
         # ── mel_scaled: after unconditioned out_scale (content path only) ──
         out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5
@@ -444,6 +522,16 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             sa, sb = aa.std().item(), ab.std().item()
             ratio = sb / (sa + 1e-8)
             print(f"  {name:<17} {l1:>9.4f} {cos:>9.4f} {cos_cent:>9.4f} {sa:>8.4f} {sb:>8.4f} {ratio:>8.3f}")
+    print("="*70)
+    # ── δ_ratio: speaker delta magnitude vs content signal ───
+    delta_ratio = mel_spk_AA.std().item() / (mel_proj_raw_AA.std().item() + 1e-8)
+    print(f"\n  δ_ratio = σ_speaker / σ_content = {delta_ratio:.3f}")
+    if delta_ratio > 0.5:
+        print(f"  ❌ Speaker delta >50% of content — REPLACING content, not converting")
+    elif delta_ratio > 0.2:
+        print(f"  ⚠️  Speaker delta 20-50% of content — significant but may be OK")
+    else:
+        print(f"  ✅ Speaker delta ≤20% of content — subtle timbre, content preserved")
     print("="*70)
     # ═══════════════════════════════════════════════════════════════════
 
