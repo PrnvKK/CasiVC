@@ -319,7 +319,8 @@ class Trainer:
             "Cross-Attention": "cross_attn",
             "Decoder Adapter": "decoder.adapter",
             "Decoder Block 0": "decoder.blocks.0",
-            "Decoder Mel Projection": "decoder.mel_proj",
+            "Decoder Mel Proj (content)": "decoder.mel_proj_content",
+            "Decoder Mel Proj (speaker)": "decoder.mel_proj_speaker",
         }
         
         # Add the final decoder block dynamically if it exists

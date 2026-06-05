@@ -549,19 +549,23 @@ class MobileNetDecoder(nn.Module):
             )
         self.blocks = nn.ModuleList(blocks)
         
-        # ── Monolithic mel projection ───────────────────────────────────────
-        # Conv1d(96→80). Uniform Xavier init on ALL 96 channels (gain=1.0).
-        # No identity shortcut — structural gradient asymmetry eliminated.
-        # All channels compete equally for L1 gradient.  The 3x detach boost
-        # on ch 80-95 gives speaker channels a mild forward advantage without
-        # backward amplification.
-        self.mel_proj = nn.Conv1d(
+        # ── Split mel projection: content path + speaker path ──────────────
+        # Content path (96→80): trained by L1 + Var.  Speaker path (96→80):
+        # trained by spk_film CE only (input detach isolates gradient).
+        # Separate weight matrices eliminate the shared-matrix L1 competition
+        # that killed Fix #17 and Fix #20.  Xavier init on both; speaker
+        # path starts conservative (gain=0.3) to prevent early noise injection.
+        self.mel_proj_content = nn.Conv1d(
             channel_progression[-1], 80, kernel_size=1, bias=True
         )
+        self.mel_proj_speaker = nn.Conv1d(
+            channel_progression[-1], 80, kernel_size=1, bias=False
+        )
         with torch.no_grad():
-            nn.init.xavier_normal_(self.mel_proj.weight.squeeze(-1), gain=1.0)
-        if self.mel_proj.bias is not None:
-            nn.init.constant_(self.mel_proj.bias, -4.5)
+            nn.init.xavier_normal_(self.mel_proj_content.weight.squeeze(-1), gain=1.0)
+            nn.init.xavier_normal_(self.mel_proj_speaker.weight.squeeze(-1), gain=0.3)
+        if self.mel_proj_content.bias is not None:
+            nn.init.constant_(self.mel_proj_content.bias, -4.5)
 
         # Speaker-conditioned FiLM at block3 output: re-injects speaker
         # identity right before mel_proj, directly targeting the cent_cos
@@ -784,16 +788,25 @@ class MobileNetDecoder(nn.Module):
         ch_high = x[:, 80:, :]
         x[:, 80:, :] = ch_high + 2.0 * ch_high.detach()
 
-        # ── Monolithic mel projection ──────────────────────────────────
-        # Conv1d(96→80).  Simple single-path projection from decoder
-        # output to mel bands.  Speaker identity is preserved upstream
-        # (adapter_film, b3_id_film, speaker_film) and downstream
-        # (mel_speaker_affine after out_scale).
-        mel = self.mel_proj(x)  # [B, 80, T]
+        # ── Split mel projection ───────────────────────────────────────
+        # Content path: L1 + Var gradient.  Speaker path: CE gradient only.
+        # Speaker path reads BROADCAST SPEAKER TOKENS (not x) so it has
+        # clean speaker identity unaffected by upstream speaker stripping.
+        # x.detach() was the old approach — caused speaker path to regress
+        # at 20ep as upstream learned to strip speaker info from features.
+        mel_content = self.mel_proj_content(x)          # [B, 80, T]
 
-        # ── Path 1: L1 target — raw mel, pre-scale ────────────────────
-        # L1 trains mel_proj directly. out_scale is NOT in L1's gradient path.
-        prebias_mel = mel  # [B, 80, T] — RAW, before any scaling
+        if speaker_feats is not None:
+            spk_pooled = speaker_feats.mean(dim=1)       # [B, 96]
+            spk_input = spk_pooled.unsqueeze(-1).expand(-1, -1, x.shape[-1])  # [B, 96, T]
+            mel_speaker = self.mel_proj_speaker(spk_input)  # [B, 80, T] — CE-only, time-invariant
+        else:
+            mel_speaker = torch.zeros_like(mel_content)
+
+        # ── Path 1: L1 target — raw mel (content path only) ────────────
+        # L1 trains mel_proj_content directly.  out_scale is NOT in L1's
+        # gradient path.  Speaker delta is NOT in L1's path.
+        prebias_mel = mel_content  # [B, 80, T] — RAW, before any scaling
 
         # ── Decoder output diagnostics ──────────────────────────────────
         out_scale = F.softplus(self.raw_out_scale) + 1.5   # [1, 80, 1]
@@ -808,38 +821,44 @@ class MobileNetDecoder(nn.Module):
             print(f"[decoder] out_bias:  mean={out_bias_vals.mean().item():.4f}, "
                   f"min={out_bias_vals.min().item():.4f}, max={out_bias_vals.max().item():.4f}")
 
-        mel_pre_scale_std = mel.std().item()
-        mel_pre_scale_mean = mel.mean().item()
+        mel_pre_scale_std = mel_content.std().item()
+        mel_pre_scale_mean = mel_content.mean().item()
         if v: print(f"[decoder] pre-scale  mel: mean={mel_pre_scale_mean:.4f}, std={mel_pre_scale_std:.4f}")
 
         # DECOUPLED SCALING: out_scale amplifies deviation from per-band mean.
         # Used ONLY by variance loss (λ=30) — L1 sees raw prebias_mel above.
-        mel_band_mean = mel.mean(dim=-1, keepdim=True)       # [B, 80, 1] per-band temporal mean
-        mel_centered  = mel - mel_band_mean                   # zero-mean per band per utterance
-        mel_scaled    = mel_centered * out_scale + mel_band_mean + self.out_bias
-        mel_post_scale_std = mel_scaled.std().item()
-        mel_post_scale_mean = mel_scaled.mean().item()
+        mel_band_mean = mel_content.mean(dim=-1, keepdim=True)       # [B, 80, 1] per-band temporal mean
+        mel_centered  = mel_content - mel_band_mean                   # zero-mean per band per utterance
+        variance_mel  = mel_centered * out_scale + mel_band_mean + self.out_bias
+        mel_post_scale_std = variance_mel.std().item()
+        mel_post_scale_mean = variance_mel.mean().item()
         if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
 
-        # ── Path 2: Variance target — post-scale, pre-affine ───────────
+        # ── Path 2: Variance target — post-scale, pre-speaker-delta ────
         # Variance loss (λ=30) trains out_scale through this path.
         # L1 gradient on out_scale ≈ 0 (centered scaling kills it),
         # so variance gradient on out_scale is uncontested.
-        variance_mel = mel_scaled  # [B, 80, T] — variance target
+        # variance_mel is already defined above — this is the Var target.
+
+        # ── Add speaker delta (CE gradient to speaker path only) ──────
+        # DETACH on variance_mel: CE gradient flows ONLY through
+        # mel_speaker → mel_proj_speaker, not through content path.
+        # Speaker path has dedicated weights → zero L1 competition.
+        spk_film_mel = variance_mel.detach() + mel_speaker  # [B, 80, T]
 
         # ── Path 3: Speaker target — post-affine, final output ─────────
         # DETACH: cross-pair stats (weight 6.0) gradient stops at
         # speaker_affine MLP. Cannot flood upstream blocks via out_scale
         # or mel_proj, protecting FiLM modules from L1 competition.
         if speaker_feats is not None:
-            mel_scaled = self.mel_speaker_affine(mel_scaled.detach(), speaker_feats)
-            self._check(mel_scaled, "mel_spk_affine")
+            postbias_mel = self.mel_speaker_affine(spk_film_mel.detach(), speaker_feats)
+            self._check(postbias_mel, "mel_spk_affine")
+        else:
+            postbias_mel = spk_film_mel
 
-        postbias_mel = mel_scaled
+        mel = torch.clamp(postbias_mel, min=-11.5, max=2.0)
 
-        mel = torch.clamp(mel_scaled, min=-11.5, max=2.0)
-
-        clamp_mask = (mel_scaled < -11.5) | (mel_scaled > 2.0)
+        clamp_mask = (postbias_mel < -11.5) | (postbias_mel > 2.0)
         clamp_pct = clamp_mask.float().mean().item() * 100
         if v: print(f"[decoder] clamp saturation: {clamp_pct:.2f}% of values at boundary")
 
@@ -849,9 +868,10 @@ class MobileNetDecoder(nn.Module):
         self._check(mel, "mel_proj")
         
         if should_return_feats:
-            intermediate.append(prebias_mel)   # [-3] raw mel (pre-scale) — L1 target
-            intermediate.append(variance_mel)  # [-2] post-scale, pre-affine — variance target
-            intermediate.append(postbias_mel)  # [-1] post-affine, pre-clamp — speaker target
+            intermediate.append(prebias_mel)     # [-4] raw mel (content path) — L1 target
+            intermediate.append(variance_mel)    # [-3] post-scale, pre-speaker-delta — Var target
+            intermediate.append(spk_film_mel)    # [-2] post-speaker-delta, pre-affine — CE target
+            intermediate.append(postbias_mel)    # [-1] post-affine, pre-clamp — Speaker target
             return mel, intermediate
         return mel
     

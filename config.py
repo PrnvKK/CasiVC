@@ -158,9 +158,9 @@ class TrainingConfig:
   cross_pair_stats_weight: float = 6.0   # raised from 2.0: equal footing with self-pair L1 (λ_mel=5.0). Forces model to match target speaker spectral shape as strongly as it reconstructs content.
 
   # Speaker classifier head at decoder bottleneck
-  classifier_weight: float = 0.3         # weight for per-frame CE loss on target speaker ID (block2 + block3)
+  classifier_weight: float = 1.0         # raised from 0.6: speaker path now reads pure speaker tokens (no content contamination). CE gradient clean, no L1 competition on separate weights.
   mel_classifier_weight: float = 0.0   # disabled: per-frame mel Conv1d CE caused upstream regression
-  pooled_mel_ce_weight: float = 0.0    # disabled: pooled CE gradient competes with new spk_film_classifier; MelSpeakerAffine kept as passive backup
+  pooled_mel_ce_weight: float = 2.0    # enabled: trains mel_speaker_affine MLP with discriminative gradient. Detach isolates from L1/Var paths.
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
