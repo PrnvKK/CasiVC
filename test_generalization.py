@@ -87,31 +87,26 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("🔬 DIAGNOSTIC 2: mel_proj weight channel utilization (split paths)")
     print("="*70)
     with torch.no_grad():
-        w_content = model.decoder.mel_proj_content.weight  # [80, 96, 1]
-        w_speaker = model.decoder.mel_proj_speaker.weight  # [80, 96, 1]
+        w_content = model.decoder.mel_proj_content.weight  # [80, 80, 1]
+        w_speaker = model.decoder.mel_proj_speaker.weight  # [80, 16, 1]
         
         # Content path
-        wc_norm = w_content.squeeze(-1).norm(p=2, dim=0)  # [96]
-        wc_lo = wc_norm[:80]
-        wc_hi = wc_norm[80:]
-        print(f"  [CONTENT PATH] ch 0-79:  mean L2={wc_lo.mean():.6f}, ch 80-95: mean L2={wc_hi.mean():.6f}, ratio={wc_hi.mean()/(wc_lo.mean()+1e-8):.4f}")
+        wc_norm = w_content.squeeze(-1).norm(p=2, dim=0)  # [80]
+        print(f"  [CONTENT PATH] ch 0-79:  mean L2={wc_norm.mean():.6f}")
         
         # Speaker path
-        ws_norm = w_speaker.squeeze(-1).norm(p=2, dim=0)  # [96]
-        ws_lo = ws_norm[:80]
-        ws_hi = ws_norm[80:]
-        print(f"  [SPEAKER PATH] ch 0-79:  mean L2={ws_lo.mean():.6f}, ch 80-95: mean L2={ws_hi.mean():.6f}, ratio={ws_hi.mean()/(ws_lo.mean()+1e-8):.4f}")
+        ws_norm = w_speaker.squeeze(-1).norm(p=2, dim=0)  # [16]
+        print(f"  [SPEAKER PATH] ch 80-95: mean L2={ws_norm.mean():.6f}")
         
         # Per-output-channel breakdown for speaker path
-        ws_mat = w_speaker.squeeze(-1)  # [80, 96]
-        ws_to_hi = ws_mat[:, 80:].norm(p=2, dim=1)  # [80]
+        ws_to_hi = w_speaker.squeeze(-1).norm(p=2, dim=1)  # [80]
         n_active = (ws_to_hi > 0.01).sum().item()
-        print(f"  Speaker path output channels with |w_hi| > 0.01: {n_active}/80")
+        print(f"  Speaker path output channels with |w_s| > 0.01: {n_active}/80")
         print(f"  [VERDICT] ", end="")
-        if ws_hi.mean() < 0.005:
+        if ws_norm.mean() < 0.005:
             print("Speaker path channels 80-95 are DEAD. CE gradient may be insufficient.")
         else:
-            print("Speaker path channels 80-95 are ACTIVE. Split architecture working.")
+            print("Speaker path channels 80-95 are ACTIVE. Explicit partition working.")
     print("="*70)
 
     # ── Speaker Space Diagnostic ─────────────────────────────────────────
@@ -403,28 +398,17 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print("🔬 DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj_content input")
         print("-"*60)
         # Normal path cent_cos (content path only for apples-to-apples comparison)
-        mel_norm_AA = model.decoder.mel_proj_content(film_AA)
-        mel_norm_AB = model.decoder.mel_proj_content(film_AB)
+        mel_norm_AA = model.decoder.mel_proj_content(film_AA[:, :80, :])
+        mel_norm_AB = model.decoder.mel_proj_content(film_AB[:, :80, :])
         aa_c_n = mel_norm_AA.flatten() - mel_norm_AA.flatten().mean()
         ab_c_n = mel_norm_AB.flatten() - mel_norm_AB.flatten().mean()
         cos_norm = torch.nn.functional.cosine_similarity(aa_c_n, ab_c_n, dim=0).item()
-        # Ablated: zero out channels 80-95 before mel_proj_content
-        film_AA_abl = film_AA.clone()
-        film_AB_abl = film_AB.clone()
-        film_AA_abl[:, 80:, :] = 0.0
-        film_AB_abl[:, 80:, :] = 0.0
-        mel_abl_AA = model.decoder.mel_proj_content(film_AA_abl)
-        mel_abl_AB = model.decoder.mel_proj_content(film_AB_abl)
-        aa_c_a = mel_abl_AA.flatten() - mel_abl_AA.flatten().mean()
-        ab_c_a = mel_abl_AB.flatten() - mel_abl_AB.flatten().mean()
-        cos_abl = torch.nn.functional.cosine_similarity(aa_c_a, ab_c_a, dim=0).item()
-        print(f"  Normal    mel_proj_content cent_cos: {cos_norm:.4f}")
-        print(f"  Ablated   mel_proj_content cent_cos: {cos_abl:.4f}")
-        delta = cos_abl - cos_norm
-        print(f"  Delta (ablated - normal):             {delta:+.4f}")
-        # Also check speaker path contribution (reads broadcast speaker tokens now)
-        spk_pooled_AA = spk_A_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AA.shape[-1])  # [1, 96, T]
-        spk_pooled_AB = spk_B_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AB.shape[-1])
+        
+        print(f"  Normal    mel_proj_content cent_cos: {cos_norm:.4f} (Isolated!)")
+
+        # Also check speaker path contribution (reads dynamic temporal features now)
+        spk_pooled_AA = film_AA[:, 80:, :]  # [B, 16, T]
+        spk_pooled_AB = film_AB[:, 80:, :]
         mel_spk_base_d4_AA = model.decoder.mel_proj_speaker(spk_pooled_AA)
         mel_spk_base_d4_AB = model.decoder.mel_proj_speaker(spk_pooled_AB)
         # Apply content-gated modulation (match decoder forward)
@@ -432,32 +416,28 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         fe_d4_AB = mel_norm_AB.detach().abs().mean(dim=1, keepdim=True)
         en_d4_AA = fe_d4_AA / (fe_d4_AA.mean(dim=-1, keepdim=True) + 1e-6)
         en_d4_AB = fe_d4_AB / (fe_d4_AB.mean(dim=-1, keepdim=True) + 1e-6)
-        mel_spk_AA = mel_spk_base_d4_AA * en_d4_AA.clamp(0, 3.0)
-        mel_spk_AB = mel_spk_base_d4_AB * en_d4_AB.clamp(0, 3.0)
-        aa_c_s = mel_spk_AA.flatten() - mel_spk_AA.flatten().mean()
-        ab_c_s = mel_spk_AB.flatten() - mel_spk_AB.flatten().mean()
+        mel_spk_AA_d4 = mel_spk_base_d4_AA * en_d4_AA.clamp(0, 3.0)
+        mel_spk_AB_d4 = mel_spk_base_d4_AB * en_d4_AB.clamp(0, 3.0)
+        aa_c_s = mel_spk_AA_d4.flatten() - mel_spk_AA_d4.flatten().mean()
+        ab_c_s = mel_spk_AB_d4.flatten() - mel_spk_AB_d4.flatten().mean()
         cos_spk = torch.nn.functional.cosine_similarity(aa_c_s, ab_c_s, dim=0).item()
         print(f"  Speaker path alone    cent_cos: {cos_spk:.4f}")
-        spk_delta_std = mel_spk_AA.std().item()
+        spk_delta_std = mel_spk_AA_d4.std().item()
         print(f"  Speaker path delta std: {spk_delta_std:.4f} (>0.05 = active)")
         print(f"  [VERDICT] ", end="")
-        if abs(delta) < 0.02:
+        if spk_delta_std < 0.05:
             print("Channels 80-95 contribute NEGLIGIBLE speaker info at mel_proj. Functionally dead.")
-        elif delta > 0.05:
-            print("Channels 80-95 carry speaker info — ablation IMPROVES separation (suggests noise from dead channels).")
-        elif delta < -0.02:
-            print("Channels 80-95 carry speaker info — ablation WORSENS separation. mel_proj has partially learned to use them.")
         else:
-            print(f"Channels 80-95 have MARGINAL contribution (|Δ|={abs(delta):.3f}).")
+            print("Channels 80-95 carry ACTIVE dynamic speaker info. Explicit isolation working.")
 
         # ── Split mel_proj: content + speaker paths ──
-        mel_proj_raw_AA = model.decoder.mel_proj_content(film_AA)  # content path only
-        mel_proj_raw_AB = model.decoder.mel_proj_content(film_AB)
-        # Speaker path now reads broadcast speaker tokens (clean identity, not x)
-        spk_pooled_A2 = spk_A_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AA.shape[-1])
-        spk_pooled_B2 = spk_B_t.mean(dim=1).unsqueeze(-1).expand(-1, -1, film_AB.shape[-1])
-        mel_spk_base_AA = model.decoder.mel_proj_speaker(spk_pooled_A2)
-        mel_spk_base_AB = model.decoder.mel_proj_speaker(spk_pooled_B2)
+        mel_proj_raw_AA = model.decoder.mel_proj_content(film_AA[:, :80, :])  # content path only
+        mel_proj_raw_AB = model.decoder.mel_proj_content(film_AB[:, :80, :])
+        # Speaker path now reads dynamic features
+        spk_feat_AA = film_AA[:, 80:, :]
+        spk_feat_AB = film_AB[:, 80:, :]
+        mel_spk_base_AA = model.decoder.mel_proj_speaker(spk_feat_AA)
+        mel_spk_base_AB = model.decoder.mel_proj_speaker(spk_feat_AB)
 
         # ── Content-gated modulation (match decoder forward exactly) ──
         frame_energy_AA = mel_proj_raw_AA.detach().abs().mean(dim=1, keepdim=True)
@@ -468,6 +448,17 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         gate_AB = energy_norm_AB.clamp(0, 3.0)
         mel_spk_AA = mel_spk_base_AA * gate_AA
         mel_spk_AB = mel_spk_base_AB * gate_AB
+
+        # ── Magnitude cap: delta capped to 20% of content std ──────
+        spk_std_AA = mel_spk_AA.std(dim=-1, keepdim=True).detach()
+        cont_std_AA = mel_proj_raw_AA.detach().std(dim=-1, keepdim=True)
+        spk_scale_AA = (0.2 * cont_std_AA / (spk_std_AA + 1e-6)).clamp(max=1.0)
+        mel_spk_AA = mel_spk_AA * spk_scale_AA
+
+        spk_std_AB = mel_spk_AB.std(dim=-1, keepdim=True).detach()
+        cont_std_AB = mel_proj_raw_AB.detach().std(dim=-1, keepdim=True)
+        spk_scale_AB = (0.2 * cont_std_AB / (spk_std_AB + 1e-6)).clamp(max=1.0)
+        mel_spk_AB = mel_spk_AB * spk_scale_AB
 
         # ── mel_scaled: after unconditioned out_scale (content path only) ──
         out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5
