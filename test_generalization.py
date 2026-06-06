@@ -188,7 +188,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.speaker_film._verbose = False
     model.decoder.block3_id_film._verbose = False
     model.decoder.adapter_speaker_film._verbose = False
-    model.decoder.mel_speaker_affine._verbose = False
+    model.decoder.mel_speaker_film._verbose = False
     for blk in model.decoder.blocks:
         blk._verbose = False
     model.mel_encoder._verbose = False
@@ -370,36 +370,36 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print("-"*60)
         chan_diff = (film_AA - film_AB).abs().mean(dim=-1).squeeze(0)  # [96]
         _, rank_order = chan_diff.sort(descending=True)
-        low_diff = chan_diff[:80]   # channels 0-79 (identity path)
-        high_diff = chan_diff[80:]  # channels 80-95 (zero-init path)
-        print(f"  Mean divergence ch 0-79:  {low_diff.mean():.6f}")
-        print(f"  Mean divergence ch 80-95: {high_diff.mean():.6f}")
-        print(f"  Ratio (80-95 / 0-79):     {high_diff.mean()/(low_diff.mean()+1e-8):.4f}")
+        low_diff = chan_diff[:64]   # channels 0-63 (identity path)
+        high_diff = chan_diff[64:]  # channels 64-95 (zero-init path)
+        print(f"  Mean divergence ch 0-63:  {low_diff.mean():.6f}")
+        print(f"  Mean divergence ch 64-95: {high_diff.mean():.6f}")
+        print(f"  Ratio (64-95 / 0-63):     {high_diff.mean()/(low_diff.mean()+1e-8):.4f}")
         top16 = set(rank_order[:16].tolist())
-        in_high = sum(1 for i in top16 if i >= 80)
-        print(f"  Top-16 channels: {in_high}/16 are in range 80-95")
+        in_high = sum(1 for i in top16 if i >= 64)
+        print(f"  Top-16 channels: {in_high}/16 are in range 64-95")
         print(f"  Top-16 channel indices (sorted): {sorted(top16)}")
         print(f"  Top-10 per-channel divergences:")
         for rank_idx, ch_idx in enumerate(rank_order[:10].tolist()):
-            zone = " ← ZERO-INIT (80-95)" if ch_idx >= 80 else ""
+            zone = " ← ZERO-INIT (64-95)" if ch_idx >= 64 else ""
             print(f"    #{rank_idx+1}: ch {ch_idx:3d}  div={chan_diff[ch_idx]:.6f}{zone}")
         print(f"  [VERDICT] ", end="")
         if in_high >= 8:
-            print("Speaker info CONCENTRATED in ch 80-95. Identity-init mel_proj is structurally wrong.")
+            print("Speaker info CONCENTRATED in ch 64-95. Identity-init mel_proj is structurally wrong.")
         elif in_high >= 3:
             print("Speaker info MIXED across channel groups. mel_proj partially usable but erodes high channels.")
         else:
-            print("Speaker info in ch 0-79. mel_proj identity path should preserve it. Erosion has different cause.")
+            print("Speaker info in ch 0-63. mel_proj identity path should preserve it. Erosion has different cause.")
 
         # ═══════════════════════════════════════════════════════════════
-        # DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj_content input
+        # DIAGNOSTIC 4: Channel 64-95 ablation at mel_proj_content input
         # ═══════════════════════════════════════════════════════════════
         print("\n" + "-"*60)
-        print("🔬 DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj_content input")
+        print("🔬 DIAGNOSTIC 4: Channel 64-95 ablation at mel_proj_content input")
         print("-"*60)
         # Normal path cent_cos (content path only for apples-to-apples comparison)
-        mel_norm_AA = model.decoder.mel_proj_content(film_AA[:, :80, :])
-        mel_norm_AB = model.decoder.mel_proj_content(film_AB[:, :80, :])
+        mel_norm_AA = model.decoder.mel_proj_content(film_AA[:, :64, :])
+        mel_norm_AB = model.decoder.mel_proj_content(film_AB[:, :64, :])
         aa_c_n = mel_norm_AA.flatten() - mel_norm_AA.flatten().mean()
         ab_c_n = mel_norm_AB.flatten() - mel_norm_AB.flatten().mean()
         cos_norm = torch.nn.functional.cosine_similarity(aa_c_n, ab_c_n, dim=0).item()
@@ -407,8 +407,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Normal    mel_proj_content cent_cos: {cos_norm:.4f} (Isolated!)")
 
         # Also check speaker path contribution (reads dynamic temporal features now)
-        spk_pooled_AA = film_AA[:, 80:, :]  # [B, 16, T]
-        spk_pooled_AB = film_AB[:, 80:, :]
+        spk_pooled_AA = film_AA[:, 64:, :]  # [B, 32, T]
+        spk_pooled_AB = film_AB[:, 64:, :]
         mel_spk_base_d4_AA = model.decoder.mel_proj_speaker(spk_pooled_AA)
         mel_spk_base_d4_AB = model.decoder.mel_proj_speaker(spk_pooled_AB)
         # Apply content-gated modulation (match decoder forward)
@@ -426,16 +426,16 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Speaker path delta std: {spk_delta_std:.4f} (>0.05 = active)")
         print(f"  [VERDICT] ", end="")
         if spk_delta_std < 0.05:
-            print("Channels 80-95 contribute NEGLIGIBLE speaker info at mel_proj. Functionally dead.")
+            print("Channels 64-95 contribute NEGLIGIBLE speaker info at mel_proj. Functionally dead.")
         else:
-            print("Channels 80-95 carry ACTIVE dynamic speaker info. Explicit isolation working.")
+            print("Channels 64-95 carry ACTIVE dynamic speaker info. Explicit isolation working.")
 
         # ── Split mel_proj: content + speaker paths ──
-        mel_proj_raw_AA = model.decoder.mel_proj_content(film_AA[:, :80, :])  # content path only
-        mel_proj_raw_AB = model.decoder.mel_proj_content(film_AB[:, :80, :])
+        mel_proj_raw_AA = model.decoder.mel_proj_content(film_AA[:, :64, :])  # content path only
+        mel_proj_raw_AB = model.decoder.mel_proj_content(film_AB[:, :64, :])
         # Speaker path now reads dynamic features
-        spk_feat_AA = film_AA[:, 80:, :]
-        spk_feat_AB = film_AB[:, 80:, :]
+        spk_feat_AA = film_AA[:, 64:, :]
+        spk_feat_AB = film_AB[:, 64:, :]
         mel_spk_base_AA = model.decoder.mel_proj_speaker(spk_feat_AA)
         mel_spk_base_AB = model.decoder.mel_proj_speaker(spk_feat_AB)
 
@@ -450,13 +450,13 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_spk_AB = mel_spk_base_AB * gate_AB
 
         # ── Magnitude cap: delta capped to 20% of content std ──────
-        spk_std_AA = mel_spk_AA.std(dim=-1, keepdim=True).detach()
-        cont_std_AA = mel_proj_raw_AA.detach().std(dim=-1, keepdim=True)
+        spk_std_AA = mel_spk_AA.flatten(1).std(dim=-1).view(-1, 1, 1).detach()
+        cont_std_AA = mel_proj_raw_AA.detach().flatten(1).std(dim=-1).view(-1, 1, 1)
         spk_scale_AA = (0.2 * cont_std_AA / (spk_std_AA + 1e-6)).clamp(max=1.0)
         mel_spk_AA = mel_spk_AA * spk_scale_AA
 
-        spk_std_AB = mel_spk_AB.std(dim=-1, keepdim=True).detach()
-        cont_std_AB = mel_proj_raw_AB.detach().std(dim=-1, keepdim=True)
+        spk_std_AB = mel_spk_AB.flatten(1).std(dim=-1).view(-1, 1, 1).detach()
+        cont_std_AB = mel_proj_raw_AB.detach().flatten(1).std(dim=-1).view(-1, 1, 1)
         spk_scale_AB = (0.2 * cont_std_AB / (spk_std_AB + 1e-6)).clamp(max=1.0)
         mel_spk_AB = mel_spk_AB * spk_scale_AB
 
@@ -476,9 +476,9 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         spk_film_AA = mel_scaled_AA.detach() + mel_spk_AA
         spk_film_AB = mel_scaled_AB.detach() + mel_spk_AB
 
-        # ── mel_spk_affine: speaker-conditioned bias AFTER out_scale ──
-        mel_affine_AA = model.decoder.mel_speaker_affine(spk_film_AA.detach(), spk_A_t)
-        mel_affine_AB = model.decoder.mel_speaker_affine(spk_film_AB.detach(), spk_B_t)
+        # ── mel_spk_film: speaker-conditioned bias AFTER out_scale ──
+        mel_affine_AA = model.decoder.mel_speaker_film(spk_film_AA.detach(), spk_A_t)
+        mel_affine_AB = model.decoder.mel_speaker_film(spk_film_AB.detach(), spk_B_t)
 
         # ── mel_scaled_final: after clamp (final model output) ──
         mel_final_AA = torch.clamp(mel_affine_AA, min=-11.5, max=2.0)
@@ -496,10 +496,10 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("b3_body", b3_body_AA, b3_body_AB),
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
-            ("mel_content", mel_proj_raw_AA, mel_proj_raw_AB),    # content path Conv1d(96→80)
-            ("mel_speaker", mel_spk_AA, mel_spk_AB),               # speaker path Conv1d(96→80)
-            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),           # after out_scale (pre-spkr-delta)
-            ("mel_spk_affine", mel_affine_AA, mel_affine_AB),      # after speaker bias
+            ("mel_content", mel_proj_raw_AA, mel_proj_raw_AB),    # content path
+            ("mel_speaker", mel_spk_AA, mel_spk_AB),               # speaker path
+            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),          # post variance scaling
+            ("mel_spk_film", mel_affine_AA, mel_affine_AB),      # final output before clamp
             ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
         ]
         print(f"  {'Stage':<17} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
@@ -533,7 +533,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model.decoder.speaker_film._verbose = True
     model.decoder.block3_id_film._verbose = True
     model.decoder.adapter_speaker_film._verbose = True
-    model.decoder.mel_speaker_affine._verbose = True
+    model.decoder.mel_speaker_film._verbose = True
     for blk in model.decoder.blocks:
         blk._verbose = True
     # ─────────────────────────────────────────────────────────────────
@@ -574,7 +574,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     # Suppress verbose prints during gradient pass
     saved_verbose = {}
     for name in ['_verbose', 'cross_attn', 'decoder', 'speaker_film',
-                 'block3_id_film', 'adapter_speaker_film', 'mel_speaker_affine']:
+                 'block3_id_film', 'adapter_speaker_film', 'mel_speaker_film']:
         if name == '_verbose':
             saved_verbose[name] = model._verbose
             model._verbose = False
@@ -595,13 +595,13 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         elif name == 'adapter_speaker_film':
             saved_verbose[name] = model.decoder.adapter_speaker_film._verbose
             model.decoder.adapter_speaker_film._verbose = False
-        elif name == 'mel_speaker_affine':
-            saved_verbose[name] = model.decoder.mel_speaker_affine._verbose
-            model.decoder.mel_speaker_affine._verbose = False
+        elif name == 'mel_speaker_film':
+            saved_verbose[name] = model.decoder.mel_speaker_film._verbose
+            model.decoder.mel_speaker_film._verbose = False
 
-    aff = model.decoder.mel_speaker_affine
+    aff = model.decoder.mel_speaker_film
 
-    # Freeze all model parameters, enable grad only on mel_spk_affine
+    # Freeze all model parameters, enable grad only on mel_spk_film
     for p in model.parameters():
         p.requires_grad = False
     for p in aff.parameters():
@@ -622,7 +622,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
 
     # Log gradient norms
     mlp0 = aff.mlp[0]   # Linear(96, 96)
-    mlp2 = aff.mlp[2]   # Linear(96, 80)
+    mlp2 = aff.mlp[2]   # Linear(96, 160)
     print(f"  L1 loss value: {l1_loss.item():.6f}")
     print(f"  --- Gradient norms (L2) ---")
     if mlp0.weight.grad is not None:
@@ -630,24 +630,24 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     else:
         print(f"  mlp[0].weight (96→96):       NO GRADIENT")
     if mlp2.weight.grad is not None:
-        print(f"  mlp[2].weight (96→80):       {mlp2.weight.grad.norm():.6f}")
+        print(f"  mlp[2].weight (96→160):       {mlp2.weight.grad.norm():.6f}")
     else:
-        print(f"  mlp[2].weight (96→80):       NO GRADIENT")
+        print(f"  mlp[2].weight (96→160):       NO GRADIENT")
     if mlp2.bias.grad is not None:
-        print(f"  mlp[2].bias (80):            {mlp2.bias.grad.norm():.6f}")
+        print(f"  mlp[2].bias (160):            {mlp2.bias.grad.norm():.6f}")
     
-    if hasattr(aff, 'raw_delta_scale') and aff.raw_delta_scale.grad is not None:
-        ds_grad_val = aff.raw_delta_scale.grad.item()
-        print(f"  raw_delta_scale grad:        {ds_grad_val:+.6f}")
+    if hasattr(aff, 'raw_film_scale') and aff.raw_film_scale.grad is not None:
+        ds_grad_val = aff.raw_film_scale.grad.item()
+        print(f"  raw_film_scale grad:        {ds_grad_val:+.6f}")
         print(f"  [VERDICT] ", end="")
         if ds_grad_val < -0.0001:
-            print("L1 PUSHES delta_scale DOWN. L1 actively suppresses speaker envelope shifts.")
+            print("L1 PUSHES film_scale DOWN. L1 actively suppresses speaker envelope shifts.")
         elif ds_grad_val > 0.0001:
-            print("L1 pushes delta_scale UP. L1 actually wants more spectral shift.")
+            print("L1 pushes film_scale UP. L1 actually wants more spectral shift.")
         else:
-            print("L1 gradient on delta_scale is NEAR ZERO.")
+            print("L1 gradient on film_scale is NEAR ZERO.")
     else:
-        print(f"  raw_delta_scale grad:        NO GRADIENT (or missing)")
+        print(f"  raw_film_scale grad:        NO GRADIENT (or missing)")
         print(f"  [VERDICT] Cannot determine.")
 
     # Cleanup

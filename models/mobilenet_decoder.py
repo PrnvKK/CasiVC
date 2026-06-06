@@ -262,75 +262,48 @@ class SpeakerFiLM(nn.Module):
 # --------------------------------------------------------------------------- #
 
 
-class MelSpeakerAffine(nn.Module):
-    """Speaker residual delta applied AFTER out_scale.
-
-    Instead of a full FiLM (scale+shift) that scales the entire mel
-    (which can homogenize content across speakers to satisfy L1), this
-    module purely learns an ADDITIVE spectral envelope shift per speaker.
-    
-    mel = mel + delta_scale * tanh(speaker_raw)
-    
-    This gives the speaker module a much cleaner mathematical role: 
-    add target-speaker spectral characteristics without rescaling the 
-    underlying content dynamics.
-    """
-    def __init__(self, speaker_dim: int = 96, n_mel_bands: int = 80):
+class MelSpeakerFiLM(nn.Module):
+    """Per-frame FiLM on 80 mel bands after out_scale."""
+    def __init__(self, speaker_dim=96, n_mel_bands=80, mlp_gain=0.3):
         super().__init__()
-        self.speaker_dim = speaker_dim
-        self.n_mel_bands = n_mel_bands
-
         self.mlp = nn.Sequential(
             nn.Linear(speaker_dim, speaker_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(speaker_dim, n_mel_bands),  # speaker_raw
+            nn.Linear(speaker_dim, n_mel_bands * 2),  # gamma + beta per band
         )
-
         with torch.no_grad():
             for m in self.mlp.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.2)
+                    nn.init.xavier_uniform_(m.weight, gain=mlp_gain)
                     nn.init.zeros_(m.bias)
-
-        # Learnable amplitude for the delta.
-        # softplus(0) + 0.1 ≈ 0.79 max amplitude.
-        self.raw_delta_scale = nn.Parameter(torch.tensor(0.0))
-
+        self.raw_film_scale = nn.Parameter(torch.tensor(0.0))  # softplus+0.5 ≈ 1.19
         self._verbose = True
 
     def forward(self, mel: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            mel:           [B, 80, T] mel after out_scale (pre-clamp)
-            speaker_feats: [B, num_tokens, speaker_dim] speaker tokens
-        Returns:
-            mel + speaker_delta: [B, 80, T]
-        """
-        # Pool speaker tokens: mean over token dimension → [B, speaker_dim]
-        spk_pooled = speaker_feats.mean(dim=1)
-
-        # Generate raw delta
-        speaker_raw = self.mlp(spk_pooled)                       # [B, 80]
-
-        # Learnable scale (softplus reparam, min 0.1 authority)
-        delta_scale = F.softplus(self.raw_delta_scale) + 0.1
+        # mel: [B, 80, T], speaker_feats: [B, num_tokens, 96]
+        spk_pooled = speaker_feats.mean(dim=1)  # [B, 96]
+        film_params = self.mlp(spk_pooled)       # [B, 160]
+        gamma, beta = film_params.chunk(2, dim=-1)  # [B, 80] each
         
-        # Bounded additive delta
-        speaker_delta = delta_scale * torch.tanh(speaker_raw)    # [B, 80]
-
-        # Reshape for broadcasting over temporal dim: [B, 80, 1]
-        speaker_delta = speaker_delta.unsqueeze(-1)
-
+        film_scale = F.softplus(self.raw_film_scale) + 0.5
+        gamma = F.elu(gamma * film_scale)  # inversion guard
+        beta = beta * film_scale
+        
+        gamma = gamma.unsqueeze(-1)  # [B, 80, 1]
+        beta = beta.unsqueeze(-1)
+        
         if self._verbose:
-            d = speaker_delta.squeeze(-1)  # [B, 80]
-            self._last_gamma_std = d.std().item()  # stored for audit to prevent crash
-            print(f"[mel_spk_affine] delta_scale: {delta_scale.item():.4f}")
-            print(f"[mel_spk_affine] speaker_delta: mean={d.mean():.4f}, std={d.std():.4f}, "
-                  f"min={d.min():.4f}, max={d.max():.4f}")
+            g = gamma.squeeze(-1)  # [B, 80]
+            b = beta.squeeze(-1)
+            self._last_gamma_std = g.std().item()  # stored for audit to prevent crash
+            print(f"[mel_spk_film] film_scale: {film_scale.item():.4f}")
+            print(f"[mel_spk_film] gamma: mean={g.mean():.4f}, std={g.std():.4f}, "
+                  f"min={g.min():.4f}, max={g.max():.4f}")
+            print(f"[mel_spk_film] beta: mean={b.mean():.4f}, std={b.std():.4f}, "
+                  f"min={b.min():.4f}, max={b.max():.4f}")
 
-        # Additive residual
-        mel = mel + speaker_delta
-        return mel
+        # Per-frame FiLM: mel * (1 + gamma) + beta
+        return mel * (1.0 + gamma) + beta
 
 
 # --------------------------------------------------------------------------- #
@@ -556,10 +529,10 @@ class MobileNetDecoder(nn.Module):
         # Content path (80→80): trained by L1 + Var.
         # Speaker path (16→80): trained by spk_film CE only.
         self.mel_proj_content = nn.Conv1d(
-            80, 80, kernel_size=1, bias=True
+            64, 80, kernel_size=1, bias=True
         )
         self.mel_proj_speaker = nn.Conv1d(
-            16, 80, kernel_size=1, bias=False
+            32, 80, kernel_size=1, bias=False
         )
         with torch.no_grad():
             nn.init.xavier_normal_(self.mel_proj_content.weight.squeeze(-1), gain=1.0)
@@ -608,7 +581,7 @@ class MobileNetDecoder(nn.Module):
         # asymmetry (cent_cos barely moved 0.7718→0.7681).  FiLM gives
         # per-band scaling (gamma) to address variance + shift (beta)
         # for timbre.  Only injection point after both erasure points.
-        self.mel_speaker_affine = MelSpeakerAffine(
+        self.mel_speaker_film = MelSpeakerFiLM(
             speaker_dim=config.speaker_projection_dim,     # 96
             n_mel_bands=80,                                 # 80 mel bands
         )
@@ -778,19 +751,18 @@ class MobileNetDecoder(nn.Module):
         # 192→96 residual_proj crushes speaker info (cent_cos 0.49→0.75).
         if speaker_feats is not None:
             x = self.speaker_film(x, speaker_feats)
+
             self._check(x, "spk_film")
 
-        # ── Channel rebalancing (gradient-decoupled): ch 80-95 carry speaker
-        # divergence but mel_proj's identity init gives ch 0-79 4x weight
-        # advantage (0.27 vs 0.99). 3x forward boost equalizes contribution,
-        # detach prevents L1 from punishing upstream FiLM through amplified
-        # backward gradient.
-        ch_high = x[:, 80:, :]
-        x[:, 80:, :] = ch_high + 2.0 * ch_high.detach()
+        # ── Channel rebalancing (gradient-decoupled): ch 64-95 carry speaker
+        # divergence but mel_proj's identity init gives ch 0-63 weight
+        # advantage. 3x forward boost equalizes contribution.
+        ch_high = x[:, 64:, :]
+        x[:, 64:, :] = ch_high + 2.0 * ch_high.detach()
 
         # ── Explicit Channel Partitioning ──────────────────────────────
-        x_content = x[:, :80, :]  # [B, 80, T]
-        x_speaker = x[:, 80:, :]  # [B, 16, T]
+        x_content = x[:, :64, :]  # [B, 64, T]
+        x_speaker = x[:, 64:, :]  # [B, 32, T]
 
         # ── Split mel projection ───────────────────────────────────────
         # Content path (L1 + Var gradient) is strictly isolated to channels 0-79.
@@ -816,8 +788,8 @@ class MobileNetDecoder(nn.Module):
             # than converting it. Detach: CE gradient flows through
             # mel_proj_speaker to learn WHICH bands to modulate, but within
             # a fixed budget. Works at any dataset scale.
-            spk_std = mel_speaker.std(dim=-1, keepdim=True).detach()
-            cont_std = mel_content.detach().std(dim=-1, keepdim=True)
+            spk_std = mel_speaker.flatten(1).std(dim=-1).view(-1, 1, 1).detach()
+            cont_std = mel_content.detach().flatten(1).std(dim=-1).view(-1, 1, 1)
             spk_scale = (0.2 * cont_std / (spk_std + 1e-6)).clamp(max=1.0)
             mel_speaker = mel_speaker * spk_scale
         else:
@@ -866,13 +838,13 @@ class MobileNetDecoder(nn.Module):
         # Speaker path has dedicated weights → zero L1 competition.
         spk_film_mel = variance_mel.detach() + mel_speaker  # [B, 80, T]
 
-        # ── Path 3: Speaker target — post-affine, final output ─────────
+        # ── Path 3: Speaker target — post-film, final output ─────────
         # DETACH: cross-pair stats (weight 6.0) gradient stops at
-        # speaker_affine MLP. Cannot flood upstream blocks via out_scale
+        # speaker_film MLP. Cannot flood upstream blocks via out_scale
         # or mel_proj, protecting FiLM modules from L1 competition.
         if speaker_feats is not None:
-            postbias_mel = self.mel_speaker_affine(spk_film_mel.detach(), speaker_feats)
-            self._check(postbias_mel, "mel_spk_affine")
+            postbias_mel = self.mel_speaker_film(spk_film_mel.detach(), speaker_feats)
+            self._check(postbias_mel, "mel_spk_film")
         else:
             postbias_mel = spk_film_mel
 

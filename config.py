@@ -112,6 +112,8 @@ class ModelConfig:
     # Output: 80 mel bands
     
     mobilenet_input_dim: int = 96  # Must match cross_attention_dim
+    speaker_path_channels: int = 32  # explicit capacity for the speaker path
+
     mobilenet_channel_progression: List[int] = field(
         default_factory=lambda: [96, 128, 160, 192, 96]
     )
