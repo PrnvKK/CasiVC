@@ -289,6 +289,181 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print("="*70)
 
     # ═══════════════════════════════════════════════════════════════════
+    # CONTENT FIDELITY AUDIT — measures intelligibility, not speaker ID
+    # ═══════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("🔬 CONTENT FIDELITY AUDIT")
+    print("="*70)
+
+    def per_band_corr(pred, gt):
+        """Pearson r per mel band: [80] vector of correlations."""
+        if pred.shape[-1] < 4:
+            return torch.zeros(80, device=pred.device)
+        p = pred.float(); g = gt.float()
+        pm = p.mean(dim=-1, keepdim=True); gm = g.mean(dim=-1, keepdim=True)
+        pc = p - pm; gc = g - gm
+        cov = (pc * gc).sum(dim=-1)
+        denom = (pc.norm(dim=-1) * gc.norm(dim=-1)) + 1e-8
+        return cov / denom
+
+    def energy_envelope(mel):
+        """Frame energy: mean(abs(mel)) over 80 bands -> [T]."""
+        return mel.float().abs().mean(dim=1)
+
+    def band_group_l1(pred, gt):
+        """L1 per band group: low(0-40), mid(40-60), high(60-80)."""
+        groups = {"low (0-39)": slice(0,40), "mid (40-59)": slice(40,60), "high (60-79)": slice(60,80)}
+        return {k: (pred[:, s] - gt[:, s]).abs().mean().item() for k, s in groups.items()}
+
+    def spectral_flatness(mel):
+        """Per-frame peak-to-median ratio (exp-log), then averaged.
+           > 3.0 = harmonic/peaked, < 1.5 = noise-like/flat."""
+        eps = 1e-8
+        peak = mel.float().max(dim=1).values
+        med = mel.float().median(dim=1).values
+        return (peak / (med.abs() + eps)).mean().item()
+
+    with torch.no_grad():
+        ml = min(gt_mel_A.shape[-1], pred_mel_AA.shape[-1], pred_mel_AB.shape[-1])
+        gt_A_mel = gt_mel_A[:, :ml].to(device)
+        pred_AA_mel = pred_mel_AA[:, :, :ml].to(device)
+        pred_AB_mel = pred_mel_AB[:, :, :ml].to(device)
+
+        # ---------------------------------------------------------------
+        # 1. Per-band correlation
+        # ---------------------------------------------------------------
+        corr_AA = per_band_corr(pred_AA_mel.squeeze(0), gt_A_mel)  # [80]
+        corr_AB = per_band_corr(pred_AB_mel.squeeze(0), gt_A_mel)  # [80]
+
+        print(f"\n  ── BAND CORRELATION TABLE ──")
+        print(f"  {'BAND':<8}", end="")
+        for s in range(0, 80, 10):
+            print(f"{s:>3d}..{s+9:<3d}  ", end="")
+        print(f"  {'MEAN':>7}")
+        print(f"  {'A→A':<8}", end="")
+        for s in range(0, 80, 10):
+            v = corr_AA[s:s+10].mean().item()
+            print(f" {v:+.3f}   ", end="")
+        print(f"  {corr_AA.mean().item():+.4f}")
+        print(f"  {'A→B':<8}", end="")
+        for s in range(0, 80, 10):
+            v = corr_AB[s:s+10].mean().item()
+            print(f" {v:+.3f}   ", end="")
+        print(f"  {corr_AB.mean().item():+.4f}")
+
+        corr_drop = corr_AA.mean().item() - corr_AB.mean().item()
+        print(f"  Δ(A→A - A→B) = {corr_drop:+.4f}  {'✅ content preserved' if corr_drop < 0.10 else '❌ speaker delta corrupting content'}")
+
+        # ---------------------------------------------------------------
+        # 2. Energy envelope correlation
+        # ---------------------------------------------------------------
+        env_AA = energy_envelope(pred_AA_mel.squeeze(0))
+        env_gt = energy_envelope(gt_A_mel)
+        energy_corr_AA = torch.nn.functional.cosine_similarity(
+            (env_AA - env_AA.mean()).unsqueeze(0),
+            (env_gt - env_gt.mean()).unsqueeze(0), dim=-1).item()
+        env_AB = energy_envelope(pred_AB_mel.squeeze(0))
+        energy_corr_AB = torch.nn.functional.cosine_similarity(
+            (env_AB - env_AB.mean()).unsqueeze(0),
+            (env_gt - env_gt.mean()).unsqueeze(0), dim=-1).item()
+
+        print(f"\n  ── ENERGY ENVELOPE ──")
+        print(f"  Corr(A→A, GT): {energy_corr_AA:+.4f}  {'✅' if energy_corr_AA > 0.4 else '❌ flat/misaligned'}")
+        print(f"  Corr(A→B, GT): {energy_corr_AB:+.4f}  {'✅' if energy_corr_AB > 0.4 else '❌ flat/misaligned'}")
+
+        # ---------------------------------------------------------------
+        # 3. Delta (frame-diff) correlation
+        # ---------------------------------------------------------------
+        da_AA = pred_AA_mel.squeeze(0)[:, 1:] - pred_AA_mel.squeeze(0)[:, :-1]
+        da_gt = gt_A_mel[:, 1:] - gt_A_mel[:, :-1]
+        delta_corr_AA = per_band_corr(da_AA, da_gt).mean().item()
+        da_AB = pred_AB_mel.squeeze(0)[:, 1:] - pred_AB_mel.squeeze(0)[:, :-1]
+        delta_corr_AB = per_band_corr(da_AB, da_gt).mean().item()
+
+        print(f"\n  ── ARTICULATION (Δ correlation) ──")
+        print(f"  Δ-corr(A→A, GT): {delta_corr_AA:+.4f}  {'✅ consonants preserved' if delta_corr_AA > 0.2 else '❌ transitions lost'}")
+        print(f"  Δ-corr(A→B, GT): {delta_corr_AB:+.4f}  {'✅ consonants preserved' if delta_corr_AB > 0.2 else '❌ transitions lost'}")
+
+        # ---------------------------------------------------------------
+        # 4. Band-group L1
+        # ---------------------------------------------------------------
+        l1_groups_AA = band_group_l1(pred_AA_mel, gt_A_mel.unsqueeze(0))
+        print(f"\n  ── L1 PER BAND GROUP ──")
+        for k in ["low (0-39)", "mid (40-59)", "high (60-79)"]:
+            v = l1_groups_AA[k]
+            marker = "✅" if v < 0.6 else ("⚠️ " if v < 1.0 else "❌")
+            print(f"  A→A {k}: L1={v:.4f}  {marker}")
+
+        # ---------------------------------------------------------------
+        # 5. Cross content loss ratio
+        # ---------------------------------------------------------------
+        l1_AA_full = (pred_AA_mel - gt_A_mel.unsqueeze(0)).abs().mean().item()
+        l1_AB_full = (pred_AB_mel - gt_A_mel.unsqueeze(0)).abs().mean().item()
+        loss_ratio = l1_AB_full / (l1_AA_full + 1e-8)
+        print(f"\n  ── CROSS-PAIR CONTENT INTERFERENCE ──")
+        print(f"  L1(A→A, GT): {l1_AA_full:.4f}  |  L1(A→B, GT): {l1_AB_full:.4f}")
+        print(f"  Ratio = {loss_ratio:.3f}x  {'✅ delta ~neutral' if loss_ratio < 1.3 else ('⚠️  mild interference' if loss_ratio < 2.0 else '❌ delta replacing content')}")
+
+        # ---------------------------------------------------------------
+        # 6. High-frequency energy ratio (noise detection)
+        # ---------------------------------------------------------------
+        def hf_ratio(mel):
+            lo = mel[:, :20, :].std(dim=-1).mean().item()
+            hi = mel[:, 60:, :].std(dim=-1).mean().item()
+            return hi / (lo + 1e-8)
+        hfr_AA = hf_ratio(pred_AA_mel)
+        hfr_GT = hf_ratio(gt_A_mel.unsqueeze(0))
+        print(f"\n  ── NOISE & ARTIFACT ──")
+        print(f"  HF ratio (GT):     {hfr_GT:.3f}  (reference)")
+        print(f"  HF ratio (A→A):    {hfr_AA:.3f}  {'✅' if hfr_AA < hfr_GT * 1.5 else '❌ broadband HF noise'}")
+
+        # ---------------------------------------------------------------
+        # 7. Spectral flatness
+        # ---------------------------------------------------------------
+        sf_AA = spectral_flatness(pred_AA_mel.squeeze(0))
+        sf_GT = spectral_flatness(gt_A_mel)
+        print(f"  Spec peak/med (GT):  {sf_GT:.2f}  (ref; <1.5 = noise-like, >3 = harmonic)")
+        print(f"  Spec peak/med (A→A): {sf_AA:.2f}  {'✅' if sf_AA > 1.8 else '❌ noise-like output'}")
+
+        # ---------------------------------------------------------------
+        # 8. Silence fraction
+        # ---------------------------------------------------------------
+        threshold = gt_A_mel.mean().item() - 2.0 * gt_A_mel.std().item()
+        sil_AA = (pred_AA_mel.mean(dim=1) < threshold).float().mean().item() * 100
+        sil_GT = (gt_A_mel < threshold).float().mean().item() * 100
+        print(f"  Silence%% (GT):     {sil_GT:.1f}%  (reference)")
+        print(f"  Silence%% (A→A):    {sil_AA:.1f}%  {'✅' if abs(sil_AA - sil_GT) < 15 else '❌ collapsed or empty frames'}")
+
+        # ---------------------------------------------------------------
+        # 9. Out-of-range fraction
+        # ---------------------------------------------------------------
+        p5_gt = gt_A_mel.quantile(0.05).item()
+        p95_gt = gt_A_mel.quantile(0.95).item()
+        oob_AA = ((pred_AA_mel < p5_gt) | (pred_AA_mel > p95_gt)).float().mean().item() * 100
+        print(f"  Out-of-range%% (A→A): {oob_AA:.1f}%  {'✅' if oob_AA < 25 else '❌ hallucinated mel values'}")
+
+        # ---------------------------------------------------------------
+        # Verdict
+        # ---------------------------------------------------------------
+        issues = []
+        if corr_AA.mean().item() < 0.15: issues.append("band correlation < 0.15 (unintelligible)")
+        if energy_corr_AA < 0.20: issues.append("energy envelope flat/misaligned")
+        if delta_corr_AA < 0.10: issues.append("articulation transitions lost")
+        if hfr_AA > hfr_GT * 2.0: issues.append("broadband HF noise")
+        if sf_AA < 1.5: issues.append("noise-like spectrum (peak/med < 1.5)")
+        if abs(sil_AA - sil_GT) > 20: issues.append("silence mismatch")
+        if oob_AA > 40: issues.append("hallucinated values")
+
+        print(f"\n  [CONTENT VERDICT] ", end="")
+        if not issues:
+            print("✅ Content intelligibility signals healthy")
+        else:
+            print(f"❌ {len(issues)} content quality issue(s):")
+            for iss in issues:
+                print(f"     • {iss}")
+    print("="*70)
+
+    # ═══════════════════════════════════════════════════════════════════
     # STAGE-DELTA AUDIT: A-voice vs B-voice divergence at each pipeline stage
     # ═══════════════════════════════════════════════════════════════════
     print("\n" + "="*70)
