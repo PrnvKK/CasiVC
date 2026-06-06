@@ -752,6 +752,14 @@ class MobileNetDecoder(nn.Module):
               intermediate.append(x)
           
         
+        # ── Speaker-channel σ guard: normalize ch 64-95 BEFORE FiLM ──
+        # FiLM receives clean σ=2 input — cannot amplify beyond this bound.
+        # Prevents CE classifier feedback loop from exploding features.
+        # Detach blocks CE magnitude shortcut; relative patterns still flow.
+        spk_ch_pre = x[:, 64:, :]
+        spk_std_pre = spk_ch_pre.std().detach()
+        x[:, 64:, :] = spk_ch_pre / (spk_std_pre + 1e-6) * 2.0
+
         # Speaker FiLM at block3 output: re-inject speaker identity
         # before mel_proj compresses it away.  Without this, block3's
         # 192→96 residual_proj crushes speaker info (cent_cos 0.49→0.75).
@@ -759,12 +767,6 @@ class MobileNetDecoder(nn.Module):
             x = self.speaker_film(x, speaker_feats)
 
             self._check(x, "spk_film")
-
-        # ── Channel rebalancing (gradient-decoupled): ch 64-95 carry speaker
-        # divergence but mel_proj's identity init gives ch 0-63 weight
-        # advantage. 3x forward boost equalizes contribution.
-        ch_high = x[:, 64:, :]
-        x[:, 64:, :] = ch_high + 2.0 * ch_high.detach()
 
         # ── Explicit Channel Partitioning ──────────────────────────────
         x_content = x[:, :64, :]  # [B, 64, T]
