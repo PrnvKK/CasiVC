@@ -124,6 +124,7 @@ class HubertVCModel(nn.Module):
 
         self.cross_attn = PositionAgnosticCrossAttention(enable_residual=True)
 
+        # Content projection: HuBERT layer 9 (768D) → 3-layer MLP → 96D
         self.hubert_proj = nn.Sequential(
             nn.Linear(768, 384),
             nn.LayerNorm(384),
@@ -133,6 +134,23 @@ class HubertVCModel(nn.Module):
             nn.GELU(),
             nn.Linear(192, 96),
             nn.LayerNorm(96)
+        )
+
+        # Speaker projection: HuBERT layer 1 (768D) → 3-layer MLP → 96D
+        # Layer 1 preserves acoustic speaker identity (F0, formant structure)
+        # before semantic abstraction. Time-varying tokens enable per-frame
+        # timbre modulation rather than static speaker embedding.
+        # Same capacity as content projection — 3 layers with LayerNorm
+        # gives the model enough representational power to separate speaker
+        # identity from generic acoustic features in HuBERT L1.
+        self.speaker_hubert_proj = nn.Sequential(
+            nn.Linear(768, 384),
+            nn.LayerNorm(384),
+            nn.GELU(),
+            nn.Linear(384, 192),
+            nn.LayerNorm(192),
+            nn.GELU(),
+            nn.Linear(192, 96),
         )
 
         self.temporal_resampler = TemporalResampler(channels=96)
@@ -289,28 +307,30 @@ class HubertVCModel(nn.Module):
         device = next(self.parameters()).device
         
         # --------------------------------------------------------- #
-        # 1. Speaker-token extraction (ECAPA-TDNN)                  #
+        # 1. Speaker-token extraction (HuBERT layer 1 from ref audio) #
         # --------------------------------------------------------- #
+        # Layer 1 provides per-frame acoustic speaker features (F0,
+        # formant structure) — time-varying tokens instead of a single
+        # pooled embedding. Enables fine-grained timbre modulation in
+        # downstream cross-attention and FiLM.
         if precomputed_speaker_feats is not None:
             speaker_feats = precomputed_speaker_feats
             B = speaker_feats.shape[0]
         else:
             if ref_audio is None:
                 raise ValueError("Either ref_audio or precomputed_speaker_feats must be provided")
-            # Handle ref_audio input
-            if isinstance(ref_audio, torch.Tensor):
-                if ref_audio.dim() == 2:
-                    ref_audio = list(ref_audio)
-                elif ref_audio.dim() == 1:
-                    ref_audio = [ref_audio]
-                else:
-                    raise ValueError(f"ref_audio tensor must be 1D or 2D, got {ref_audio.dim()}D")
+            if isinstance(ref_audio, torch.Tensor) and ref_audio.dim() == 2:
+                ref_audio = [ref_audio[i] for i in range(ref_audio.shape[0])]
+            if not isinstance(ref_audio, (list, tuple)):
+                ref_audio = [ref_audio]
             B = len(ref_audio)
             
-            speaker_feats = self.mel_encoder(ref_audio)  # [B, 64, 96]
+            with torch.no_grad():
+                speaker_feats = self.hubert.extract_speaker_layer(ref_audio)  # [B, T_ref, 768]
+            speaker_feats = self.speaker_hubert_proj(speaker_feats)            # [B, T_ref, 96]
             
             if self._verbose:
-                print(f"[ECAPA-TDNN] Speaker feats shape: {speaker_feats.shape}")
+                print(f"[HuBERT L1] Speaker feats shape: {speaker_feats.shape}")
                 print(f"Speaker feats (96D): μ={speaker_feats.mean():.4f}, σ={speaker_feats.std():.4f}")
 
         # --------------------------------------------------------- #

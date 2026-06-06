@@ -236,6 +236,36 @@ class HuBERTEncoder(nn.Module):
 
 
 
+    def _extract_layer_features(self, audio: torch.Tensor, original_valid_length: int, layer_idx: int = HUBERT_HIDDEN_STATE_INDEX) -> torch.Tensor:
+        """
+        Extract features from a specific HuBERT layer.
+        
+        Args:
+            audio: Preprocessed audio tensor [samples]
+            layer_idx: Index into hidden_states (1-12 for transformer layers)
+        """
+        try:
+            device = next(self.hubert_model.parameters()).device
+            audio = audio.to(device)
+            max_val = audio.abs().max()
+            if max_val > 1e-8:
+                if max_val > 1.0 + 1e-5:
+                    warnings.warn(f"Audio unnormalized (max: {max_val:.4f}), auto-normalizing")
+                audio = audio / max_val
+            else:
+                warnings.warn("Audio is near-silent, may produce poor features")
+            outputs = self.hubert_model(
+                input_values=audio.unsqueeze(0),
+                output_hidden_states=True,
+                return_dict=True
+            )
+            features = outputs.hidden_states[layer_idx].squeeze(0)
+            if features.dim() != 2:
+                raise RuntimeError(f"Unexpected feature shape from layer {layer_idx}: {features.shape}")
+            return features
+        except Exception as e:
+            raise RuntimeError(f"HuBERT layer {layer_idx} extraction failed: {str(e)}")
+
     def _extract_continuous_features(self, audio: torch.Tensor, original_valid_length: int) -> torch.Tensor:
         """
         Extract continuous semantic features from HuBERT.
@@ -397,6 +427,47 @@ class HuBERTEncoder(nn.Module):
         
         # Return as list of tensors
         return padded_features
+
+    @torch.no_grad()
+    def extract_speaker_layer(self, audio_batch):
+        """Extract per-frame speaker features from HuBERT layer 1.
+        
+        Layer 1 preserves acoustic speaker identity (F0, formants) before
+        semantic abstraction. Returns time-varying tokens instead of a
+        single pooled embedding, enabling per-frame timbre modulation
+        in downstream cross-attention.
+        
+        Args:
+            audio_batch: list of 1D tensors [T_i] or batched tensor (B, T)
+        Returns:
+            padded features [B, T_max, 768] — time-varying speaker tokens
+        """
+        if isinstance(audio_batch, torch.Tensor):
+            if audio_batch.dim() == 2:
+                audio_batch = [audio_batch[i] for i in range(audio_batch.shape[0])]
+            else:
+                audio_batch = [audio_batch]
+        
+        if not isinstance(audio_batch, (list, tuple)):
+            raise ValueError("audio_batch must be Tensor or List[Tensor]")
+        
+        batch_features = []
+        for audio in audio_batch:
+            audio_proc, valid_len = self._validate_audio(audio)
+            feats = self._extract_layer_features(audio_proc, valid_len, layer_idx=1)
+            batch_features.append(feats)
+        
+        if len(batch_features) == 1:
+            return batch_features[0].unsqueeze(0)
+        
+        max_len = max(f.shape[0] for f in batch_features)
+        padded = torch.zeros(
+            len(batch_features), max_len, self.feature_dim,
+            dtype=batch_features[0].dtype, device=batch_features[0].device
+        )
+        for i, features in enumerate(batch_features):
+            padded[i, :features.shape[0]] = features
+        return padded
 
 
     @property
