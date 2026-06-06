@@ -449,15 +449,16 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         mel_spk_AA = mel_spk_base_AA * gate_AA
         mel_spk_AB = mel_spk_base_AB * gate_AB
 
-        # ── Magnitude cap: delta capped to 20% of content std ──────
+        # ── Magnitude cap: uses model's learnable delta_cap ──────
+        delta_cap = torch.nn.functional.softplus(model.decoder.raw_delta_cap) + 0.05
         spk_std_AA = mel_spk_AA.flatten(1).std(dim=-1).view(-1, 1, 1).detach()
         cont_std_AA = mel_proj_raw_AA.detach().flatten(1).std(dim=-1).view(-1, 1, 1)
-        spk_scale_AA = (0.2 * cont_std_AA / (spk_std_AA + 1e-6)).clamp(max=1.0)
+        spk_scale_AA = (delta_cap * cont_std_AA / (spk_std_AA + 1e-6)).clamp(max=1.0)
         mel_spk_AA = mel_spk_AA * spk_scale_AA
 
         spk_std_AB = mel_spk_AB.flatten(1).std(dim=-1).view(-1, 1, 1).detach()
         cont_std_AB = mel_proj_raw_AB.detach().flatten(1).std(dim=-1).view(-1, 1, 1)
-        spk_scale_AB = (0.2 * cont_std_AB / (spk_std_AB + 1e-6)).clamp(max=1.0)
+        spk_scale_AB = (delta_cap * cont_std_AB / (spk_std_AB + 1e-6)).clamp(max=1.0)
         mel_spk_AB = mel_spk_AB * spk_scale_AB
 
         # ── mel_scaled: after unconditioned out_scale (content path only) ──

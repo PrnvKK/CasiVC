@@ -290,8 +290,6 @@ class Trainer:
         # ADD vocoder state loading with backward compatibility
         if "vocoder_state" in ckpt:
             self.vocoder.load_state_dict(ckpt["vocoder_state"])
-        self.optimizer.load_state_dict(ckpt["optim_state"])
-        self.scheduler.load_state_dict(ckpt["sched_state"])
         # ADD scaler state loading with backward compatibility
         if "scaler_state" in ckpt:
             self.scaler.load_state_dict(ckpt["scaler_state"])

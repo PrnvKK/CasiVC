@@ -597,6 +597,12 @@ class MobileNetDecoder(nn.Module):
         # independently of variance scaling.
         self.out_bias = nn.Parameter(torch.zeros(1, 80, 1))
 
+        # Learnable speaker delta cap — replaces hardcoded 0.2.
+        # softplus(-1.8) + 0.05 ≈ 0.20 at init, floor 0.05, no upper bound.
+        # Cross-pair stats (weight 6.0) pushes it up, L1 pulls it back.
+        # Self-calibrates to dataset scale — no magic numbers for full LibriTTS.
+        self.raw_delta_cap = nn.Parameter(torch.tensor(-1.8))
+
         # Speaker-conditioned out_scale modulation removed to prevent gradient competition
         # with mel_spk_affine. out_scale is now purely an unconditional variance amplifier.
 
@@ -782,15 +788,14 @@ class MobileNetDecoder(nn.Module):
             gate = energy_norm.clamp(0, 3.0)  # [B, 1, T] — capped to prevent explosions
             mel_speaker = mel_speaker_base * gate  # [B, 80, T] — content-gated delta
 
-            # ── Magnitude cap: delta capped to 20% of content std ──────
-            # Without this, CE pushes delta σ above content σ (σ_spk=1.11
-            # vs σ_cont=1.05 at 60ep) — the delta REPLACES content rather
-            # than converting it. Detach: CE gradient flows through
-            # mel_proj_speaker to learn WHICH bands to modulate, but within
-            # a fixed budget. Works at any dataset scale.
+            # ── Learnable magnitude cap: delta capped to δ% of content std ──
+            # softplus reparam: init ≈ 0.20, floor 0.05, unbounded above.
+            # Cross-pair stats (w=6.0) pushes cap up, L1 pulls back.
+            # Detach on cont_std prevents CE cap gradient from entering content path.
+            delta_cap = F.softplus(self.raw_delta_cap) + 0.05
             spk_std = mel_speaker.flatten(1).std(dim=-1).view(-1, 1, 1).detach()
             cont_std = mel_content.detach().flatten(1).std(dim=-1).view(-1, 1, 1)
-            spk_scale = (0.2 * cont_std / (spk_std + 1e-6)).clamp(max=1.0)
+            spk_scale = (delta_cap * cont_std / (spk_std + 1e-6)).clamp(max=1.0)
             mel_speaker = mel_speaker * spk_scale
         else:
             mel_speaker = torch.zeros_like(mel_content)
@@ -839,11 +844,12 @@ class MobileNetDecoder(nn.Module):
         spk_film_mel = variance_mel.detach() + mel_speaker  # [B, 80, T]
 
         # ── Path 3: Speaker target — post-film, final output ─────────
-        # DETACH: cross-pair stats (weight 6.0) gradient stops at
-        # speaker_film MLP. Cannot flood upstream blocks via out_scale
-        # or mel_proj, protecting FiLM modules from L1 competition.
+        # detach REMOVED: cross-pair stats gradient (weight 6.0) now flows
+        # through mel_speaker → mel_proj_speaker to train speaker path.
+        # variance_mel is already detached, so upstream blocks are protected.
+        # mel_proj_speaker has dedicated weights (separate from content path).
         if speaker_feats is not None:
-            postbias_mel = self.mel_speaker_film(spk_film_mel.detach(), speaker_feats)
+            postbias_mel = self.mel_speaker_film(spk_film_mel, speaker_feats)
             self._check(postbias_mel, "mel_spk_film")
         else:
             postbias_mel = spk_film_mel
