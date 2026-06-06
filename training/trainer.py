@@ -545,20 +545,22 @@ class Trainer:
                 print(f"[CROSS-PAIR-CHECK] prob={cross_pair_prob}, B={B}, valid={valid_pairs}")
                 
                 if valid_pairs > 0 and random.random() < cross_pair_prob:
-                    # Roll speaker features and targets by 1
-                    rolled_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
+                    # Roll reference audio and targets by 1
+                    # Speaker feats are no longer precomputed — model extracts
+                    # HuBERT L1 from rolled ref_audio on the fly.
+                    rolled_ref_audio = torch.roll(ref_audio, shifts=1, dims=0)
                     rolled_gt_mel = torch.roll(gt_mel, shifts=1, dims=0)
                     rolled_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
                     
                     # Forward pass with rolled speaker (content unchanged)
                     pred_cross, _, aux_cross = self.model(
-                        ref_audio=None,
+                        ref_audio=rolled_ref_audio,
                         content_audio=None,
                         gt_mels=None,
                         compute_losses=False,
                         return_aux=need_bottleneck,
                         return_bottleneck=need_bottleneck,
-                        precomputed_speaker_feats=rolled_speaker_feats,
+                        precomputed_speaker_feats=None,
                         precomputed_content_feats=batch.get("content_feats")
                     )
                     pred_cross = pred_cross.to(torch.float32)
@@ -941,14 +943,11 @@ class Trainer:
                 content_audio_gpu = [content_audio.to(self.device)]
                 
                 with torch.inference_mode():
-                    # 1. ECAPA-TDNN Speaker Features
-                    speaker_feats = self.model.mel_encoder(ref_audio_gpu)[0] # [64, 96]
-                    
-                    # 2. HuBERT Content Features 
+                    # 1. HuBERT Content Features (layer 9)
                     hubert_out = self.model.hubert(content_audio_gpu)
                     content_feats = self.model.hubert_proj(hubert_out)[0] # [T, 96]
                     
-                    # 3. GT Mel 
+                    # 2. GT Mel 
                     gt_mel = extract_mel_spectrogram(
                         content_audio, 
                         sample_rate=self.audio_cfg.sample_rate
@@ -957,7 +956,7 @@ class Trainer:
                 # Save to disk
                 torch.save({
                     'content_feats': content_feats.cpu(),
-                    'speaker_feats': speaker_feats.cpu(),
+                    'ref_audio': ref_audio.cpu(),        # raw ref waveform for HuBERT L1
                     'gt_mel': gt_mel.cpu(),
                     'gt_wave': content_audio.cpu(),
                 }, cache_file)

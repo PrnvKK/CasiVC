@@ -579,7 +579,7 @@ class VoiceConversionDataset(Dataset):
                 cached = torch.load(cache_file, map_location='cpu')
                 speaker_idx = self.speaker_to_idx.get(speaker_id, -1)
                 return TrainingPair(
-                    ref_audio=None,
+                    ref_audio=cached.get('ref_audio'),  # raw waveform for HuBERT L1 speaker
                     ref_mel=None, 
                     content_audio=cached['gt_wave'],
                     content_mel=cached['gt_mel'],
@@ -590,7 +590,7 @@ class VoiceConversionDataset(Dataset):
                     ref_duration=0.0,
                     content_duration=0.0,
                     content_feats=cached['content_feats'],
-                    speaker_feats=cached['speaker_feats']
+                    speaker_feats=cached.get('speaker_feats')  # None for new cache format
                 )
             except Exception as e:
                 pass # Fall through to local processing if cache corrupted

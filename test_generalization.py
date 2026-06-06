@@ -87,16 +87,20 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("🔬 DIAGNOSTIC 2: mel_proj weight channel utilization (split paths)")
     print("="*70)
     with torch.no_grad():
-        w_content = model.decoder.mel_proj_content.weight  # [80, 80, 1]
-        w_speaker = model.decoder.mel_proj_speaker.weight  # [80, 16, 1]
+        w_content = model.decoder.mel_proj_content.weight
+        w_speaker = model.decoder.mel_proj_speaker.weight
+        content_in_ch = w_content.shape[1]
+        speaker_in_ch = w_speaker.shape[1]
+        speaker_start = content_in_ch
+        speaker_end = content_in_ch + speaker_in_ch - 1
         
         # Content path
         wc_norm = w_content.squeeze(-1).norm(p=2, dim=0)  # [80]
-        print(f"  [CONTENT PATH] ch 0-79:  mean L2={wc_norm.mean():.6f}")
+        print(f"  [CONTENT PATH] ch 0-{content_in_ch-1}:  mean L2={wc_norm.mean():.6f}")
         
         # Speaker path
-        ws_norm = w_speaker.squeeze(-1).norm(p=2, dim=0)  # [16]
-        print(f"  [SPEAKER PATH] ch 80-95: mean L2={ws_norm.mean():.6f}")
+        ws_norm = w_speaker.squeeze(-1).norm(p=2, dim=0)
+        print(f"  [SPEAKER PATH] ch {speaker_start}-{speaker_end}: mean L2={ws_norm.mean():.6f}")
         
         # Per-output-channel breakdown for speaker path
         ws_to_hi = w_speaker.squeeze(-1).norm(p=2, dim=1)  # [80]
@@ -104,9 +108,9 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Speaker path output channels with |w_s| > 0.01: {n_active}/80")
         print(f"  [VERDICT] ", end="")
         if ws_norm.mean() < 0.005:
-            print("Speaker path channels 80-95 are DEAD. CE gradient may be insufficient.")
+            print(f"Speaker path channels {speaker_start}-{speaker_end} are DEAD. CE gradient may be insufficient.")
         else:
-            print("Speaker path channels 80-95 are ACTIVE. Explicit partition working.")
+            print(f"Speaker path channels {speaker_start}-{speaker_end} are ACTIVE. Explicit partition working.")
     print("="*70)
 
     # ── Speaker Space Diagnostic ─────────────────────────────────────────
@@ -133,7 +137,7 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         elif cos_sim.item() > 0.50:
             print("Partial separation. Speaker info is weak but present.")
         else:
-            print("Speaker space is WELL-SEPARATED. Problem is training task (no cross-pair training).")
+            print("Speaker space is WELL-SEPARATED. Bottleneck is downstream fusion/decoder training signal.")
 
         # ── Per-token diversity audit ─────────────────────────────────────
         print("\n[PER-TOKEN DIVERSITY AUDIT]")
@@ -251,10 +255,22 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             emb_gt_B = model.mel_encoder.extract_speaker_features(
                 content_B.unsqueeze(0).to(device), apply_projection=False
             ).squeeze()
-            
+            emb_gt_voc_A = get_spk_emb(vocoded_A).squeeze()
+            emb_gt_voc_B = get_spk_emb(vocoded_B).squeeze()
+             
             def cos_sim(a, b):
                 return torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item()
-            
+
+            ceiling_A = cos_sim(emb_gt_voc_A, emb_gt_A)
+            ceiling_B = cos_sim(emb_gt_voc_B, emb_gt_B)
+            avg_ceiling = 0.5 * (ceiling_A + ceiling_B)
+
+            print(f"\n  {'VOCODER CEILING':<30} {'Cos Sim':>8}  {'Use':<8}")
+            print(f"  {'-'*30} {'-'*8}  {'-'*8}")
+            print(f"  {'GT-vocoded A vs raw GT_A':<30} {ceiling_A:>8.4f}  {'ceiling':>8}")
+            print(f"  {'GT-vocoded B vs raw GT_B':<30} {ceiling_B:>8.4f}  {'ceiling':>8}")
+            print(f"  {'Average vocoder ceiling':<30} {avg_ceiling:>8.4f}  {'anchor':>8}")
+             
             print(f"\n  {'Comparison':<30} {'Cos Sim':>8}  {'Target':<8}")
             print(f"  {'─'*30} {'─'*8}  {'─'*8}")
             
@@ -273,6 +289,61 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             print(f"  {'A→B vs GT_A (source leak)':<30} {leak_ab:>8.4f}  {'<0.30':>8}")
             print(f"  {'B→A vs GT_B (source leak)':<30} {leak_ba:>8.4f}  {'<0.30':>8}")
             
+            def pct_of_ceiling(score, ceiling):
+                if abs(ceiling) < 1e-6:
+                    return float("nan")
+                return 100.0 * score / ceiling
+
+            print(f"\n  {'Ceiling-normalized':<30} {'% Ceiling':>10}")
+            print(f"  {'-'*30} {'-'*10}")
+            print(f"  {'A->A / ceiling A':<30} {pct_of_ceiling(aa, ceiling_A):>9.1f}%")
+            print(f"  {'B->B / ceiling B':<30} {pct_of_ceiling(bb, ceiling_B):>9.1f}%")
+            print(f"  {'A->B / ceiling B':<30} {pct_of_ceiling(ab, ceiling_B):>9.1f}%")
+            print(f"  {'B->A / ceiling A':<30} {pct_of_ceiling(ba, ceiling_A):>9.1f}%")
+
+            def match_band_stats(base_mel, target_mel, band_slice):
+                patched = base_mel.clone()
+                target_band = target_mel[band_slice, :].unsqueeze(0)
+                target_band = torch.nn.functional.interpolate(
+                    target_band, size=base_mel.shape[-1],
+                    mode="linear", align_corners=False,
+                ).squeeze(0)
+                base_band = patched[0, band_slice, :]
+                base_mean = base_band.mean(dim=-1, keepdim=True)
+                base_std = base_band.std(dim=-1, keepdim=True).clamp_min(1e-6)
+                target_mean = target_band.mean(dim=-1, keepdim=True)
+                target_std = target_band.std(dim=-1, keepdim=True).clamp_min(1e-6)
+                patched[0, band_slice, :] = (base_band - base_mean) / base_std * target_std + target_mean
+                return patched
+
+            def speaker_sim_from_mel(mel, target_emb):
+                wav = vocoder(mel.to(device)).squeeze(0).squeeze(0).cpu()
+                emb = get_spk_emb(wav).squeeze()
+                return cos_sim(emb, target_emb)
+
+            print("\n  BAND-STAT SPK_SIM RESCUE")
+            print("  Patches one mel band group to target-speaker mean/std, then vocodes.")
+            print(f"  {'Band':<9} {'A->B sim':>9} {'dAB':>8} {'B->A sim':>9} {'dBA':>8} {'avg d':>8}")
+            print(f"  {'-'*9} {'-'*9} {'-'*8} {'-'*9} {'-'*8} {'-'*8}")
+            band_rescues = []
+            for start in range(0, 80, 10):
+                band_slice = slice(start, start + 10)
+                patched_ab = match_band_stats(pred_mel_AB.detach(), gt_mel_B.to(device), band_slice)
+                patched_ba = match_band_stats(pred_mel_BA.detach(), gt_mel_A.to(device), band_slice)
+                sim_ab = speaker_sim_from_mel(patched_ab, emb_gt_B)
+                sim_ba = speaker_sim_from_mel(patched_ba, emb_gt_A)
+                delta_ab = sim_ab - ab
+                delta_ba = sim_ba - ba
+                avg_delta = 0.5 * (delta_ab + delta_ba)
+                band_rescues.append((avg_delta, start))
+                print(f"  {start:02d}-{start+9:<4d} {sim_ab:>9.4f} {delta_ab:>+8.4f} {sim_ba:>9.4f} {delta_ba:>+8.4f} {avg_delta:>+8.4f}")
+
+            band_rescues.sort(reverse=True)
+            print("  Top rescue bands:", ", ".join(
+                f"{start:02d}-{start+9} (avg d={avg_delta:+.4f})"
+                for avg_delta, start in band_rescues[:3]
+            ))
+
             # If conversions are better than self-recons (unlikely but possible)
             if ab > aa: print(f"  ⚠️  A→B MORE similar to B than A→A is to A — over-conversion?")
             if ba > bb: print(f"  ⚠️  B→A MORE similar to A than B→B is to B — over-conversion?")
@@ -545,8 +616,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print("-"*60)
         chan_diff = (film_AA - film_AB).abs().mean(dim=-1).squeeze(0)  # [96]
         _, rank_order = chan_diff.sort(descending=True)
-        low_diff = chan_diff[:64]   # channels 0-63 (identity path)
-        high_diff = chan_diff[64:]  # channels 64-95 (zero-init path)
+        low_diff = chan_diff[:64]   # channels 0-63 (content path)
+        high_diff = chan_diff[64:]  # channels 64-95 (speaker path)
         print(f"  Mean divergence ch 0-63:  {low_diff.mean():.6f}")
         print(f"  Mean divergence ch 64-95: {high_diff.mean():.6f}")
         print(f"  Ratio (64-95 / 0-63):     {high_diff.mean()/(low_diff.mean()+1e-8):.4f}")
@@ -556,21 +627,21 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Top-16 channel indices (sorted): {sorted(top16)}")
         print(f"  Top-10 per-channel divergences:")
         for rank_idx, ch_idx in enumerate(rank_order[:10].tolist()):
-            zone = " ← ZERO-INIT (64-95)" if ch_idx >= 64 else ""
+            zone = " <- SPEAKER PATH (64-95)" if ch_idx >= 64 else ""
             print(f"    #{rank_idx+1}: ch {ch_idx:3d}  div={chan_diff[ch_idx]:.6f}{zone}")
         print(f"  [VERDICT] ", end="")
         if in_high >= 8:
-            print("Speaker info CONCENTRATED in ch 64-95. Identity-init mel_proj is structurally wrong.")
+            print("Speaker info CONCENTRATED in ch 64-95. Speaker path is active; judge usefulness by SPK_SIM and band rescue.")
         elif in_high >= 3:
-            print("Speaker info MIXED across channel groups. mel_proj partially usable but erodes high channels.")
+            print("Speaker info MIXED across channel groups. Use downstream SPK_SIM/band rescue before changing training.")
         else:
-            print("Speaker info in ch 0-63. mel_proj identity path should preserve it. Erosion has different cause.")
+            print("Speaker info mostly in ch 0-63. Speaker path may be under-used.")
 
         # ═══════════════════════════════════════════════════════════════
-        # DIAGNOSTIC 4: Channel 64-95 ablation at mel_proj_content input
+        # DIAGNOSTIC 4: Channel 64-95 speaker-path contribution
         # ═══════════════════════════════════════════════════════════════
         print("\n" + "-"*60)
-        print("🔬 DIAGNOSTIC 4: Channel 64-95 ablation at mel_proj_content input")
+        print("🔬 DIAGNOSTIC 4: Channel 64-95 speaker-path contribution")
         print("-"*60)
         # Normal path cent_cos (content path only for apples-to-apples comparison)
         mel_norm_AA = model.decoder.mel_proj_content(film_AA[:, :64, :])
