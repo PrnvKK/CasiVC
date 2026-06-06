@@ -549,17 +549,17 @@ class MobileNetDecoder(nn.Module):
             )
         self.blocks = nn.ModuleList(blocks)
         
-        # ── Split mel projection: content path + speaker path ──────────────
-        # Content path (96→80): trained by L1 + Var.  Speaker path (96→80):
-        # trained by spk_film CE only (input detach isolates gradient).
-        # Separate weight matrices eliminate the shared-matrix L1 competition
-        # that killed Fix #17 and Fix #20.  Xavier init on both; speaker
-        # path starts conservative (gain=0.3) to prevent early noise injection.
+        # ── Explicit Channel Partitioning for Split Mel Projection ─────────
+        # To prevent the massive L1 loss from suppressing speaker information,
+        # we explicitly partition the 96 channels: ch 0-79 go to content,
+        # ch 80-95 go to speaker.
+        # Content path (80→80): trained by L1 + Var.
+        # Speaker path (16→80): trained by spk_film CE only.
         self.mel_proj_content = nn.Conv1d(
-            channel_progression[-1], 80, kernel_size=1, bias=True
+            80, 80, kernel_size=1, bias=True
         )
         self.mel_proj_speaker = nn.Conv1d(
-            channel_progression[-1], 80, kernel_size=1, bias=False
+            16, 80, kernel_size=1, bias=False
         )
         with torch.no_grad():
             nn.init.xavier_normal_(self.mel_proj_content.weight.squeeze(-1), gain=1.0)
@@ -788,23 +788,21 @@ class MobileNetDecoder(nn.Module):
         ch_high = x[:, 80:, :]
         x[:, 80:, :] = ch_high + 2.0 * ch_high.detach()
 
+        # ── Explicit Channel Partitioning ──────────────────────────────
+        x_content = x[:, :80, :]  # [B, 80, T]
+        x_speaker = x[:, 80:, :]  # [B, 16, T]
+
         # ── Split mel projection ───────────────────────────────────────
-        # Content path: L1 + Var gradient.  Speaker path: CE gradient only.
-        # Speaker path reads BROADCAST SPEAKER TOKENS (not x) so it has
-        # clean speaker identity unaffected by upstream speaker stripping.
-        # x.detach() was the old approach — caused speaker path to regress
-        # at 20ep as upstream learned to strip speaker info from features.
-        mel_content = self.mel_proj_content(x)          # [B, 80, T]
+        # Content path (L1 + Var gradient) is strictly isolated to channels 0-79.
+        mel_content = self.mel_proj_content(x_content)          # [B, 80, T]
 
         if speaker_feats is not None:
-            spk_pooled = speaker_feats.mean(dim=1)       # [B, 96]
-            spk_input = spk_pooled.unsqueeze(-1).expand(-1, -1, x.shape[-1])  # [B, 96, T]
-            mel_speaker_base = self.mel_proj_speaker(spk_input)  # [B, 80, T] — time-invariant base
+            # Speaker path (CE gradient) is strictly isolated to channels 80-95.
+            # It now uses dynamic temporal features instead of static speaker tokens!
+            mel_speaker_base = self.mel_proj_speaker(x_speaker)  # [B, 80, T]
 
             # ── Content-gated modulation (prevents robotic fixed-filter sound) ──
-            # Time-invariant speaker delta sounds unnatural: same spectral shift
-            # applied to every frame regardless of phoneme. Solution: modulate
-            # delta strength by per-frame content energy. Vowels (high energy)
+            # Modulate delta strength by per-frame content energy. Vowels (high energy)
             # get full speaker timbre; silence gets none; consonants get partial.
             # Detach on mel_content prevents CE gradient entering content path.
             frame_energy = mel_content.detach().abs().mean(dim=1, keepdim=True)  # [B, 1, T]
