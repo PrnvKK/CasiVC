@@ -290,12 +290,13 @@ class HubertVCModel(nn.Module):
         Parameters
         ----------
         ref_audio     : list or batch tensor of reference raw audio waveforms (samples,)
-                        for ECAPA-TDNN speaker encoder
+                        for HuBERT L1 speaker-token extraction
         content_audio : list of raw 16-kHz waveforms (variable length) for HuBERT
         gt_mels       : optional ground-truth mels for reconstruction loss
         compute_losses: if True, returns {"mel": …}
         return_aux    : if True, returns dict with intermediate tensors
-        precomputed_speaker_feats: Optional precomputed ECAPA features [B, 64, 96]
+        precomputed_speaker_feats: Optional cached HuBERT L1 [B, T_ref, 768]
+                                   or already-projected speaker tokens [B, T_ref, 96]
         precomputed_content_feats: Optional precomputed HuBERT features [B, T, 96]
 
         Returns
@@ -316,6 +317,14 @@ class HubertVCModel(nn.Module):
         if precomputed_speaker_feats is not None:
             speaker_feats = precomputed_speaker_feats
             B = speaker_feats.shape[0]
+            if speaker_feats.shape[-1] == self.m_cfg.hubert_features_dim:
+                speaker_feats = self.speaker_hubert_proj(speaker_feats)
+            elif speaker_feats.shape[-1] != self.m_cfg.speaker_projection_dim:
+                raise ValueError(
+                    f"precomputed_speaker_feats must end in "
+                    f"{self.m_cfg.hubert_features_dim} or {self.m_cfg.speaker_projection_dim}, "
+                    f"got {speaker_feats.shape[-1]}"
+                )
         else:
             if ref_audio is None:
                 raise ValueError("Either ref_audio or precomputed_speaker_feats must be provided")

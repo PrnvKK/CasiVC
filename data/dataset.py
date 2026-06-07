@@ -47,7 +47,7 @@ class TrainingPair:
     content_duration: float        # Content segment duration (seconds)
     speaker_idx: int = -1          # Integer index for speaker classifier CE loss
     content_feats: Optional[torch.Tensor] = None # Added for precomputed HuBERT
-    speaker_feats: Optional[torch.Tensor] = None # Added for precomputed ECAPA
+    speaker_feats: Optional[torch.Tensor] = None # Cached HuBERT L1 speaker features
 
 
 @dataclass
@@ -579,7 +579,7 @@ class VoiceConversionDataset(Dataset):
                 cached = torch.load(cache_file, map_location='cpu')
                 speaker_idx = self.speaker_to_idx.get(speaker_id, -1)
                 return TrainingPair(
-                    ref_audio=cached.get('ref_audio'),  # raw waveform for HuBERT L1 speaker
+                    ref_audio=cached.get('ref_audio'),  # fallback if cached HuBERT L1 is absent
                     ref_mel=None, 
                     content_audio=cached['gt_wave'],
                     content_mel=cached['gt_mel'],
@@ -590,7 +590,7 @@ class VoiceConversionDataset(Dataset):
                     ref_duration=0.0,
                     content_duration=0.0,
                     content_feats=cached['content_feats'],
-                    speaker_feats=cached.get('speaker_feats')  # None for new cache format
+                    speaker_feats=cached.get('speaker_l1_feats', cached.get('speaker_feats'))
                 )
             except Exception as e:
                 pass # Fall through to local processing if cache corrupted
@@ -745,11 +745,11 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
     needs (ref_audio, ref_mel, content_audio, gt_mel, gt_wave) while keeping
     the per-sample metadata as lists.
     
-    Updated to support ECAPA-TDNN encoder by including raw reference audio.
+    Supports cached HuBERT content and HuBERT L1 speaker features.
     """
 
     # ---- gather per-sample objects ---------------------------------
-    ref_audios = []              # NEW: Raw reference audio for ECAPA-TDNN
+    ref_audios = []              # Raw reference audio fallback for HuBERT L1
     ref_mels = []                # Reference mel-spectrograms
     content_audios = []          # Content audio for HuBERT
     content_mels = []            # Content mel (usually None)
@@ -790,7 +790,7 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
     batched_ref_mels = _pad_2d(ref_mels)           # (B, 80, T_ref)
     batched_audio = _pad_1d(content_audios)        # (B, T_wav)
     batched_content_feats = _pad_2d_feats(content_feats_list)
-    batched_speaker_feats = torch.stack(speaker_feats_list) if speaker_feats_list[0] is not None else None
+    batched_speaker_feats = _pad_2d_feats(speaker_feats_list)
 
     # ---- ground-truth mel for loss ----------------------------------
     if all(m is None for m in content_mels):
@@ -835,11 +835,11 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
     # -----------------------------------------------------------------
     return_dict = {
         # ---- AUDIO/MEL TENSORS --------------------------------------
-        "ref_audio":         batched_ref_audios,       # NEW: (B, T_ref_wav) - for ECAPA-TDNN
+        "ref_audio":         batched_ref_audios,       # fallback raw ref waveform for HuBERT L1
         "ref_mel":           batched_ref_mels,         # (B, 80, T_ref) - kept for compatibility
         "content_audio":     batched_audio,            # (B, T_wav) - for HuBERT
         "content_feats":     batched_content_feats,    # (B, T, 96) - precomputed HuBERT
-        "speaker_feats":     batched_speaker_feats,    # (B, 64, 96) - precomputed ECAPA
+        "speaker_feats":     batched_speaker_feats,    # (B, T_ref, 768) cached HuBERT L1
         "gt_mel":            batched_gt_mels,          # (B, 80, T_gt) - for reconstruction loss
         "gt_wave":           batched_audio,            # (B, T_wav) - for vocoder loss
         

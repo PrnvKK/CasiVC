@@ -545,10 +545,14 @@ class Trainer:
                 print(f"[CROSS-PAIR-CHECK] prob={cross_pair_prob}, B={B}, valid={valid_pairs}")
                 
                 if valid_pairs > 0 and random.random() < cross_pair_prob:
-                    # Roll reference audio and targets by 1
-                    # Speaker feats are no longer precomputed — model extracts
-                    # HuBERT L1 from rolled ref_audio on the fly.
-                    rolled_ref_audio = torch.roll(ref_audio, shifts=1, dims=0)
+                    # Roll cached speaker features when available. Fallback to
+                    # raw ref audio only for old/corrupt caches.
+                    rolled_speaker_feats = None
+                    rolled_ref_audio = None
+                    if batch.get("speaker_feats") is not None:
+                        rolled_speaker_feats = torch.roll(batch["speaker_feats"], shifts=1, dims=0)
+                    else:
+                        rolled_ref_audio = torch.roll(ref_audio, shifts=1, dims=0)
                     rolled_gt_mel = torch.roll(gt_mel, shifts=1, dims=0)
                     rolled_lengths = torch.roll(gt_lengths, shifts=1, dims=0)
                     
@@ -560,7 +564,7 @@ class Trainer:
                         compute_losses=False,
                         return_aux=need_bottleneck,
                         return_bottleneck=need_bottleneck,
-                        precomputed_speaker_feats=None,
+                        precomputed_speaker_feats=rolled_speaker_feats,
                         precomputed_content_feats=batch.get("content_feats")
                     )
                     pred_cross = pred_cross.to(torch.float32)
@@ -906,7 +910,7 @@ class Trainer:
     #  Public runner
     # ==============================================================
     def _build_cache_if_needed(self):
-        """Builds a local cache of HuBERT and ECAPA features to speed up Colab training."""
+        """Builds a local cache of frozen HuBERT features to speed up Colab training."""
         cache_dir = Path("/content/hubertvc_cache")
         # To force recomputation on the first epoch of every run, we can wipe the folder
         if cache_dir.exists():
@@ -947,7 +951,10 @@ class Trainer:
                     hubert_out = self.model.hubert(content_audio_gpu)
                     content_feats = self.model.hubert_proj(hubert_out)[0] # [T, 96]
                     
-                    # 2. GT Mel 
+                    # 2. Speaker Features (raw HuBERT L1) - project during training
+                    speaker_l1_feats = self.model.hubert.extract_speaker_layer(ref_audio_gpu)[0]  # [T_ref, 768]
+
+                    # 3. GT Mel
                     gt_mel = extract_mel_spectrogram(
                         content_audio, 
                         sample_rate=self.audio_cfg.sample_rate
@@ -956,6 +963,7 @@ class Trainer:
                 # Save to disk
                 torch.save({
                     'content_feats': content_feats.cpu(),
+                    'speaker_l1_feats': speaker_l1_feats.cpu(),  # raw HuBERT L1 for cross-pair
                     'ref_audio': ref_audio.cpu(),        # raw ref waveform for HuBERT L1
                     'gt_mel': gt_mel.cpu(),
                     'gt_wave': content_audio.cpu(),
