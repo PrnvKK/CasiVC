@@ -420,9 +420,9 @@ class VoiceConversionDataset(Dataset):
         speaker_ids = list(self.speakers.keys())
         speaker_ids.sort()  # Ensure reproducible ordering
         
-        # Set random seed for reproducible splits
-        random.seed(self.data_config.speaker_split_seed)
-        random.shuffle(speaker_ids)
+        # Use isolated random instance for reproducible splits
+        rng = random.Random(self.data_config.speaker_split_seed)
+        rng.shuffle(speaker_ids)
         
         # Get split ratios
         train_ratio, val_ratio, test_ratio = self.data_config.get_speaker_split_ratios()
