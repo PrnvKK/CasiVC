@@ -476,9 +476,9 @@ class HubertVCModel(nn.Module):
                 aux["mel_classifier_logits"] = mel_logits
 
             # Pooled mel-bias classifier: gated CE on bias-only component
-            # intermediate: [-3]=prebias(raw), [-2]=variance(post-scale), [-1]=postbias(post-affine)
-            if self.pooled_mel_classifier is not None and len(intermediate) > 6:
-                prebias_mel = intermediate[-3]   # [B, 80, T] raw mel, pre-scale
+            # intermediate: [-4]=prebias(raw), [-3]=variance(post-scale), [-2]=mel_speaker, [-1]=postbias(post-affine)
+            if self.pooled_mel_classifier is not None and len(intermediate) >= 8:
+                prebias_mel = intermediate[-4]   # [B, 80, T] raw mel, pre-scale
                 postbias_mel = intermediate[-1]  # [B, 80, T] after speaker bias
                 bias_only = postbias_mel - prebias_mel  # [B, 80, T] scale+affine delta
                 mel_for_ce = prebias_mel.detach() + bias_only
@@ -486,9 +486,10 @@ class HubertVCModel(nn.Module):
                 pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)
                 aux["pooled_mel_logits"] = pooled_mel_logits
 
-            # Spk_film classifier: taps variance_mel (post-out_scale, pre-affine)
-            if self.spk_film_classifier is not None and len(intermediate) > 6:
-                spk_film_feats = intermediate[-2]  # [B, 80, T] variance_mel (post-out_scale)
+            # Spk_film classifier: taps mel_speaker (pure speaker delta from mel_proj_speaker)
+            # Gradient-isolated: CE flows ONLY to mel_proj_speaker, never upstream.
+            if self.spk_film_classifier is not None and len(intermediate) >= 8:
+                spk_film_feats = intermediate[-2]  # [B, 80, T] mel_speaker (speaker delta)
                 spk_film_feats = F.avg_pool1d(spk_film_feats, kernel_size=3, stride=1, padding=1)
                 spk_film_logits = self.spk_film_classifier(spk_film_feats)
                 aux["spk_film_classifier_logits"] = spk_film_logits
@@ -496,10 +497,11 @@ class HubertVCModel(nn.Module):
             # Three-path gradient separation: expose all intermediate mels
             #   prebias_mel  (raw, pre-scale)             → L1 target
             #   variance_mel (post-scale, pre-affine)      → variance target (trains out_scale)
+            #   mel_speaker  (speaker delta)               → spk_film CE target
             #   postbias_mel (post-scale, post-affine)     → speaker stats (detach protected)
-            if len(intermediate) >= 7:
-                aux["prebias_mel"]   = intermediate[-3]   # raw mel — L1 target
-                aux["variance_mel"]  = intermediate[-2]   # post-scale, pre-affine — variance target
+            if len(intermediate) >= 8:
+                aux["prebias_mel"]   = intermediate[-4]   # raw mel — L1 target
+                aux["variance_mel"]  = intermediate[-3]   # post-scale, pre-affine — variance target
         
         return pred_mel, loss_dict, aux
 

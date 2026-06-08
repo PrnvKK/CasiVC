@@ -230,7 +230,7 @@ class Trainer:
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=0,
             pin_memory=True,
             collate_fn=collate_training_pairs,
@@ -319,7 +319,8 @@ class Trainer:
             "Cross-Attention": "cross_attn",
             "Decoder Adapter": "decoder.adapter",
             "Decoder Block 0": "decoder.blocks.0",
-            "Decoder Mel Projection": "decoder.mel_proj",
+            "Decoder Mel Proj Content": "decoder.mel_proj_content",
+            "Decoder Mel Proj Speaker": "decoder.mel_proj_speaker",
         }
         
         # Add the final decoder block dynamically if it exists
@@ -356,6 +357,20 @@ class Trainer:
         self.model.train()
         loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0}
         num_batches = 0
+
+        # Ensure exact reproducibility for this epoch's shuffling and data augmentation (like random crops)
+        epoch_seed = 42 + self.start_epoch
+        torch.manual_seed(epoch_seed)
+        random.seed(epoch_seed)
+        np.random.seed(epoch_seed)
+        
+        # Override dataloader sampler generator for strict reproducibility
+        if hasattr(self.train_loader.sampler, 'generator') and self.train_loader.sampler.generator is None:
+            g = torch.Generator()
+            g.manual_seed(epoch_seed)
+            self.train_loader.sampler.generator = g
+        elif hasattr(self.train_loader.sampler, 'generator'):
+            self.train_loader.sampler.generator.manual_seed(epoch_seed)
 
         pbar = tqdm(self.train_loader, desc=f"Train | epoch {self.start_epoch}", leave=False)
         for batch in pbar:

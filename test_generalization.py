@@ -81,47 +81,46 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     print("✅ Model loaded.")
 
     # ═══════════════════════════════════════════════════════════════════
-    # DIAGNOSTIC 2: mel_proj weight channel utilization
+    # DIAGNOSTIC 2: Split mel_proj weight norms (Fix #21: content vs speaker paths)
     # ═══════════════════════════════════════════════════════════════════
     print("\n" + "="*70)
-    print("🔬 DIAGNOSTIC 2: mel_proj weight channel utilization")
+    print("🔬 DIAGNOSTIC 2: Split mel_proj weight norms (Fix #21)")
     print("="*70)
     with torch.no_grad():
-        w = model.decoder.mel_proj.weight  # [80, 96, 1]
-        w_norm = w.squeeze(-1).norm(p=2, dim=0)  # [96] per-input-channel L2
-        low_chans = w_norm[:80]   # channels 0-79 (identity-init)
-        high_chans = w_norm[80:]  # channels 80-95 (zero-init)
-        print(f"  Input channels 0-79:  mean L2={low_chans.mean():.6f}, max={low_chans.max():.6f}, min={low_chans.min():.6f}")
-        print(f"  Input channels 80-95: mean L2={high_chans.mean():.6f}, max={high_chans.max():.6f}, min={high_chans.min():.6f}")
-        ratio = high_chans.mean() / (low_chans.mean() + 1e-8)
-        print(f"  Ratio (80-95 / 0-79): {ratio:.4f}")
-        # Per-output-channel breakdown: how much weight goes to 80-95 vs 0-79
-        w_mat = w.squeeze(-1)  # [80, 96]
-        w_to_lo = w_mat[:, :80].norm(p=2, dim=1)  # [80] per output chan
-        w_to_hi = w_mat[:, 80:].norm(p=2, dim=1)  # [80]
-        print(f"  Per-output-channel weight to ch 0-79:  mean={w_to_lo.mean():.6f}, max={w_to_lo.max():.6f}")
-        print(f"  Per-output-channel weight to ch 80-95: mean={w_to_hi.mean():.6f}, max={w_to_hi.max():.6f}")
-        # How many output channels have meaningful high-channel utilization?
-        n_active = (w_to_hi > 0.01).sum().item()
-        print(f"  Output channels with |w_hi| > 0.01: {n_active}/80")
+        # mel_proj_content: Conv1d(96→80) for L1+Var, reads feature tensor x
+        wc = model.decoder.mel_proj_content.weight  # [80, 96, 1]
+        wc_norm = wc.squeeze(-1).norm(p=2, dim=0)  # [96] per-input-channel L2
+        wc_to_lo = wc.squeeze(-1)[:, :80].norm(p=2, dim=1)  # [80] weight to ch 0-79
+        wc_to_hi = wc.squeeze(-1)[:, 80:].norm(p=2, dim=1)  # [80] weight to ch 80-95
+        print(f"  mel_proj_content (L1+Var):")
+        print(f"    Input ch 0-79  mean L2={wc_norm[:80].mean():.6f}, max={wc_norm[:80].max():.6f}")
+        print(f"    Input ch 80-95 mean L2={wc_norm[80:].mean():.6f}, max={wc_norm[80:].max():.6f}")
+        print(f"    Per-output weight to ch 0-79:  mean={wc_to_lo.mean():.6f}")
+        print(f"    Per-output weight to ch 80-95: mean={wc_to_hi.mean():.6f}")
+        # mel_proj_speaker: Conv1d(96→80) for spk_film CE, reads broadcast spk tokens
+        ws = model.decoder.mel_proj_speaker.weight  # [80, 96, 1]
+        ws_norm = ws.squeeze(-1).norm(p=2, dim=0)  # [96]
+        ws_per_out = ws.squeeze(-1).norm(p=2, dim=1)  # [80] per-output-channel L2
+        print(f"  mel_proj_speaker (spk_film CE):")
+        print(f"    Input ch mean L2={ws_norm.mean():.6f}, max={ws_norm.max():.6f}, min={ws_norm.min():.6f}")
+        print(f"    Per-output weight mean={ws_per_out.mean():.6f}, max={ws_per_out.max():.6f}")
+        # Check both are alive
         print(f"  [VERDICT] ", end="")
-        if w_to_hi.max() < 0.005:
-            print("Channels 80-95 are DEAD. Gradient starvation via identity shortcut confirmed.")
-        elif ratio < 0.05:
-            print("Channels 80-95 are SEVERELY STARVED. Near-zero recruitment.")
-        elif ratio < 0.2:
-            print("Channels 80-95 are WEAK. Partial recruitment, gradient competition with identity path.")
+        if ws_per_out.max() < 0.005:
+            print("mel_proj_speaker DEAD. spk_film CE gradient not reaching it.")
+        elif wc_to_hi.mean() < 0.001 and wc_to_lo.mean() > 0.1:
+            print("mel_proj_content ignoring ch 80-95. Content path healthy, speaker path separate — expected.")
         else:
-            print("Channels 80-95 are ACTIVE. Erosion has a different cause.")
+            print("Both projections alive. Gradient isolation working.")
     print("="*70)
 
     # ── Speaker Space Diagnostic ─────────────────────────────────────────
     print("\n[SPEAKER SPACE DIAGNOSTIC]")
     with torch.no_grad():
-        spk_A = model.mel_encoder(ref_A.unsqueeze(0))  # [1, 1, 96]
-        spk_B = model.mel_encoder(ref_B.unsqueeze(0))  # [1, 1, 96]
+        spk_A = model.mel_encoder(ref_A.unsqueeze(0))  # [1, 8, 96]
+        spk_B = model.mel_encoder(ref_B.unsqueeze(0))  # [1, 8, 96]
 
-        vec_A = spk_A.view(1, -1)  # flatten to [1, 96]
+        vec_A = spk_A.view(1, -1)  # flatten to [1, 768] (8 tokens x 96 dims)
         vec_B = spk_B.view(1, -1)
 
         cos_sim = torch.nn.functional.cosine_similarity(vec_A, vec_B, dim=-1)
@@ -142,22 +141,19 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             print("Speaker space is WELL-SEPARATED. Problem is training task (no cross-pair training).")
 
         # ── Per-token diversity audit ─────────────────────────────────────
+        # NOTE: per-token LayerNorm forces each token to μ≈0, σ≈1, L2≈√96≈9.8.
+        # Those per-token stats are constant by design — diagnostically useless.
+        # Use inter-token cosine and effective rank to measure true diversity.
         print("\n[PER-TOKEN DIVERSITY AUDIT]")
         for speaker_label, spk_feats in [("A (Man)", spk_A), ("B (Woman)", spk_B)]:
             tokens = spk_feats[0]  # [8, 96]
             print(f"  Speaker {speaker_label}:")
-            token_l2 = torch.norm(tokens, dim=-1)  # [8]
-            token_means = tokens.mean(dim=-1)       # [8]
-            token_stds  = tokens.std(dim=-1)        # [8]
-            print(f"    Token L2 norms:  [{', '.join(f'{v:.3f}' for v in token_l2.tolist())}]")
-            print(f"    Token means:     [{', '.join(f'{v:.3f}' for v in token_means.tolist())}]")
-            print(f"    Token stds:      [{', '.join(f'{v:.3f}' for v in token_stds.tolist())}]")
             # Inter-token cosine similarity (lower = more diverse)
             tokens_norm = torch.nn.functional.normalize(tokens, dim=-1)  # [8, 96]
             cos_matrix = tokens_norm @ tokens_norm.T  # [8, 8]
             off_diag = cos_matrix[~torch.eye(8, dtype=torch.bool, device=tokens.device)]
             print(f"    Inter-token cosine: mean={off_diag.mean():.4f}, max={off_diag.max():.4f} (lower=more diverse)")
-            # Effective rank (should now be >> 8/96)
+            # Effective rank (8/8 = full diversity)
             _, S, _ = torch.svd(tokens)
             ev = (S**2) / (S**2).sum()
             rank_95 = (ev.cumsum(0) < 0.95).sum().item() + 1
@@ -170,8 +166,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     # ── Interpolation Probe ───────────────────────────────────────────
     print("[INTERPOLATION PROBE]")
     with torch.no_grad():
-        spk_A = model.mel_encoder([ref_A.to(device)]) # [1, 1, 96]
-        spk_B = model.mel_encoder([ref_B.to(device)]) # [1, 1, 96]
+        spk_A = model.mel_encoder([ref_A.to(device)]) # [1, 8, 96]
+        spk_B = model.mel_encoder([ref_B.to(device)]) # [1, 8, 96]
         blended_spk = 0.5 * spk_A + 0.5 * spk_B  # 50/50 blend of Man + Woman
         
         # Override speaker features in model forward pass
@@ -315,8 +311,8 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print("-"*60)
         chan_diff = (film_AA - film_AB).abs().mean(dim=-1).squeeze(0)  # [96]
         _, rank_order = chan_diff.sort(descending=True)
-        low_diff = chan_diff[:80]   # channels 0-79 (identity path)
-        high_diff = chan_diff[80:]  # channels 80-95 (zero-init path)
+        low_diff = chan_diff[:80]   # channels 0-79 (content-leaning)
+        high_diff = chan_diff[80:]  # channels 80-95 (speaker-leaning)
         print(f"  Mean divergence ch 0-79:  {low_diff.mean():.6f}")
         print(f"  Mean divergence ch 80-95: {high_diff.mean():.6f}")
         print(f"  Ratio (80-95 / 0-79):     {high_diff.mean()/(low_diff.mean()+1e-8):.4f}")
@@ -326,71 +322,91 @@ def test_generalization(checkpoint_path: str, output_dir: str):
         print(f"  Top-16 channel indices (sorted): {sorted(top16)}")
         print(f"  Top-10 per-channel divergences:")
         for rank_idx, ch_idx in enumerate(rank_order[:10].tolist()):
-            zone = " ← ZERO-INIT (80-95)" if ch_idx >= 80 else ""
+            zone = " ← ch 80-95 (speaker group)" if ch_idx >= 80 else ""
             print(f"    #{rank_idx+1}: ch {ch_idx:3d}  div={chan_diff[ch_idx]:.6f}{zone}")
         print(f"  [VERDICT] ", end="")
         if in_high >= 8:
-            print("Speaker info CONCENTRATED in ch 80-95. Identity-init mel_proj is structurally wrong.")
+            print("Speaker info CONCENTRATED in ch 80-95. Content path may miss speaker info — speaker path should cover it.")
         elif in_high >= 3:
-            print("Speaker info MIXED across channel groups. mel_proj partially usable but erodes high channels.")
+            print("Speaker info MIXED across channel groups. Healthy — content path carries some speaker residual.")
         else:
-            print("Speaker info in ch 0-79. mel_proj identity path should preserve it. Erosion has different cause.")
+            print("Speaker info in ch 0-79. Content path carries speaker info — speaker path may be redundant.")
 
         # ═══════════════════════════════════════════════════════════════
-        # DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj input
+        # DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj_content input
         # ═══════════════════════════════════════════════════════════════
         print("\n" + "-"*60)
-        print("🔬 DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj input")
+        print("🔬 DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj_content")
         print("-"*60)
-        # Normal path cent_cos
-        mel_norm_AA = model.decoder.mel_proj(film_AA)
-        mel_norm_AB = model.decoder.mel_proj(film_AB)
+        # Normal path cent_cos (content path)
+        mel_norm_AA = model.decoder.mel_proj_content(film_AA)
+        mel_norm_AB = model.decoder.mel_proj_content(film_AB)
         aa_c_n = mel_norm_AA.flatten() - mel_norm_AA.flatten().mean()
         ab_c_n = mel_norm_AB.flatten() - mel_norm_AB.flatten().mean()
         cos_norm = torch.nn.functional.cosine_similarity(aa_c_n, ab_c_n, dim=0).item()
-        # Ablated: zero out channels 80-95 before mel_proj
+        # Ablated: zero out channels 80-95 before mel_proj_content
         film_AA_abl = film_AA.clone()
         film_AB_abl = film_AB.clone()
         film_AA_abl[:, 80:, :] = 0.0
         film_AB_abl[:, 80:, :] = 0.0
-        mel_abl_AA = model.decoder.mel_proj(film_AA_abl)
-        mel_abl_AB = model.decoder.mel_proj(film_AB_abl)
+        mel_abl_AA = model.decoder.mel_proj_content(film_AA_abl)
+        mel_abl_AB = model.decoder.mel_proj_content(film_AB_abl)
         aa_c_a = mel_abl_AA.flatten() - mel_abl_AA.flatten().mean()
         ab_c_a = mel_abl_AB.flatten() - mel_abl_AB.flatten().mean()
         cos_abl = torch.nn.functional.cosine_similarity(aa_c_a, ab_c_a, dim=0).item()
-        print(f"  Normal    mel_proj_raw cent_cos: {cos_norm:.4f}")
-        print(f"  Ablated   mel_proj_raw cent_cos: {cos_abl:.4f}")
+        print(f"  Normal    mel_proj_content cent_cos: {cos_norm:.4f}")
+        print(f"  Ablated   mel_proj_content cent_cos: {cos_abl:.4f}")
         delta = cos_abl - cos_norm
-        print(f"  Delta (ablated - normal):         {delta:+.4f}")
+        print(f"  Delta (ablated - normal):             {delta:+.4f}")
         print(f"  [VERDICT] ", end="")
         if abs(delta) < 0.02:
-            print("Channels 80-95 contribute NEGLIGIBLE speaker info at mel_proj. Functionally dead.")
+            print("Channels 80-95 contribute NEGLIGIBLE speaker info at content path. Expected — speaker path handles this.")
         elif delta > 0.05:
-            print("Channels 80-95 carry speaker info — ablation IMPROVES separation (suggests noise from dead channels).")
+            print("Channels 80-95 carry noise into content path — ablation IMPROVES separation.")
         elif delta < -0.02:
-            print("Channels 80-95 carry speaker info — ablation WORSENS separation. mel_proj has partially learned to use them.")
+            print("Channels 80-95 carry speaker info in content path. mel_proj_content may be competing with speaker path.")
         else:
-            print(f"Channels 80-95 have MARGINAL contribution (|Δ|={abs(delta):.3f}).")
+            print(f"Channels 80-95 have MARGINAL contribution to content path (|Δ|={abs(delta):.3f}).")
 
-        # ── Monolithic mel_proj: Conv1d(96→80) ──
-        mel_proj_raw_AA = model.decoder.mel_proj(film_AA)
-        mel_proj_raw_AB = model.decoder.mel_proj(film_AB)
+        # ── Split mel_proj (Fix #21): content path + speaker path ──
+        content_mel_AA = model.decoder.mel_proj_content(film_AA)
+        content_mel_AB = model.decoder.mel_proj_content(film_AB)
+
+        # Speaker delta from broadcast tokens
+        T = film_AA.size(-1)
+        spk_pooled_A = spk_A_t.mean(dim=1)  # [1, 96]
+        spk_pooled_B = spk_B_t.mean(dim=1)
+        spk_broad_A = spk_pooled_A.unsqueeze(-1).expand(-1, -1, T)  # [1, 96, T]
+        spk_broad_B = spk_pooled_B.unsqueeze(-1).expand(-1, -1, T)
+        mel_speaker_AA = model.decoder.mel_proj_speaker(spk_broad_A)  # [1, 80, T]
+        mel_speaker_AB = model.decoder.mel_proj_speaker(spk_broad_B)
+        # Energy gate (content-gated)
+        energy_AA = content_mel_AA.abs().mean(dim=1, keepdim=True)
+        energy_AB = content_mel_AB.abs().mean(dim=1, keepdim=True)
+        gate_AA = energy_AA / (energy_AA.mean(dim=-1, keepdim=True) + 1e-6)
+        gate_AB = energy_AB / (energy_AB.mean(dim=-1, keepdim=True) + 1e-6)
+        mel_speaker_AA = mel_speaker_AA * gate_AA
+        mel_speaker_AB = mel_speaker_AB * gate_AB
 
         # ── mel_scaled: after unconditioned out_scale ──
         out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
         out_scale_AA = out_scale
         out_scale_AB = out_scale
 
-        mel_band_mean_AA = mel_proj_raw_AA.mean(dim=-1, keepdim=True)
-        mel_band_mean_AB = mel_proj_raw_AB.mean(dim=-1, keepdim=True)
-        mel_centered_AA = mel_proj_raw_AA - mel_band_mean_AA
-        mel_centered_AB = mel_proj_raw_AB - mel_band_mean_AB
+        mel_band_mean_AA = content_mel_AA.mean(dim=-1, keepdim=True)
+        mel_band_mean_AB = content_mel_AB.mean(dim=-1, keepdim=True)
+        mel_centered_AA = content_mel_AA - mel_band_mean_AA
+        mel_centered_AB = content_mel_AB - mel_band_mean_AB
         mel_scaled_AA = mel_centered_AA * out_scale_AA + mel_band_mean_AA + model.decoder.out_bias
         mel_scaled_AB = mel_centered_AB * out_scale_AB + mel_band_mean_AB + model.decoder.out_bias
 
-        # ── mel_spk_affine: speaker-conditioned bias AFTER out_scale ──
-        mel_affine_AA = model.decoder.mel_speaker_affine(mel_scaled_AA, spk_A_t)
-        mel_affine_AB = model.decoder.mel_speaker_affine(mel_scaled_AB, spk_B_t)
+        # ── Combine: variance_mel.detach() + mel_speaker ──
+        spk_film_AA = mel_scaled_AA.detach() + mel_speaker_AA
+        spk_film_AB = mel_scaled_AB.detach() + mel_speaker_AB
+
+        # ── mel_spk_affine: speaker-conditioned bias AFTER combine ──
+        mel_affine_AA = model.decoder.mel_speaker_affine(spk_film_AA, spk_A_t)
+        mel_affine_AB = model.decoder.mel_speaker_affine(spk_film_AB, spk_B_t)
 
         # ── mel_scaled_final: after clamp (final model output) ──
         mel_final_AA = torch.clamp(mel_affine_AA, min=-11.5, max=2.0)
@@ -403,13 +419,14 @@ def test_generalization(checkpoint_path: str, output_dir: str):
             ("adapter_film", adapter_film_AA, adapter_film_AB),
             ("block0", block0_AA, block0_AB),
             ("block2", block2_AA, block2_AB),
-            ("b3_identity", b3_id_AA, b3_id_AB),        # raw residual_proj output (the erasure point)
-            ("b3_id_film", b3_id_film_AA, b3_id_film_AB), # after Block3IdentityFiLM (speaker recovered)
+            ("b3_identity", b3_id_AA, b3_id_AB),
+            ("b3_id_film", b3_id_film_AA, b3_id_film_AB),
             ("b3_body", b3_body_AA, b3_body_AB),
             ("block3_sum", block3_AA, block3_AB),
             ("spk_film", film_AA, film_AB),
-            ("mel_proj_raw", mel_proj_raw_AA, mel_proj_raw_AB),    # monolithic Conv1d(96→80)
-            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),            # after out_scale (pre-spkr-bias)
+            ("mel_content", content_mel_AA, content_mel_AB),       # mel_proj_content (L1+Var path)
+            ("mel_speaker", mel_speaker_AA, mel_speaker_AB),       # mel_proj_speaker (CE path, energy-gated)
+            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),           # after out_scale
             ("mel_spk_affine", mel_affine_AA, mel_affine_AB),      # after speaker bias
             ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
         ]
