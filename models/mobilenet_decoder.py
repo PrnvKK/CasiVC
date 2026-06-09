@@ -233,8 +233,10 @@ class SpeakerFiLM(nn.Module):
         # Learnable scale (softplus reparam, always > 0.5)
         film_scale = F.softplus(self.raw_film_scale) + 0.5
 
-        # Scale + ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard)
-        gamma = F.elu(gamma * film_scale)
+        # Scale + ELU on gamma: ensures (1+gamma) ≥ 0 (inversion guard).
+        # Clamp to [-0.5, 1.0]: (1+gamma) ∈ [0.5, 2.0], max 2× amplification.
+        # Prevents asymptotic FiLM overgrowth causing vocoder buzzing at >20 epochs.
+        gamma = torch.clamp(F.elu(gamma * film_scale), -0.5, 1.0)
         beta  = beta * film_scale
 
         # Reshape for broadcasting over temporal dim: [B, C, 1]
@@ -550,11 +552,11 @@ class MobileNetDecoder(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         
         # ── Split mel projection (gradient-isolated content vs speaker) ──
-        # Fix #21: L1+Var train ONLY mel_proj_content(96→80).
-        #           spk_film CE trains ONLY mel_proj_speaker(96→80).
-        # No shared weight matrix → zero asymptotic competition.
-        # Speaker path takes broadcast speaker tokens (pure identity signal,
-        # detached) so upstream speaker stripping cannot regress it.
+        # Fix #21: mel_proj_content(96→80) for L1+Var, reads all 96 channels.
+        #   L1 flowing through all channels naturally regularizes upstream FiLM
+        #   modules — prevents unbounded drift on ch 80-95 (γ→3.15, id suppression→0.36).
+        # mel_proj_speaker(96→80) for spk_film CE, reads broadcast spk tokens.
+        #   Separate weight matrices → zero L1-vs-CE shared-matrix competition.
         self.mel_proj_content = nn.Conv1d(
             channel_progression[-1], 80, kernel_size=1, bias=True
         )
@@ -780,10 +782,11 @@ class MobileNetDecoder(nn.Module):
             x = self.speaker_film(x, speaker_feats)
             self._check(x, "spk_film")
 
-        # ── Split mel projection (Fix #21): gradient-isolated paths ─────
-        # Content path (mel_proj_content): trained by L1 + Var only.
-        # Speaker path (mel_proj_speaker): trained by spk_film CE only.
-        # No shared weight matrix → zero asymptotic L1-vs-CE competition.
+        # ── Split mel projection: gradient-isolated paths ─────────────
+        # Content path (mel_proj_content): reads all 96 ch — L1+Var only.
+        #   L1 through all channels regularizes FiLM, prevents ch 80-95 drift.
+        # Speaker path (mel_proj_speaker): reads broadcast spk tokens — CE only.
+        #   Separate weight matrices → zero L1-vs-CE shared-matrix competition.
         content_mel = self.mel_proj_content(x)  # [B, 80, T]
 
         # Speaker delta from broadcast speaker tokens (pure identity signal)
