@@ -729,8 +729,8 @@ class MobileNetDecoder(nn.Module):
         # Adapter-entry speaker FiLM: inject speaker identity before
         # blocks 0-2 so they process speaker-enriched features
         if speaker_feats is not None:
-            x = self.adapter_speaker_film(x, speaker_feats)
-            self._check(x, "adapter_film")
+            pass # DISABLED FOR PHASE 1: x = self.adapter_speaker_film(x, speaker_feats)
+            # self._check(x, "adapter_film")
         
         # REMOVE old upsample_first logic entirely
         
@@ -742,7 +742,7 @@ class MobileNetDecoder(nn.Module):
         for i, blk in enumerate(self.blocks):
           x_before = x
 
-          if i == 3 and speaker_feats is not None and self.block3_id_film is not None:
+          if i == 3 and speaker_feats is not None and self.block3_id_film is not None and False: # DISABLED FOR PHASE 1
               # ── Decompose block3 to inject FiLM at residual_proj output ──
               identity = x
               # No upsample for block3 (upsample_stages[3] = False)
@@ -779,8 +779,8 @@ class MobileNetDecoder(nn.Module):
         # before mel_proj compresses it away.  Without this, block3's
         # 192→96 residual_proj crushes speaker info (cent_cos 0.49→0.75).
         if speaker_feats is not None:
-            x = self.speaker_film(x, speaker_feats)
-            self._check(x, "spk_film")
+            pass # DISABLED FOR PHASE 1: x = self.speaker_film(x, speaker_feats)
+            # self._check(x, "spk_film")
 
         # ── Split mel projection: gradient-isolated paths ─────────────
         # Content path (mel_proj_content): reads all 96 ch — L1+Var only.
@@ -793,16 +793,7 @@ class MobileNetDecoder(nn.Module):
         # Fix #21b: uses spk tokens, not x.detach(), to prevent regression
         # as upstream strips speaker info from feature tensor over time.
         if speaker_feats is not None:
-            spk_pooled = speaker_feats.mean(dim=1)  # [B, 96]
-            spk_broadcast = spk_pooled.unsqueeze(-1).expand(-1, -1, x.size(-1))  # [B, 96, T]
-            mel_speaker = self.mel_proj_speaker(spk_broadcast)  # [B, 80, T]
-
-            # Fix #21c: Content-gated speaker delta. Per-frame energy gate
-            # prevents time-invariant fixed-filter sound and concentrates
-            # CE gradient on vowel frames where speaker identity matters most.
-            energy = content_mel.abs().mean(dim=1, keepdim=True)  # [B, 1, T]
-            energy_gate = energy / (energy.mean(dim=-1, keepdim=True) + 1e-6)
-            mel_speaker = mel_speaker * energy_gate
+            mel_speaker = torch.zeros_like(content_mel) # DISABLED FOR PHASE 1
         else:
             mel_speaker = torch.zeros_like(content_mel)
 
@@ -831,7 +822,8 @@ class MobileNetDecoder(nn.Module):
         # Used ONLY by variance loss (λ=30) — L1 sees raw prebias_mel above.
         mel_band_mean = content_mel.mean(dim=-1, keepdim=True)       # [B, 80, 1]
         mel_centered  = content_mel - mel_band_mean                   # zero-mean per band
-        mel_scaled    = mel_centered * out_scale + mel_band_mean + self.out_bias
+        # PHASE 1: Bypass out_scale to prevent structural variance amplifier from fighting L1
+        mel_scaled    = content_mel + self.out_bias
         mel_post_scale_std = mel_scaled.std().item()
         mel_post_scale_mean = mel_scaled.mean().item()
         if v: print(f"[decoder] post-scale pre-clamp mel: mean={mel_post_scale_mean:.4f}, std={mel_post_scale_std:.4f}")
@@ -844,11 +836,10 @@ class MobileNetDecoder(nn.Module):
         # mel_speaker added to detached variance_mel: spk_film CE gradient
         # flows ONLY to mel_proj_speaker, never upstream. Speaker delta is
         # an additive residual on the content baseline.
-        spk_film_mel = variance_mel.detach() + mel_speaker
+        spk_film_mel = variance_mel # PHASE 1: Strict final output L1
 
         if speaker_feats is not None:
-            spk_film_mel = self.mel_speaker_affine(spk_film_mel, speaker_feats)
-            self._check(spk_film_mel, "mel_spk_affine")
+            pass # DISABLED FOR PHASE 1: spk_film_mel = self.mel_speaker_affine(spk_film_mel, speaker_feats)
 
         postbias_mel = spk_film_mel
         mel = torch.clamp(spk_film_mel, min=-11.5, max=2.0)

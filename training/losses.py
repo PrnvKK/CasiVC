@@ -411,10 +411,10 @@ class VCGeneratorLoss(nn.Module):
 
         # --- Compute and weight each loss term ---
 
-        # Mel reconstruction loss (Raw L1) — on content_mel (raw, pre-scale)
+        # Mel reconstruction loss (Raw L1) — ENFORCED ON FINAL pred_mel
         if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
             try:
-                mel_for_l1 = content_mel if content_mel is not None else pred_mel
+                mel_for_l1 = pred_mel  # Phase 1: STRICT training contract on final output
                 T_common = min(mel_for_l1.size(-1), gt_mel.size(-1))
                 p_align = mel_for_l1[:, :, :T_common]
                 g_align = gt_mel[:, :, :T_common]

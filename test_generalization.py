@@ -1,18 +1,109 @@
 import os
+import json
 import torch
 import torchaudio
 import argparse
+import random
 from pathlib import Path
+from tqdm import tqdm
 
 from config import AudioConfig, ModelConfig, TrainingConfig
 from data.audio_utils import extract_mel_spectrogram, load_audio, split_utterance_for_training
 from models.hubertvc_model import HubertVCModel
 from inference import load_vocoder
 
-def test_generalization(checkpoint_path: str, output_dir: str):
-    print("="*60)
-    print("🚀 RUNNING 2-UTTERANCE GENERALIZATION TEST")
-    print("="*60)
+# Try to load SpeechBrain for SPK_SIM
+try:
+    from speechbrain.pretrained import EncoderClassifier
+    SPEECHBRAIN_AVAILABLE = True
+except ImportError:
+    SPEECHBRAIN_AVAILABLE = False
+    print("\n[WARNING] SpeechBrain not installed. SPK_SIM metric will be skipped.")
+    print("Run: pip install speechbrain\n")
+
+def build_or_load_manifest(dataset_root: str, num_utterances: int = 50, seed: int = 42, manifest_path: str = "eval_manifest.json") -> list:
+    """
+    Deterministically selects num_utterances from the test-clean split (or dev-clean) and saves them.
+    If the manifest already exists, loads it to ensure reproducibility across runs.
+    """
+    if os.path.exists(manifest_path):
+        print(f"Loading existing evaluation manifest from {manifest_path}...")
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+        return manifest
+
+    print(f"Building new deterministic evaluation manifest with {num_utterances} utterances...")
+    
+    # Check test-clean, fallback to dev-clean
+    test_dir = os.path.join(dataset_root, "test-clean")
+    if not os.path.exists(test_dir):
+        test_dir = os.path.join(dataset_root, "dev-clean")
+        
+    if not os.path.exists(test_dir):
+        raise FileNotFoundError(f"Neither test-clean nor dev-clean found in {dataset_root}")
+
+    all_wavs = []
+    for root, _, files in os.walk(test_dir):
+        for file in files:
+            if file.endswith('.wav'):
+                all_wavs.append(os.path.join(root, file))
+                
+    if not all_wavs:
+        raise ValueError(f"No .wav files found in {test_dir}")
+
+    # Deterministic sort and seed
+    all_wavs.sort()
+    rng = random.Random(seed)
+    
+    # Group by speaker to ensure diversity
+    speaker_dict = {}
+    for wav in all_wavs:
+        # LibriTTS format: speaker/chapter/wav
+        parts = Path(wav).parts
+        speaker_id = parts[-3] if len(parts) >= 3 else "unknown"
+        if speaker_id not in speaker_dict:
+            speaker_dict[speaker_id] = []
+        speaker_dict[speaker_id].append(wav)
+        
+    for spk in speaker_dict:
+        rng.shuffle(speaker_dict[spk])
+        
+    selected_wavs = []
+    speakers = sorted(list(speaker_dict.keys()))
+    rng.shuffle(speakers)
+    
+    # Round robin selection
+    while len(selected_wavs) < num_utterances and speakers:
+        for spk in list(speakers):
+            if speaker_dict[spk]:
+                selected_wavs.append(speaker_dict[spk].pop(0))
+                if len(selected_wavs) >= num_utterances:
+                    break
+            else:
+                speakers.remove(spk)
+
+    # Save manifest
+    with open(manifest_path, 'w') as f:
+        json.dump(selected_wavs, f, indent=2)
+        
+    print(f"Saved manifest to {manifest_path}")
+    return selected_wavs
+
+def calculate_spk_sim(encoder, wave1, wave2, device="cpu"):
+    """Calculate cosine similarity between two waveforms using SpeechBrain ECAPA-TDNN."""
+    if not SPEECHBRAIN_AVAILABLE or encoder is None:
+        return 0.0
+    with torch.no_grad():
+        emb1 = encoder.encode_batch(wave1.to(device))
+        emb2 = encoder.encode_batch(wave2.to(device))
+        # embeddings are (B, 1, 192)
+        sim = torch.nn.functional.cosine_similarity(emb1.squeeze(1), emb2.squeeze(1), dim=-1)
+        return sim.item()
+
+def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = False):
+    print("="*70)
+    print("🚀 RUNNING CASIVC GENERALIZATION EVALUATION")
+    print("="*70)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(output_dir, exist_ok=True)
@@ -21,591 +112,162 @@ def test_generalization(checkpoint_path: str, output_dir: str):
     model_cfg = ModelConfig()
     train_cfg = TrainingConfig()
     
-    print("\n[1] Loading Vocoder...")
+    # ── Load Subsystems ──────────────────────────
+    print("\n[1] Loading Vocoder & Metrics...")
     vocoder = load_vocoder(None, device=str(device))
     vocoder.eval()
     
-    # ── Hardcoded paths provided by the user ─────────────────────
-    utt_path_A = "/content/LibriTTS/dev-clean/2428/83705/2428_83705_000000_000001.wav"
-    utt_path_B = "/content/LibriTTS/dev-clean/1988/148538/1988_148538_000002_000000.wav"
-    spk_A = "2428 (man)"
-    spk_B = "1988 (woman)"
+    spk_encoder = None
+    if SPEECHBRAIN_AVAILABLE:
+        try:
+            spk_encoder = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir="pretrained_models/spkrec-ecapa-voxceleb",
+                run_opts={"device": str(device)}
+            )
+            spk_encoder.eval()
+            print("✅ Loaded ECAPA-TDNN for SPK_SIM metric.")
+        except Exception as e:
+            print(f"⚠️ Failed to load ECAPA-TDNN: {e}")
     
-    print(f"\n[2] Loading Specific Utterances...")
-    print(f"   Utterance A: {Path(utt_path_A).name}  (speaker {spk_A})")
-    print(f"   Utterance B: {Path(utt_path_B).name}  (speaker {spk_B})")
-
-    # Load full audio for both
-    full_audio_A = load_audio(utt_path_A, sample_rate=audio_cfg.sample_rate).to(device)
-    full_audio_B = load_audio(utt_path_B, sample_rate=audio_cfg.sample_rate).to(device)
-
-    # Deterministic split (using the exact same logic as training)
-    ref_A, content_A = split_utterance_for_training(
-        full_audio_A, ref_length_range=(1.0, 2.0),
-        sample_rate=audio_cfg.sample_rate, min_content_length=0.5, deterministic=True
-    )
-    ref_B, content_B = split_utterance_for_training(
-        full_audio_B, ref_length_range=(1.0, 2.0),
-        sample_rate=audio_cfg.sample_rate, min_content_length=0.5, deterministic=True
-    )
-    print(f"   A: ref={ref_A.shape[0]/audio_cfg.sample_rate:.2f}s, content={content_A.shape[0]/audio_cfg.sample_rate:.2f}s")
-    print(f"   B: ref={ref_B.shape[0]/audio_cfg.sample_rate:.2f}s, content={content_B.shape[0]/audio_cfg.sample_rate:.2f}s")
-
-    # ── Test 1: Raw ground truth waveforms ────────────────────────
-    torchaudio.save(os.path.join(output_dir, "01_raw_content_A.wav"),
-                    content_A.cpu().unsqueeze(0), audio_cfg.sample_rate)
-    torchaudio.save(os.path.join(output_dir, "02_raw_content_B.wav"),
-                    content_B.cpu().unsqueeze(0), audio_cfg.sample_rate)
-    print("\n✅ Saved raw content A and B")
-
-    # ── Test 2: Vocoder ceiling (GT mel → vocoded) ─────────────────
-    print("\n[3] Testing Vocoder Ceiling...")
-    gt_mel_A = extract_mel_spectrogram(content_A, sample_rate=audio_cfg.sample_rate)  # (80, T)
-    gt_mel_B = extract_mel_spectrogram(content_B, sample_rate=audio_cfg.sample_rate)
-    with torch.no_grad():
-        vocoded_A = vocoder(gt_mel_A.unsqueeze(0).to(device)).squeeze(0).squeeze(0).cpu()
-        vocoded_B = vocoder(gt_mel_B.unsqueeze(0).to(device)).squeeze(0).squeeze(0).cpu()
-    torchaudio.save(os.path.join(output_dir, "03_vocoded_A.wav"), vocoded_A.unsqueeze(0), audio_cfg.sample_rate)
-    torchaudio.save(os.path.join(output_dir, "04_vocoded_B.wav"), vocoded_B.unsqueeze(0), audio_cfg.sample_rate)
-    print("✅ Saved vocoded GT mels for A and B")
-
-    # ── Load model ─────────────────────────────────────────────────
-    print(f"\n[4] Loading Model from {checkpoint_path}...")
+    print(f"\n[2] Loading Model from {checkpoint_path}...")
     if not os.path.exists(checkpoint_path):
-        print(f"❌ Checkpoint not found: {checkpoint_path}. Skipping model tests.")
+        print(f"❌ Checkpoint not found: {checkpoint_path}. Exiting.")
         return
+        
     model = HubertVCModel(audio_cfg, model_cfg, train_cfg).to(device)
     model.eval()
     ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
-    print("✅ Model loaded.")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # DIAGNOSTIC 2: Split mel_proj weight norms (content=96→80, speaker=96→80)
-    # ═══════════════════════════════════════════════════════════════════
-    print("\n" + "="*70)
-    print("🔬 DIAGNOSTIC 2: Split mel_proj weight norms (content: 96→80, speaker: 96→80)")
-    print("="*70)
-    with torch.no_grad():
-        # mel_proj_content: Conv1d(96→80), reads all 96 feature channels (L1+Var)
-        wc = model.decoder.mel_proj_content.weight  # [80, 96, 1]
-        wc_norm = wc.squeeze(-1).norm(p=2, dim=0)  # [96] per-input-channel L2
-        wc_to_lo = wc.squeeze(-1)[:, :80].norm(p=2, dim=1)  # [80] weight to ch 0-79
-        wc_to_hi = wc.squeeze(-1)[:, 80:].norm(p=2, dim=1)  # [80] weight to ch 80-95
-        wc_per_out = wc.squeeze(-1).norm(p=2, dim=1)  # [80] per-output-channel L2
-        print(f"  mel_proj_content (L1+Var, reads all 96 ch):")
-        print(f"    Input ch 0-79  mean L2={wc_norm[:80].mean():.6f}, max={wc_norm[:80].max():.6f}")
-        print(f"    Input ch 80-95 mean L2={wc_norm[80:].mean():.6f}, max={wc_norm[80:].max():.6f}")
-        print(f"    Per-output weight to ch 0-79:  mean={wc_to_lo.mean():.6f}")
-        print(f"    Per-output weight to ch 80-95: mean={wc_to_hi.mean():.6f}")
-        # mel_proj_speaker: Conv1d(96→80), reads broadcast spk tokens (CE gradient only)
-        ws = model.decoder.mel_proj_speaker.weight  # [80, 96, 1]
-        ws_norm = ws.squeeze(-1).norm(p=2, dim=0)  # [96]
-        ws_per_out = ws.squeeze(-1).norm(p=2, dim=1)  # [80] per-output-channel L2
-        print(f"  mel_proj_speaker (spk_film CE, reads spk tokens):")
-        print(f"    Input ch mean L2={ws_norm.mean():.6f}, max={ws_norm.max():.6f}, min={ws_norm.min():.6f}")
-        print(f"    Per-output weight mean={ws_per_out.mean():.6f}, max={ws_per_out.max():.6f}")
-        print(f"  [VERDICT] ", end="")
-        if ws_per_out.max() < 0.005:
-            print("mel_proj_speaker DEAD. spk_film CE gradient not reaching it.")
-        elif wc_per_out.mean() < 0.01:
-            print("mel_proj_content DEAD. L1 gradient not reaching it.")
-        else:
-            print("Both projections alive. Separate matrices, L1→content, CE→speaker.")
-    print("="*70)
-
-    # ── Speaker Space Diagnostic ─────────────────────────────────────────
-    print("\n[SPEAKER SPACE DIAGNOSTIC]")
-    with torch.no_grad():
-        spk_A = model.mel_encoder(ref_A.unsqueeze(0))  # [1, 8, 96]
-        spk_B = model.mel_encoder(ref_B.unsqueeze(0))  # [1, 8, 96]
-
-        vec_A = spk_A.view(1, -1)  # flatten to [1, 768] (8 tokens x 96 dims)
-        vec_B = spk_B.view(1, -1)
-
-        cos_sim = torch.nn.functional.cosine_similarity(vec_A, vec_B, dim=-1)
-        l2_dist = torch.norm(vec_A - vec_B, p=2)
-        diff = (vec_A - vec_B).abs()
-        top5 = diff.squeeze().topk(5)
-
-        print(f"  Cosine similarity (Man vs Woman): {cos_sim.item():.4f}")
-        print(f"  L2 distance       (Man vs Woman): {l2_dist.item():.4f}")
-        print(f"  Top-5 most different dims values:  {[round(v, 4) for v in top5.values.tolist()]}")
-        print(f"  Top-5 most different dims indices:  {top5.indices.tolist()}")
-        print(f"  [VERDICT] ", end="")
-        if cos_sim.item() > 0.90:
-            print("Speaker space is COLLAPSED. Tanh is compressing Man/Woman into the same region.")
-        elif cos_sim.item() > 0.50:
-            print("Partial separation. Speaker info is weak but present.")
-        else:
-            print("Speaker space is WELL-SEPARATED. Problem is training task (no cross-pair training).")
-
-        # ── Per-token diversity audit ─────────────────────────────────────
-        # NOTE: per-token LayerNorm forces each token to μ≈0, σ≈1, L2≈√96≈9.8.
-        # Those per-token stats are constant by design — diagnostically useless.
-        # Use inter-token cosine and effective rank to measure true diversity.
-        print("\n[PER-TOKEN DIVERSITY AUDIT]")
-        for speaker_label, spk_feats in [("A (Man)", spk_A), ("B (Woman)", spk_B)]:
-            tokens = spk_feats[0]  # [8, 96]
-            print(f"  Speaker {speaker_label}:")
-            # Inter-token cosine similarity (lower = more diverse)
-            tokens_norm = torch.nn.functional.normalize(tokens, dim=-1)  # [8, 96]
-            cos_matrix = tokens_norm @ tokens_norm.T  # [8, 8]
-            off_diag = cos_matrix[~torch.eye(8, dtype=torch.bool, device=tokens.device)]
-            print(f"    Inter-token cosine: mean={off_diag.mean():.4f}, max={off_diag.max():.4f} (lower=more diverse)")
-            # Effective rank (8/8 = full diversity)
-            _, S, _ = torch.svd(tokens)
-            ev = (S**2) / (S**2).sum()
-            rank_95 = (ev.cumsum(0) < 0.95).sum().item() + 1
-            print(f"    Effective rank (95% var): {rank_95}/8  |  Singular values: [{', '.join(f'{v:.2f}' for v in S.tolist())}]")
-        # ─────────────────────────────────────────────────────────────────
-    print()
-
-    # ─────────────────────────────────────────────────────────────────────
-
-    # ── Interpolation Probe ───────────────────────────────────────────
-    print("[INTERPOLATION PROBE]")
-    with torch.no_grad():
-        spk_A = model.mel_encoder([ref_A.to(device)]) # [1, 8, 96]
-        spk_B = model.mel_encoder([ref_B.to(device)]) # [1, 8, 96]
-        blended_spk = 0.5 * spk_A + 0.5 * spk_B  # 50/50 blend of Man + Woman
-        
-        # Override speaker features in model forward pass
-        pred_blend_A, _, _ = model(
-            precomputed_speaker_feats=blended_spk,
-            content_audio=[content_A.to(device)]
-        )
-        wave_blend = vocoder(pred_blend_A).squeeze(0).squeeze(0).cpu()
-        torchaudio.save(os.path.join(output_dir, "09_blend_A_spk50.wav"), 
-                        wave_blend.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"  Blended mel mean: {pred_blend_A.mean():.4f}")
-        print("✅ Saved 09_blend_A_spk50.wav  (Man content + 50% Man / 50% Woman voice)")
-    print()
-    # ──────────────────────────────────────────────────────────────────
-
-    # ── Suppress per-call debug prints after diagnostic probe ────────
-    model._verbose = False
-    model.cross_attn._verbose = False
-    model.decoder._verbose = False
-    model.decoder.speaker_film._verbose = False
-    model.decoder.block3_id_film._verbose = False
-    model.decoder.adapter_speaker_film._verbose = False
-    model.decoder.mel_speaker_affine._verbose = False
-    for blk in model.decoder.blocks:
-        blk._verbose = False
-    model.mel_encoder._verbose = False
-    # ─────────────────────────────────────────────────────────────────
-
-    with torch.no_grad():
-        # ── Test 3: Self-reconstruction A → A ─────────────────────
-        print("\n[5] Self-reconstruction: A content + A voice...")
-        pred_mel_AA, _, _ = model(ref_A.unsqueeze(0), [content_A])
-        wave_AA = vocoder(pred_mel_AA).squeeze(0).squeeze(0).cpu()
-        torchaudio.save(os.path.join(output_dir, "05_self_recon_A.wav"), wave_AA.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_AA.shape}, mean={pred_mel_AA.mean():.4f}")
-        print("✅ Saved A→A")
-
-        # ── Test 4: Self-reconstruction B → B ─────────────────────
-        print("\n[6] Self-reconstruction: B content + B voice...")
-        pred_mel_BB, _, _ = model(ref_B.unsqueeze(0), [content_B])
-        wave_BB = vocoder(pred_mel_BB).squeeze(0).squeeze(0).cpu()
-        torchaudio.save(os.path.join(output_dir, "06_self_recon_B.wav"), wave_BB.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_BB.shape}, mean={pred_mel_BB.mean():.4f}")
-        print("✅ Saved B→B")
-
-        # ── Test 5: Cross-conversion A content → B voice (Man speaking as Woman) ──────────
-        print("\n[7] Cross-conversion: A content + B voice (Man speaking as Woman)...")
-        pred_mel_AB, _, _ = model(ref_B.unsqueeze(0), [content_A])
-        wave_AB = vocoder(pred_mel_AB).squeeze(0).squeeze(0).cpu()
-        torchaudio.save(os.path.join(output_dir, "07_cross_AtoB.wav"), wave_AB.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_AB.shape}, mean={pred_mel_AB.mean():.4f}")
-        print("✅ Saved A→B")
-
-        # ── Test 6: Cross-conversion B content → A voice (Woman speaking as Man) ──────────
-        print("\n[8] Cross-conversion: B content + A voice (Woman speaking as Man)...")
-        pred_mel_BA, _, _ = model(ref_A.unsqueeze(0), [content_B])
-        wave_BA = vocoder(pred_mel_BA).squeeze(0).squeeze(0).cpu()
-        torchaudio.save(os.path.join(output_dir, "08_cross_BtoA.wav"), wave_BA.unsqueeze(0), audio_cfg.sample_rate)
-        print(f"   Pred mel: {pred_mel_BA.shape}, mean={pred_mel_BA.mean():.4f}")
-        print("\u2705 Saved B\u2192A")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # STAGE-DELTA AUDIT: A-voice vs B-voice divergence at each pipeline stage
-    # ═══════════════════════════════════════════════════════════════════
-    print("\n" + "="*70)
-    print("🔬 STAGE-DELTA AUDIT (A-voice vs B-voice divergence per stage)")
-    print("="*70)
-    with torch.no_grad():
-        cont_A_t = model.hubert([content_A.to(device)])
-        cont_A_t = model.hubert_proj(cont_A_t)
-        cont_A_t = model.info_bottleneck(cont_A_t)
-        spk_A_t = model.mel_encoder([ref_A.to(device)])
-        spk_B_t = model.mel_encoder([ref_B.to(device)])
-
-        fused_AA = model.cross_attn(cont_A_t, spk_A_t)
-        fused_AB = model.cross_attn(cont_A_t, spk_B_t)
-
-        tgt_len = gt_mel_A.shape[-1]
-        resampled_AA = model.temporal_resampler(fused_AA, target_length=tgt_len)
-        resampled_AB = model.temporal_resampler(fused_AB, target_length=tgt_len)
-
-        adapter_AA = model.decoder.adapter(resampled_AA.transpose(1, 2))
-        adapter_AB = model.decoder.adapter(resampled_AB.transpose(1, 2))
-
-        # ── Adapter-entry speaker FiLM ──
-        adapter_film_AA = model.decoder.adapter_speaker_film(adapter_AA, spk_A_t)
-        adapter_film_AB = model.decoder.adapter_speaker_film(adapter_AB, spk_B_t)
-
-        x_AA, x_AB = adapter_film_AA, adapter_film_AB
-        for i, blk in enumerate(model.decoder.blocks):
-            if i == 3:
-                # ── Block3 decomposed: identity vs body vs sum ──
-                # Replicate MobileNetBlock.forward logic to capture each branch
-                identity_AA, identity_AB = x_AA, x_AB
-                # upsampling (none for block3)
-                if blk.upsample_first is not None:
-                    x_AA = blk.upsample_first(x_AA)
-                    x_AB = blk.upsample_first(x_AB)
-                    identity_AA = blk.upsample_first(identity_AA)
-                    identity_AB = blk.upsample_first(identity_AB)
-                # body
-                body_AA = blk.block(x_AA)
-                body_AB = blk.block(x_AB)
-                # identity projection
-                if blk.residual_proj is not None:
-                    id_proj_AA = blk.residual_proj(identity_AA)
-                    id_proj_AB = blk.residual_proj(identity_AB)
-                else:
-                    id_proj_AA = identity_AA
-                    id_proj_AB = identity_AB
-                # store raw id_proj BEFORE FiLM (the erasure point)
-                b3_id_AA, b3_id_AB = id_proj_AA.clone(), id_proj_AB.clone()
-                # ── INJECT: block3_id_film at residual_proj output ──
-                id_proj_AA = model.decoder.block3_id_film(id_proj_AA, spk_A_t)
-                id_proj_AB = model.decoder.block3_id_film(id_proj_AB, spk_B_t)
-                # store id_proj AFTER FiLM (speaker-recovered)
-                b3_id_film_AA, b3_id_film_AB = id_proj_AA.clone(), id_proj_AB.clone()
-                # final sum
-                sum_AA = blk.residual_identity_scale * id_proj_AA + blk.residual_scale * body_AA
-                sum_AB = blk.residual_identity_scale * id_proj_AB + blk.residual_scale * body_AB
-                # store for stage audit
-                b3_body_AA, b3_body_AB = body_AA, body_AB
-                block3_AA, block3_AB = sum_AA, sum_AB
-                x_AA, x_AB = sum_AA, sum_AB
-            else:
-                x_AA, x_AB = blk(x_AA), blk(x_AB)
-            if i == 0:
-                block0_AA, block0_AB = x_AA.clone(), x_AB.clone()
-            if i == 2:
-                block2_AA, block2_AB = x_AA.clone(), x_AB.clone()
-
-        # ── Speaker FiLM: re-inject speaker identity before mel_proj ──
-        film_AA = model.decoder.speaker_film(block3_AA, spk_A_t)
-        film_AB = model.decoder.speaker_film(block3_AB, spk_B_t)
-
-        # ═══════════════════════════════════════════════════════════════
-        # DIAGNOSTIC 1: Per-channel speaker divergence at spk_film output
-        # ═══════════════════════════════════════════════════════════════
-        print("\n" + "-"*60)
-        print("🔬 DIAGNOSTIC 1: Per-channel speaker divergence at spk_film")
-        print("-"*60)
-        chan_diff = (film_AA - film_AB).abs().mean(dim=-1).squeeze(0)  # [96]
-        _, rank_order = chan_diff.sort(descending=True)
-        low_diff = chan_diff[:80]   # channels 0-79 (content-leaning)
-        high_diff = chan_diff[80:]  # channels 80-95 (speaker-leaning)
-        print(f"  Mean divergence ch 0-79:  {low_diff.mean():.6f}")
-        print(f"  Mean divergence ch 80-95: {high_diff.mean():.6f}")
-        print(f"  Ratio (80-95 / 0-79):     {high_diff.mean()/(low_diff.mean()+1e-8):.4f}")
-        top16 = set(rank_order[:16].tolist())
-        in_high = sum(1 for i in top16 if i >= 80)
-        print(f"  Top-16 channels: {in_high}/16 are in range 80-95")
-        print(f"  Top-16 channel indices (sorted): {sorted(top16)}")
-        print(f"  Top-10 per-channel divergences:")
-        for rank_idx, ch_idx in enumerate(rank_order[:10].tolist()):
-            zone = " ← ch 80-95 (speaker group)" if ch_idx >= 80 else ""
-            print(f"    #{rank_idx+1}: ch {ch_idx:3d}  div={chan_diff[ch_idx]:.6f}{zone}")
-        print(f"  [VERDICT] ", end="")
-        if in_high >= 8:
-            print("Speaker info CONCENTRATED in ch 80-95. Content path may miss speaker info — speaker path should cover it.")
-        elif in_high >= 3:
-            print("Speaker info MIXED across channel groups. Healthy — content path carries some speaker residual.")
-        else:
-            print("Speaker info in ch 0-79. Content path carries speaker info — speaker path may be redundant.")
-
-        # ═══════════════════════════════════════════════════════════════
-        # DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj_content input
-        # ═══════════════════════════════════════════════════════════════
-        print("\n" + "-"*60)
-        print("🔬 DIAGNOSTIC 4: Channel 80-95 ablation at mel_proj_content")
-        print("-"*60)
-        mel_norm_AA = model.decoder.mel_proj_content(film_AA)
-        mel_norm_AB = model.decoder.mel_proj_content(film_AB)
-        aa_c_n = mel_norm_AA.flatten() - mel_norm_AA.flatten().mean()
-        ab_c_n = mel_norm_AB.flatten() - mel_norm_AB.flatten().mean()
-        cos_norm = torch.nn.functional.cosine_similarity(aa_c_n, ab_c_n, dim=0).item()
-        film_AA_abl = film_AA.clone()
-        film_AB_abl = film_AB.clone()
-        film_AA_abl[:, 80:, :] = 0.0
-        film_AB_abl[:, 80:, :] = 0.0
-        mel_abl_AA = model.decoder.mel_proj_content(film_AA_abl)
-        mel_abl_AB = model.decoder.mel_proj_content(film_AB_abl)
-        aa_c_a = mel_abl_AA.flatten() - mel_abl_AA.flatten().mean()
-        ab_c_a = mel_abl_AB.flatten() - mel_abl_AB.flatten().mean()
-        cos_abl = torch.nn.functional.cosine_similarity(aa_c_a, ab_c_a, dim=0).item()
-        delta = cos_abl - cos_norm
-        print(f"  Normal    mel_proj_content cent_cos: {cos_norm:.4f}")
-        print(f"  Ablated   mel_proj_content cent_cos: {cos_abl:.4f}")
-        print(f"  Delta (ablated - normal):             {delta:+.4f}")
-        print(f"  [VERDICT] ", end="")
-        if abs(delta) < 0.02:
-            print("Channels 80-95 contribute NEGLIGIBLE speaker info at content path.")
-        elif delta > 0.05:
-            print("Channels 80-95 carry noise — ablation IMPROVES separation.")
-        elif delta < -0.02:
-            print("Channels 80-95 carry speaker info — ablation WORSENS separation.")
-        else:
-            print(f"Channels 80-95 have MARGINAL contribution to content path (|Δ|={abs(delta):.3f}).")
-
-        # ── Split mel_proj: content path reads all 96 channels ──
-        content_mel_AA = model.decoder.mel_proj_content(film_AA)
-        content_mel_AB = model.decoder.mel_proj_content(film_AB)
-
-        # Speaker delta from broadcast tokens
-        T = film_AA.size(-1)
-        spk_pooled_A = spk_A_t.mean(dim=1)  # [1, 96]
-        spk_pooled_B = spk_B_t.mean(dim=1)
-        spk_broad_A = spk_pooled_A.unsqueeze(-1).expand(-1, -1, T)  # [1, 96, T]
-        spk_broad_B = spk_pooled_B.unsqueeze(-1).expand(-1, -1, T)
-        mel_speaker_AA = model.decoder.mel_proj_speaker(spk_broad_A)  # [1, 80, T]
-        mel_speaker_AB = model.decoder.mel_proj_speaker(spk_broad_B)
-        # Energy gate (content-gated)
-        energy_AA = content_mel_AA.abs().mean(dim=1, keepdim=True)
-        energy_AB = content_mel_AB.abs().mean(dim=1, keepdim=True)
-        gate_AA = energy_AA / (energy_AA.mean(dim=-1, keepdim=True) + 1e-6)
-        gate_AB = energy_AB / (energy_AB.mean(dim=-1, keepdim=True) + 1e-6)
-        mel_speaker_AA = mel_speaker_AA * gate_AA
-        mel_speaker_AB = mel_speaker_AB * gate_AB
-
-        # ── mel_scaled: after unconditioned out_scale ──
-        out_scale = torch.nn.functional.softplus(model.decoder.raw_out_scale) + 1.5  # [1, 80, 1]
-        out_scale_AA = out_scale
-        out_scale_AB = out_scale
-
-        mel_band_mean_AA = content_mel_AA.mean(dim=-1, keepdim=True)
-        mel_band_mean_AB = content_mel_AB.mean(dim=-1, keepdim=True)
-        mel_centered_AA = content_mel_AA - mel_band_mean_AA
-        mel_centered_AB = content_mel_AB - mel_band_mean_AB
-        mel_scaled_AA = mel_centered_AA * out_scale_AA + mel_band_mean_AA + model.decoder.out_bias
-        mel_scaled_AB = mel_centered_AB * out_scale_AB + mel_band_mean_AB + model.decoder.out_bias
-
-        # ── Combine: variance_mel.detach() + mel_speaker ──
-        spk_film_AA = mel_scaled_AA.detach() + mel_speaker_AA
-        spk_film_AB = mel_scaled_AB.detach() + mel_speaker_AB
-
-        # ── mel_spk_affine: speaker-conditioned bias AFTER combine ──
-        mel_affine_AA = model.decoder.mel_speaker_affine(spk_film_AA, spk_A_t)
-        mel_affine_AB = model.decoder.mel_speaker_affine(spk_film_AB, spk_B_t)
-
-        # ── mel_scaled_final: after clamp (final model output) ──
-        mel_final_AA = torch.clamp(mel_affine_AA, min=-11.5, max=2.0)
-        mel_final_AB = torch.clamp(mel_affine_AB, min=-11.5, max=2.0)
-
-        stages = [
-            ("cross_attn", fused_AA, fused_AB),
-            ("resampler", resampled_AA, resampled_AB),
-            ("adapter", adapter_AA, adapter_AB),
-            ("adapter_film", adapter_film_AA, adapter_film_AB),
-            ("block0", block0_AA, block0_AB),
-            ("block2", block2_AA, block2_AB),
-            ("b3_identity", b3_id_AA, b3_id_AB),
-            ("b3_id_film", b3_id_film_AA, b3_id_film_AB),
-            ("b3_body", b3_body_AA, b3_body_AB),
-            ("block3_sum", block3_AA, block3_AB),
-            ("spk_film", film_AA, film_AB),
-            ("mel_content", content_mel_AA, content_mel_AB),       # mel_proj_content(96→80), reads all 96 ch
-            ("mel_speaker", mel_speaker_AA, mel_speaker_AB),       # mel_proj_speaker (CE path, energy-gated)
-            ("mel_scaled", mel_scaled_AA, mel_scaled_AB),           # after out_scale
-            ("mel_spk_affine", mel_affine_AA, mel_affine_AB),      # after speaker bias
-            ("mel_scaled_final", mel_final_AA, mel_final_AB),      # after clamp
-        ]
-        print(f"  {'Stage':<17} {'L1 diff':>9} {'cos sim':>9} {'cent cos':>9} {'σ(A)':>8} {'σ(B)':>8} {'σ ratio':>8}")
-        for name, aa, ab in stages:
-            l1 = (aa - ab).abs().mean().item()
-            cos = torch.nn.functional.cosine_similarity(aa.flatten(), ab.flatten(), dim=0).item()
-            # Centered cosine: subtract per-tensor mean before cosine, removing DC/bias contamination
-            aa_c = aa.flatten() - aa.flatten().mean()
-            ab_c = ab.flatten() - ab.flatten().mean()
-            cos_cent = torch.nn.functional.cosine_similarity(aa_c, ab_c, dim=0).item()
-            sa, sb = aa.std().item(), ab.std().item()
-            ratio = sb / (sa + 1e-8)
-            print(f"  {name:<17} {l1:>9.4f} {cos:>9.4f} {cos_cent:>9.4f} {sa:>8.4f} {sb:>8.4f} {ratio:>8.3f}")
-    print("="*70)
-    # ═══════════════════════════════════════════════════════════════════
-
-    # ── Re-enable verbose for forced-gamma diagnostic ────────────────
-    model._verbose = True
-    model.cross_attn._verbose = True
-    model.decoder._verbose = True
-    model.decoder.speaker_film._verbose = True
-    model.decoder.block3_id_film._verbose = True
-    model.decoder.adapter_speaker_film._verbose = True
-    model.decoder.mel_speaker_affine._verbose = True
-    for blk in model.decoder.blocks:
-        blk._verbose = True
-    # ─────────────────────────────────────────────────────────────────
-
-    # \u2500\u2500 FORCED-GAMMA DIAGNOSTIC \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    # Bypasses the mapping network. Injects constant gamma to answer:
-    # "Can decoder blocks compute given strong FiLM, or are they dead?"
-    #
-    # Read [Block] After block: std= lines in the decoder prints above.
-    #   Block 3 body std > 0.25  \u2192  blocks ALIVE, mapping net is timid.
-    #                                Fix: raise raw_film_scale to 0.5.
-    #   Block 3 body std < 0.20  \u2192  block weights structurally dead.
-    #                                Fix: reduce residual suppression 0.6\u21920.35.
-    print("\n" + "="*70)
-    print("\U0001f52c FORCED-GAMMA DIAGNOSTIC (mapping network bypassed)")
-    print("="*70)
-    print("  Runs A\u2192A with constant gamma injected. Beta=0. Pure residual-scale test.")
-    print("  Watch [Block] After block: std= in decoder prints above each result.\n")
-    with torch.no_grad():
-        for forced_val in [0.5, 1.0]:
-            print(f"  --- gamma={forced_val}  (residual scaled by {1+forced_val:.1f}x) ---")
-            model.cross_attn.force_gamma = forced_val
-            pred_forced, _, _ = model(ref_A.unsqueeze(0), [content_A])
-            print(f"  Forced mel: mean={pred_forced.mean():.4f},  \u03c3={pred_forced.std():.4f}")
-            print()
-    model.cross_attn.force_gamma = None   # always reset
-    print("  [force_gamma reset \u2192 None, normal mode restored]")
-    print("="*70)
-    # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-    # ═══════════════════════════════════════════════════════════════════
-    # DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)
-    # ═══════════════════════════════════════════════════════════════════
-    print("\n" + "="*70)
-    print("🔬 DIAGNOSTIC 3: mel_spk_affine gradient decomposition (L1 loss)")
-    print("="*70)
-
-    # Suppress verbose prints during gradient pass
-    saved_verbose = {}
-    for name in ['_verbose', 'cross_attn', 'decoder', 'speaker_film',
-                 'block3_id_film', 'adapter_speaker_film', 'mel_speaker_affine']:
-        if name == '_verbose':
-            saved_verbose[name] = model._verbose
-            model._verbose = False
-        elif name == 'cross_attn':
-            saved_verbose[name] = model.cross_attn._verbose
-            model.cross_attn._verbose = False
-        elif name == 'decoder':
-            saved_verbose[name] = model.decoder._verbose
-            model.decoder._verbose = False
-            for blk in model.decoder.blocks:
-                blk._verbose = False
-        elif name == 'speaker_film':
-            saved_verbose[name] = model.decoder.speaker_film._verbose
-            model.decoder.speaker_film._verbose = False
-        elif name == 'block3_id_film':
-            saved_verbose[name] = model.decoder.block3_id_film._verbose
-            model.decoder.block3_id_film._verbose = False
-        elif name == 'adapter_speaker_film':
-            saved_verbose[name] = model.decoder.adapter_speaker_film._verbose
-            model.decoder.adapter_speaker_film._verbose = False
-        elif name == 'mel_speaker_affine':
-            saved_verbose[name] = model.decoder.mel_speaker_affine._verbose
-            model.decoder.mel_speaker_affine._verbose = False
-
-    aff = model.decoder.mel_speaker_affine
-
-    # Freeze all model parameters, enable grad only on mel_spk_affine
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in aff.parameters():
-        p.requires_grad = True
-
-    # Forward: A→A self-reconstruction with grad tracking
-    pred_AA_grad, _, _ = model(ref_A.unsqueeze(0), [content_A])
-    gt_mel_grad = extract_mel_spectrogram(content_A, sample_rate=audio_cfg.sample_rate).unsqueeze(0).to(device)
-
-    # Trim to min length
-    min_len = min(pred_AA_grad.shape[-1], gt_mel_grad.shape[-1])
-    pred_AA_grad = pred_AA_grad[:, :, :min_len]
-    gt_mel_grad = gt_mel_grad[:, :, :min_len]
-
-    # L1 loss + backward
-    l1_loss = torch.nn.functional.l1_loss(pred_AA_grad, gt_mel_grad)
-    l1_loss.backward()
-
-    # Log gradient norms
-    mlp0 = aff.mlp[0]   # Linear(96, 96)
-    mlp2 = aff.mlp[2]   # Linear(96, 80)
-    print(f"  L1 loss value: {l1_loss.item():.6f}")
-    print(f"  --- Gradient norms (L2) ---")
-    if mlp0.weight.grad is not None:
-        print(f"  mlp[0].weight (96→96):       {mlp0.weight.grad.norm():.6f}")
-    else:
-        print(f"  mlp[0].weight (96→96):       NO GRADIENT")
-    if mlp2.weight.grad is not None:
-        print(f"  mlp[2].weight (96→80):       {mlp2.weight.grad.norm():.6f}")
-    else:
-        print(f"  mlp[2].weight (96→80):       NO GRADIENT")
-    if mlp2.bias.grad is not None:
-        print(f"  mlp[2].bias (80):            {mlp2.bias.grad.norm():.6f}")
     
-    if hasattr(aff, 'raw_delta_scale') and aff.raw_delta_scale.grad is not None:
-        ds_grad_val = aff.raw_delta_scale.grad.item()
-        print(f"  raw_delta_scale grad:        {ds_grad_val:+.6f}")
-        print(f"  [VERDICT] ", end="")
-        if ds_grad_val < -0.0001:
-            print("L1 PUSHES delta_scale DOWN. L1 actively suppresses speaker envelope shifts.")
-        elif ds_grad_val > 0.0001:
-            print("L1 pushes delta_scale UP. L1 actually wants more spectral shift.")
-        else:
-            print("L1 gradient on delta_scale is NEAR ZERO.")
+    try:
+        state_dict = ckpt.get("model_state", ckpt)
+        model.load_state_dict(state_dict, strict=False)
+        print("✅ Model loaded successfully (Strict Mode Disabled).")
+    except RuntimeError as e:
+        print(f"\n❌ [ERROR] Loading failed!")
+        print(e)
+        print("\nPlease run a fresh training session from scratch.")
+        return
+
+    # ── Manifest Setup ────────────────────────────
+    print("\n[3] Preparing Data...")
+    if smoke_test:
+        print("💨 SMOKE TEST MODE: Running 2 fixed utterances.")
+        manifest = [
+            "/content/LibriTTS/dev-clean/2428/83705/2428_83705_000000_000001.wav",
+            "/content/LibriTTS/dev-clean/1988/148538/1988_148538_000002_000000.wav"
+        ]
     else:
-        print(f"  raw_delta_scale grad:        NO GRADIENT (or missing)")
-        print(f"  [VERDICT] Cannot determine.")
+        manifest = build_or_load_manifest("/content/LibriTTS", num_utterances=50, seed=42)
+        
+    # Validation
+    valid_manifest = [p for p in manifest if os.path.exists(p)]
+    if not valid_manifest:
+        print("❌ No valid audio files found in manifest. Check your dataset paths.")
+        return
+        
+    # We will create pairs: utterance[i] as content, utterance[(i+1)%N] as speaker reference
+    results = []
+    
+    print(f"\n[4] Running Evaluation on {len(valid_manifest)} Pairs...")
+    
+    avg_l1_self = 0.0
+    avg_spk_sim_cross = 0.0
+    avg_spk_sim_ceiling = 0.0
+    evaluated_pairs = 0
+    
+    with torch.no_grad():
+        for i in tqdm(range(len(valid_manifest)), desc="Evaluating Pairs"):
+            content_path = valid_manifest[i]
+            spk_path = valid_manifest[(i+1) % len(valid_manifest)]
+            
+            # Load
+            content_audio = load_audio(content_path, sample_rate=audio_cfg.sample_rate).to(device)
+            spk_audio = load_audio(spk_path, sample_rate=audio_cfg.sample_rate).to(device)
+            
+            # Use FULL utterances for evaluation instead of chopping them into tiny fragments
+            content_seg = content_audio
+            spk_ref = spk_audio
+            content_ref = content_audio
+            
+            gt_mel_content = extract_mel_spectrogram(content_seg, sample_rate=audio_cfg.sample_rate).to(device)
+            
+            # -- Self Reconstruction (Content A, Voice A) --
+            pred_mel_self, _, _ = model(content_ref.unsqueeze(0), [content_seg])
+            pred_mel_self = pred_mel_self.squeeze(0)
+            
+            min_len = min(pred_mel_self.size(-1), gt_mel_content.size(-1))
+            l1_self = torch.nn.functional.l1_loss(
+                pred_mel_self[:, :min_len], 
+                gt_mel_content[:, :min_len]
+            ).item()
+            avg_l1_self += l1_self
+            
+            # -- Cross Conversion (Content A, Voice B) --
+            pred_mel_cross, _, _ = model(spk_ref.unsqueeze(0), [content_seg])
+            
+            # -- Vocoder & SPK_SIM --
+            if spk_encoder is not None:
+                # Target Speaker Ceiling (GT Mel of speaker reference -> Vocoded)
+                gt_mel_spk = extract_mel_spectrogram(spk_ref, sample_rate=audio_cfg.sample_rate)
+                wav_ceiling = vocoder(gt_mel_spk.unsqueeze(0).to(device)).squeeze(0).cpu()
+                
+                # Cross-conversion output
+                wav_cross = vocoder(pred_mel_cross).squeeze(0).cpu()
+                
+                # Raw target reference (Ground Truth)
+                wav_target_raw = spk_ref.cpu().unsqueeze(0)
+                
+                # Ceiling SPK SIM (Vocoded vs Raw)
+                sim_ceil = calculate_spk_sim(spk_encoder, wav_ceiling, wav_target_raw, device)
+                avg_spk_sim_ceiling += sim_ceil
+                
+                # Model SPK SIM (Cross vs Raw)
+                sim_cross = calculate_spk_sim(spk_encoder, wav_cross, wav_target_raw, device)
+                avg_spk_sim_cross += sim_cross
+                
+            # Save first 5 pairs for manual listening
+            if i < 5:
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_source_content.wav"), content_seg.cpu().unsqueeze(0), audio_cfg.sample_rate)
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_target_voice.wav"), spk_ref.cpu().unsqueeze(0), audio_cfg.sample_rate)
+                
+                wav_self = vocoder(pred_mel_self).squeeze(0).cpu()
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_self.wav"), wav_self, audio_cfg.sample_rate)
+                
+                wav_cross = vocoder(pred_mel_cross).squeeze(0).cpu()
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_cross.wav"), wav_cross, audio_cfg.sample_rate)
 
-    # Cleanup
-    model.zero_grad()
-    for p in aff.parameters():
-        p.requires_grad = False
-    # Restore model to eval-appropriate state (params stay frozen)
-    del pred_AA_grad, gt_mel_grad, l1_loss
-    print("="*70)
+                
+            evaluated_pairs += 1
 
+    # ── Summary Report ─────────────────────────────
+    if evaluated_pairs == 0:
+        print("\n❌ No pairs were long enough to evaluate. Please check your dataset.")
+        return
+        
+    avg_l1_self /= evaluated_pairs
+    avg_spk_sim_cross /= evaluated_pairs
+    avg_spk_sim_ceiling /= evaluated_pairs
+    
     print("\n" + "="*60)
-    print("\U0001f4cb LISTENING GUIDE:")
+    print("📊 EVALUATION SCOREBOARD")
     print("="*60)
-    print("  01_raw_content_A.wav   \u2192 Ground truth Man (what was said)")
-    print("  02_raw_content_B.wav   \u2192 Ground truth Woman (what was said)")
-    print("  05_self_recon_A.wav    \u2192 Model: Man content + Man voice")
-    print("  06_self_recon_B.wav    \u2192 Model: Woman content + Woman voice")
-    print("  07_cross_AtoB.wav      \u2192 Model: Man's WORDS in Woman's VOICE \u2190 Key Test!")
-    print("  08_cross_BtoA.wav      \u2192 Model: Woman's WORDS in Man's VOICE \u2190 Key Test!")
+    print(f"  Pairs Evaluated:       {evaluated_pairs} (out of {len(valid_manifest)})")
+    print(f"  Self-Recon Mel L1:     {avg_l1_self:.4f} (Lower is better)")
+    if spk_encoder is not None:
+        print(f"  Cross SPK_SIM:         {avg_spk_sim_cross:.4f} (Target > 0.35)")
+        print(f"  Vocoder Ceiling SIM:   {avg_spk_sim_ceiling:.4f} (Upper bound for vocoded audio)")
+    else:
+        print("  SPK_SIM:               [Skipped - SpeechBrain missing]")
     print("="*60)
-
-
-    # ── Mel variance summary: compare pred vs matching GT, not fixed 2.5 ─
-    print("\n[MEL VARIANCE SUMMARY]  (pred vs matching GT)")
-    gt_A_std  = gt_mel_A.std().item()
-    gt_B_std  = gt_mel_B.std().item()
-    aa_std    = pred_mel_AA.std().item()
-    bb_std    = pred_mel_BB.std().item()
-    ab_std    = pred_mel_AB.std().item()
-    ba_std    = pred_mel_BA.std().item()
-    print(f"  GT A σ={gt_A_std:.4f}  |  GT B σ={gt_B_std:.4f}")
-    print(f"  A→A σ={aa_std:.4f}  |  B→B σ={bb_std:.4f}  |  A→B σ={ab_std:.4f}  |  B→A σ={ba_std:.4f}")
-    deficit_aa = ((gt_A_std - aa_std) / gt_A_std) * 100
-    deficit_bb = ((gt_B_std - bb_std) / gt_B_std) * 100
-    print(f"  Variance deficit (A→A vs GT A={gt_A_std:.4f}): {deficit_aa:.1f}%  {'✅ OK' if deficit_aa < 15 else '❌ Compressed'}")
-    print(f"  Variance deficit (B→B vs GT B={gt_B_std:.4f}): {deficit_bb:.1f}%  {'✅ OK' if deficit_bb < 15 else '❌ Compressed'}")
-    # ──────────────────────────────────────────────────────────────────
-
+    print(f"Sample audio saved to {output_dir}/")
+    print("Listen to pair_0_pred_self.wav to verify basic intelligibility.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/last.ckpt", help="Path to your trained checkpoint")
-    parser.add_argument("--output_dir", type=str, default="generalization_test", help="Folder to save the output audio files")
+    parser = argparse.ArgumentParser(description="Evaluate CasiVC Generalization")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/last.ckpt", help="Path to checkpoint")
+    parser.add_argument("--output_dir", type=str, default="generalization_outputs", help="Output directory for audio")
+    parser.add_argument("--smoke", action="store_true", help="Run quick 2-utterance smoke test instead of full 50-pair manifest")
     args = parser.parse_args()
-    test_generalization(args.checkpoint, args.output_dir)
+    
+    run_evaluation(args.checkpoint, args.output_dir, args.smoke)

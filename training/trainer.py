@@ -275,8 +275,13 @@ class Trainer:
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"], strict=False)
-        
+        try:
+            self.model.load_state_dict(ckpt["model_state"], strict=False)
+        except RuntimeError as e:
+            print(f"\n[WARNING] Strict loading failed. This means your model architecture "
+                  f"has changed since this checkpoint was saved.\n{e}\n"
+                  f"Please start a fresh training run.\n")
+            raise e
         try:
             self.optimizer.load_state_dict(ckpt["optim_state"])
             self.scheduler.load_state_dict(ckpt["sched_state"])
@@ -962,7 +967,8 @@ class Trainer:
                     
                     # 2. HuBERT Content Features 
                     hubert_out = self.model.hubert(content_audio_gpu)
-                    content_feats = self.model.hubert_proj(hubert_out)[0] # [T, 96]
+                    # Cache raw 768D features so hubert_proj receives gradients during training
+                    content_feats = hubert_out[0] # [T, 768]
                     
                     # 3. GT Mel 
                     gt_mel = extract_mel_spectrogram(

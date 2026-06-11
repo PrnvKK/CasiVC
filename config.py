@@ -147,20 +147,20 @@ class TrainingConfig:
   lambda_spk: float = 1.0      # Weight for the new Speaker Identity loss.
   """
 
-  lambda_mel: float = 5.0      # was 45 — prevents memorizing exact mels, allows generalization
-  lambda_rec: float = 3.0      # more weight on spectral texture (helps with robotic sound)
-  lambda_spk: float = 3.0      # was 1.0 — generalizes well, reward it more
-  lambda_var: float = 30.0     # Raised from 4.0 to overcome L1 dominance and force the learnable scale to grow
-  lambda_entropy: float = 1.0   # Two-sided hinge [1.0, 1.5]; reverted from 3.0 — 1.72 was blended-speaker diagnostic, not training path
+  lambda_mel: float = 45.0     # Phase 1: Heavy L1 on final output
+  lambda_rec: float = 3.0      # STFT (if active)
+  lambda_spk: float = 1.0      # Re-enabled for Phase 2
+  lambda_var: float = 0.0      # Disabled for Phase 1
+  lambda_entropy: float = 0.0  # Disabled for Phase 1
 
-  # Cross-pair training (Mel Spectral Stats only — no L1 on cross pairs)
-  cross_pair_prob: float = 1.0           # probability of applying cross-pair in a batch (increased for decisive diagnostic)
-  cross_pair_stats_weight: float = 6.0   # raised from 2.0: equal footing with self-pair L1 (λ_mel=5.0). Forces model to match target speaker spectral shape as strongly as it reconstructs content.
+  # Cross-pair training
+  cross_pair_prob: float = 0.0           # Disabled for Phase 1
+  cross_pair_stats_weight: float = 0.0   # Disabled for Phase 1
 
   # Speaker classifier head at decoder bottleneck
-  classifier_weight: float = 1.0         # Fix #21: raised from 0.3 — block2+block3 CE + spk_film CE
-  mel_classifier_weight: float = 0.0   # disabled: per-frame mel Conv1d CE caused upstream regression
-  pooled_mel_ce_weight: float = 2.0    # Fix #21: pooled CE on mel_speaker_affine bias-only, trains affine MLP
+  classifier_weight: float = 0.0         # Disabled for Phase 1
+  mel_classifier_weight: float = 0.0   # Disabled for Phase 1
+  pooled_mel_ce_weight: float = 0.0    # Disabled for Phase 1
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
@@ -168,7 +168,7 @@ class TrainingConfig:
   lambda_feat: float = 0.0
 
   # Training (HiFi-GAN proven hyperparameters)
-  learning_rate: float = 1e-4
+  learning_rate: float = 5e-4  # Bumped from 1e-4 for faster baseline convergence
   adam_beta1: float = 0.8
   adam_beta2: float = 0.99
   lr_decay_factor: float = 0.999
