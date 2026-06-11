@@ -706,7 +706,7 @@ def _pad_2d(tensors: List[torch.Tensor]) -> torch.Tensor:
     c = tensors[0].size(0)
     max_t = max(t.size(1) for t in tensors)
     
-    LOG_MEL_SILENCE = 0
+    LOG_MEL_SILENCE = -11.5  # Fixed: Log-mel silence is ~-11.5 (log(1e-5)), not 0.
     
     out = []
     for t in tensors:

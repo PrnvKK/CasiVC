@@ -317,6 +317,7 @@ class HubertVCModel(nn.Module):
         # 2. HuBERT content features                                #
         # --------------------------------------------------------- #
         if precomputed_content_feats is not None:
+            # Features are 768D raw HuBERT outputs
             content_feats = precomputed_content_feats
         else:
             if content_audio is None:
@@ -329,7 +330,8 @@ class HubertVCModel(nn.Module):
             with torch.no_grad():
                 content_feats = self.hubert(content_audio)    # [B, T, 768] (assuming padded)
 
-            content_feats = self.hubert_proj(content_feats)  # [B, T, 768] → [B, T, 96]
+        # ALWAYS project features so hubert_proj receives gradients!
+        content_feats = self.hubert_proj(content_feats)  # [B, T, 768] → [B, T, 96]
             
         # ========================================================= #
         # CONTINUOUS INFORMATION BOTTLENECK                         #
@@ -337,7 +339,8 @@ class HubertVCModel(nn.Module):
         # Force the features through a 12-dimensional chokepoint. 
         # This violently strips out the background identity while maintaining
         # gradient flow and avoiding discrete codebook collapse.
-        content_feats = self.info_bottleneck(content_feats)
+        # ABLATION PHASE 1: Disable 32D information bottleneck to see if it causes content loss
+        # content_feats = self.info_bottleneck(content_feats)
         
         # REMOVED F.instance_norm (Fixes Whispering)
         # Normalizing over the temporal dimension completely destroyed the F0/pitch 
@@ -353,6 +356,7 @@ class HubertVCModel(nn.Module):
         
         # Process entire batch at once - each item uses its OWN speaker conditioning
         # content_feats: [B, T, 96], speaker_feats: [B, 64, 96]
+        # PHASE 2 Step 1: Re-enable Cross-Attention
         fused_features = self.cross_attn(
             content_feats,  # [B, T, 96]
             speaker_feats   # [B, 64, 96]
