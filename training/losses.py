@@ -411,16 +411,33 @@ class VCGeneratorLoss(nn.Module):
 
         # --- Compute and weight each loss term ---
 
-        # Mel reconstruction loss (Raw L1) — ENFORCED ON FINAL pred_mel
+        # Mel reconstruction loss — THREE-PATH GRADIENT SEPARATION
+        # Path 1: L1 on content_mel (prebias_mel, raw) → trains mel_proj_content + upstream
+        # Path 3: L1 on pred_mel (final output) → trains mel_proj_speaker via mel_speaker
+        # Both use lambda_mel weight. Each path gets half the effective weight
+        # to maintain the same total gradient magnitude as single-path L1.
         if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
             try:
-                mel_for_l1 = pred_mel  # Phase 1: STRICT training contract on final output
-                T_common = min(mel_for_l1.size(-1), gt_mel.size(-1))
-                p_align = mel_for_l1[:, :, :T_common]
+                T_common = min(pred_mel.size(-1), gt_mel.size(-1))
                 g_align = gt_mel[:, :, :T_common]
                 
-                l_mel = self.mel_loss(p_align, g_align, lengths=gt_lengths)
-                outs["mel"] = self.cfg.lambda_mel * l_mel
+                # Path 3: L1 on final output (trains mel_proj_speaker via mel_speaker,
+                # since variance_mel is detached in the decoder forward pass)
+                l_mel_final = self.mel_loss(pred_mel[:, :, :T_common], g_align, lengths=gt_lengths)
+                outs["mel_final"] = (self.cfg.lambda_mel * 0.5) * l_mel_final
+                
+                # Path 1: L1 on content_mel / prebias_mel (trains mel_proj_content + upstream)
+                if content_mel is not None:
+                    T_common_c = min(content_mel.size(-1), gt_mel.size(-1))
+                    l_mel_content = self.mel_loss(
+                        content_mel[:, :, :T_common_c],
+                        gt_mel[:, :, :T_common_c],
+                        lengths=gt_lengths
+                    )
+                    outs["mel_content"] = (self.cfg.lambda_mel * 0.5) * l_mel_content
+                else:
+                    # Fallback: if content_mel not provided, use full weight on final only
+                    outs["mel_final"] = self.cfg.lambda_mel * l_mel_final
             except Exception as exc:
                 raise RuntimeError(f"Mel loss failed: {exc}") from exc
 

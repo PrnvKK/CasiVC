@@ -167,77 +167,123 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
         return
         
     # We will create pairs: utterance[i] as content, utterance[(i+1)%N] as speaker reference
+    # shuffled ref uses offset 2 so content/target/shuffled are three different files
+    N = len(valid_manifest)
+    shuffled_offset = 2 if N >= 3 else 1
+    
     results = []
     
-    print(f"\n[4] Running Evaluation on {len(valid_manifest)} Pairs...")
+    print(f"\n[4] Running Evaluation on {N} Pairs...")
     
     avg_l1_self = 0.0
+    avg_spk_sim_self = 0.0
     avg_spk_sim_cross = 0.0
     avg_spk_sim_ceiling = 0.0
+    avg_spk_sim_shuf_to_shuf = 0.0
+    avg_spk_sim_shuf_to_target = 0.0
+    avg_mel_speaker_mag = 0.0
     evaluated_pairs = 0
     
     with torch.no_grad():
-        for i in tqdm(range(len(valid_manifest)), desc="Evaluating Pairs"):
+        for i in tqdm(range(N), desc="Evaluating Pairs"):
             content_path = valid_manifest[i]
-            spk_path = valid_manifest[(i+1) % len(valid_manifest)]
+            spk_path = valid_manifest[(i+1) % N]
+            shuffled_path = valid_manifest[(i + shuffled_offset) % N]
             
             # Load
             content_audio = load_audio(content_path, sample_rate=audio_cfg.sample_rate).to(device)
             spk_audio = load_audio(spk_path, sample_rate=audio_cfg.sample_rate).to(device)
+            shuffled_audio = load_audio(shuffled_path, sample_rate=audio_cfg.sample_rate).to(device)
             
-            # Use FULL utterances for evaluation instead of chopping them into tiny fragments
+            # Use FULL utterances for evaluation
             content_seg = content_audio
             spk_ref = spk_audio
             content_ref = content_audio
+            shuffled_ref = shuffled_audio
             
             gt_mel_content = extract_mel_spectrogram(content_seg, sample_rate=audio_cfg.sample_rate).to(device)
             
-            # -- Self Reconstruction (Content A, Voice A) --
+            # ── 1. Self Reconstruction (Content A, Voice A) ──
             pred_mel_self, _, _ = model(content_ref.unsqueeze(0), [content_seg])
-            pred_mel_self = pred_mel_self.squeeze(0)
+            pred_mel_self_sq = pred_mel_self.squeeze(0)  # [80, T] for L1
             
-            min_len = min(pred_mel_self.size(-1), gt_mel_content.size(-1))
+            min_len = min(pred_mel_self_sq.size(-1), gt_mel_content.size(-1))
             l1_self = torch.nn.functional.l1_loss(
-                pred_mel_self[:, :min_len], 
+                pred_mel_self_sq[:, :min_len], 
                 gt_mel_content[:, :min_len]
             ).item()
             avg_l1_self += l1_self
             
-            # -- Cross Conversion (Content A, Voice B) --
-            pred_mel_cross, _, _ = model(spk_ref.unsqueeze(0), [content_seg])
+            # ── 2. Cross Conversion (Content A, Voice B) ──
+            pred_mel_cross, _, aux_cross = model(
+                spk_ref.unsqueeze(0), [content_seg],
+                return_bottleneck=True, return_aux=True
+            )
             
-            # -- Vocoder & SPK_SIM --
+            # mel_speaker magnitude (measure whether speaker delta branch is active)
+            if aux_cross is not None and "mel_speaker" in aux_cross:
+                mel_spk = aux_cross["mel_speaker"]
+                avg_mel_speaker_mag += mel_spk.abs().mean().item()
+            
+            # ── 3. Shuffled Reference (Content A, Voice C) ──
+            pred_mel_shuffled, _, _ = model(
+                shuffled_ref.unsqueeze(0), [content_seg],
+                return_bottleneck=True, return_aux=True
+            )
+            
+            # ── Vocoder & SPK_SIM ──
             if spk_encoder is not None:
                 # Target Speaker Ceiling (GT Mel of speaker reference -> Vocoded)
                 gt_mel_spk = extract_mel_spectrogram(spk_ref, sample_rate=audio_cfg.sample_rate)
                 wav_ceiling = vocoder(gt_mel_spk.unsqueeze(0).to(device)).squeeze(0).cpu()
                 
-                # Cross-conversion output
-                wav_cross = vocoder(pred_mel_cross).squeeze(0).cpu()
+                # Self-recon vocoded
+                wav_self = vocoder(pred_mel_self).squeeze(0).cpu()
+                wav_content_raw = content_audio.cpu().unsqueeze(0)
                 
-                # Raw target reference (Ground Truth)
+                # Cross-conversion vocoded
+                wav_cross = vocoder(pred_mel_cross).squeeze(0).cpu()
                 wav_target_raw = spk_ref.cpu().unsqueeze(0)
                 
-                # Ceiling SPK SIM (Vocoded vs Raw)
+                # Shuffled-conversion vocoded
+                wav_shuffled = vocoder(pred_mel_shuffled).squeeze(0).cpu()
+                wav_shuffled_raw = shuffled_audio.cpu().unsqueeze(0)
+                
+                # Ceiling SPK SIM (Vocoded GT vs Raw)
                 sim_ceil = calculate_spk_sim(spk_encoder, wav_ceiling, wav_target_raw, device)
                 avg_spk_sim_ceiling += sim_ceil
                 
-                # Model SPK SIM (Cross vs Raw)
+                # Self SPK SIM (Self-recon vs Content Raw)
+                sim_self = calculate_spk_sim(spk_encoder, wav_self, wav_content_raw, device)
+                avg_spk_sim_self += sim_self
+                
+                # Model SPK SIM (Cross vs Target Raw)
                 sim_cross = calculate_spk_sim(spk_encoder, wav_cross, wav_target_raw, device)
                 avg_spk_sim_cross += sim_cross
+                
+                # SPK SIM (Shuffled vs Shuffled Raw) — does the model track the shuffled ref?
+                sim_shuf_to_shuf = calculate_spk_sim(spk_encoder, wav_shuffled, wav_shuffled_raw, device)
+                avg_spk_sim_shuf_to_shuf += sim_shuf_to_shuf
+                
+                # SPK SIM (Shuffled vs Original Target Raw) — should be low (no tonic)
+                sim_shuf_to_target = calculate_spk_sim(spk_encoder, wav_shuffled, wav_target_raw, device)
+                avg_spk_sim_shuf_to_target += sim_shuf_to_target
                 
             # Save first 5 pairs for manual listening
             if i < 5:
                 torchaudio.save(os.path.join(output_dir, f"pair_{i}_source_content.wav"), content_seg.cpu().unsqueeze(0), audio_cfg.sample_rate)
                 torchaudio.save(os.path.join(output_dir, f"pair_{i}_target_voice.wav"), spk_ref.cpu().unsqueeze(0), audio_cfg.sample_rate)
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_shuffled_voice.wav"), shuffled_ref.cpu().unsqueeze(0), audio_cfg.sample_rate)
                 
-                wav_self = vocoder(pred_mel_self).squeeze(0).cpu()
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_self.wav"), wav_self, audio_cfg.sample_rate)
+                wav_self_save = vocoder(pred_mel_self).squeeze(0).cpu()
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_self.wav"), wav_self_save, audio_cfg.sample_rate)
                 
-                wav_cross = vocoder(pred_mel_cross).squeeze(0).cpu()
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_cross.wav"), wav_cross, audio_cfg.sample_rate)
+                wav_cross_save = vocoder(pred_mel_cross).squeeze(0).cpu()
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_cross.wav"), wav_cross_save, audio_cfg.sample_rate)
+                
+                wav_shuf_save = vocoder(pred_mel_shuffled).squeeze(0).cpu()
+                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_shuffled.wav"), wav_shuf_save, audio_cfg.sample_rate)
 
-                
             evaluated_pairs += 1
 
     # ── Summary Report ─────────────────────────────
@@ -246,19 +292,31 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
         return
         
     avg_l1_self /= evaluated_pairs
+    avg_spk_sim_self /= evaluated_pairs
     avg_spk_sim_cross /= evaluated_pairs
     avg_spk_sim_ceiling /= evaluated_pairs
+    avg_spk_sim_shuf_to_shuf /= evaluated_pairs
+    avg_spk_sim_shuf_to_target /= evaluated_pairs
+    avg_mel_speaker_mag /= evaluated_pairs
     
     print("\n" + "="*60)
     print("📊 EVALUATION SCOREBOARD")
     print("="*60)
-    print(f"  Pairs Evaluated:       {evaluated_pairs} (out of {len(valid_manifest)})")
-    print(f"  Self-Recon Mel L1:     {avg_l1_self:.4f} (Lower is better)")
+    print(f"  Pairs Evaluated:          {evaluated_pairs} (out of {len(valid_manifest)})")
+    print(f"  Self-Recon Mel L1:        {avg_l1_self:.4f} (Lower is better)")
     if spk_encoder is not None:
-        print(f"  Cross SPK_SIM:         {avg_spk_sim_cross:.4f} (Target > 0.35)")
-        print(f"  Vocoder Ceiling SIM:   {avg_spk_sim_ceiling:.4f} (Upper bound for vocoded audio)")
+        print(f"  Self SPK_SIM:             {avg_spk_sim_self:.4f} (Target > 0.70, upper ~0.92)")
+        print(f"  Cross SPK_SIM:            {avg_spk_sim_cross:.4f} (Target > 0.35)")
+        print(f"  Vocoder Ceiling SIM:      {avg_spk_sim_ceiling:.4f} (Upper bound for vocoded audio)")
+        print(f"  Shuffled→Shuffled SIM:    {avg_spk_sim_shuf_to_shuf:.4f}")
+        print(f"  Shuffled→Target SIM:      {avg_spk_sim_shuf_to_target:.4f}")
+        print(f"  Delta (shuf→shuf minus shuf→target):  {avg_spk_sim_shuf_to_shuf - avg_spk_sim_shuf_to_target:.4f} (should be > 0.05)")
+        if avg_mel_speaker_mag > 0:
+            print(f"  mel_speaker |mean|:      {avg_mel_speaker_mag:.4f} (should be > 0.01)")
+        else:
+            print(f"  mel_speaker |mean|:      [not available - spk_film_classifier not in model]")
     else:
-        print("  SPK_SIM:               [Skipped - SpeechBrain missing]")
+        print("  SPK_SIM:                  [Skipped - SpeechBrain missing]")
     print("="*60)
     print(f"Sample audio saved to {output_dir}/")
     print("Listen to pair_0_pred_self.wav to verify basic intelligibility.")

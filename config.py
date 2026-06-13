@@ -158,9 +158,10 @@ class TrainingConfig:
   cross_pair_stats_weight: float = 6.0   # Balance with L1 gradient magnitude
 
   # Speaker classifier head at decoder bottleneck
-  classifier_weight: float = 0.0         # Disabled for Phase 1
-  mel_classifier_weight: float = 0.0   # Disabled for Phase 1
-  pooled_mel_ce_weight: float = 0.0    # Disabled for Phase 1
+  classifier_weight: float = 0.0         # Bottleneck CE disabled (FiLM modules inactive)
+  mel_classifier_weight: float = 0.0   # Per-frame mel classifier disabled
+  pooled_mel_ce_weight: float = 2.0    # Pooled mel-bias CE on speaker delta
+  spk_film_ce_weight: float = 2.0      # Per-frame CE on mel_speaker delta (mel_proj_speaker)
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
