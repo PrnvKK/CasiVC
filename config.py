@@ -64,7 +64,7 @@ class DataConfig:
     # Random seed for reproducible speaker splits
     speaker_split_seed: int = 42
 
-    max_items: Optional[int] = 2500
+    max_items: Optional[int] = 4000
     
     def get_dataset_path(self) -> str:
         """Get the appropriate dataset path based on configuration."""
@@ -154,8 +154,8 @@ class TrainingConfig:
   lambda_entropy: float = 0.0  # Disabled for Phase 1
 
   # Cross-pair training
-  cross_pair_prob: float = 0.0           # Disabled for Phase 1
-  cross_pair_stats_weight: float = 0.0   # Disabled for Phase 1
+  cross_pair_prob: float = 0.5           # Phase 2 Step 2: cross-pair training
+  cross_pair_stats_weight: float = 6.0   # Balance with L1 gradient magnitude
 
   # Speaker classifier head at decoder bottleneck
   classifier_weight: float = 0.0         # Disabled for Phase 1
