@@ -360,7 +360,7 @@ class Trainer:
       # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0}
+        loss_accum = {"mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0, "spk_film_acc": 0.0, "spk_film_cnt": 0}
         num_batches = 0
 
         # Ensure exact reproducibility for this epoch's shuffling and data augmentation (like random crops)
@@ -401,7 +401,8 @@ class Trainer:
             classifier_weight = getattr(self.train_cfg, 'classifier_weight', 0.0)
             mel_classifier_weight = 0.0   # per-frame mel Conv1d CE remains disabled
             pooled_mel_ce_weight = getattr(self.train_cfg, 'pooled_mel_ce_weight', 0.0)
-            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None or self.model.spk_film_classifier is not None)
+            spk_film_ce_weight = getattr(self.train_cfg, 'spk_film_ce_weight', 0.0)
+            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0 or spk_film_ce_weight > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None or self.model.spk_film_classifier is not None)
             
             pred_mel, _, aux = self.model(
                 ref_audio=ref_audio,
@@ -494,21 +495,25 @@ class Trainer:
                         acc_b3 = (pred_b3 == target_expanded_b3).float().mean().item()
                         print(f"[B3_CLASSIFIER] ce={ce_b3.item():.4f}, self_accuracy={acc_b3:.4f}")
 
-            # --- Spk_film classifier CE (self-pair): supervises post-speaker_film features ---
-            # Provides direct speaker-discriminative gradient to speaker_film —
-            # the exact missing ingredient that left it near-identity.
-            if need_bottleneck and aux is not None and "spk_film_classifier_logits" in aux:
+            # --- Spk_film classifier CE (self-pair): supervises mel_proj_speaker output ---
+            # Provides speaker-discriminative gradient to mel_proj_speaker —
+            # the key ingredient that makes the residual branch speaker-specific
+            # rather than a generic reconstructor.
+            spk_film_ce_weight = getattr(self.train_cfg, 'spk_film_ce_weight', 0.0)
+            if spk_film_ce_weight > 0 and need_bottleneck and aux is not None and "spk_film_classifier_logits" in aux:
                 sf_logits = aux["spk_film_classifier_logits"]  # [B, N, T]
                 T_sf = sf_logits.size(-1)
                 target_expanded_sf = target_idx.unsqueeze(1).expand(-1, T_sf)
                 ce_sf = self.classifier_loss_fn(sf_logits, target_expanded_sf)
-                total = total + classifier_weight * ce_sf
+                total = total + spk_film_ce_weight * ce_sf
                 loss_accum["classifier"] += ce_sf.item()
-                if num_batches == 0:
-                    with torch.no_grad():
-                        _, pred_sf = sf_logits.max(dim=1)
-                        acc_sf = (pred_sf == target_expanded_sf).float().mean().item()
-                        print(f"[SPK_FILM_CLASSIFIER] ce={ce_sf.item():.4f}, self_accuracy={acc_sf:.4f}")
+                with torch.no_grad():
+                    _, pred_sf = sf_logits.max(dim=1)
+                    acc_sf = (pred_sf == target_expanded_sf).float().mean().item()
+                    loss_accum["spk_film_acc"] += acc_sf
+                    loss_accum["spk_film_cnt"] += 1
+                    if num_batches == 0:
+                        print(f"[SPK_FILM_CLASSIFIER] weight={spk_film_ce_weight}, ce={ce_sf.item():.4f}, self_accuracy={acc_sf:.4f}")
 
             # --- Mel-output classifier CE (self-pair): prevents mel_proj erasure ---
             if mel_classifier_weight > 0 and aux is not None and "mel_classifier_logits" in aux:
@@ -616,13 +621,19 @@ class Trainer:
                         loss_accum["classifier"] += ce_b3_cross.item()
 
                     # --- Spk_film classifier CE on cross-pair ---
-                    if need_bottleneck and aux_cross is not None and "spk_film_classifier_logits" in aux_cross:
+                    spk_film_ce_weight = getattr(self.train_cfg, 'spk_film_ce_weight', 0.0)
+                    if spk_film_ce_weight > 0 and need_bottleneck and aux_cross is not None and "spk_film_classifier_logits" in aux_cross:
                         sf_logits_cross = aux_cross["spk_film_classifier_logits"]  # [B, N, T]
                         T_sfc = sf_logits_cross.size(-1)
                         target_sf_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_sfc)
                         ce_sf_cross = self.classifier_loss_fn(sf_logits_cross, target_sf_rolled)
-                        total = total + classifier_weight * ce_sf_cross
+                        total = total + spk_film_ce_weight * ce_sf_cross
                         loss_accum["classifier"] += ce_sf_cross.item()
+                        with torch.no_grad():
+                            _, pred_sf_cross = sf_logits_cross.max(dim=1)
+                            acc_sf_cross = (pred_sf_cross == target_sf_rolled).float().mean().item()
+                            loss_accum["spk_film_acc"] += acc_sf_cross
+                            loss_accum["spk_film_cnt"] += 1
 
                     # --- Mel-output classifier CE on cross-pair ---
                     if mel_classifier_weight > 0 and aux_cross is not None and "mel_classifier_logits" in aux_cross:
@@ -842,7 +853,8 @@ class Trainer:
 
             postfix = {
                 "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
-                "mel": f"{losses.get('mel', torch.tensor(0.)).item():.3f}",
+                "mel_c": f"{losses.get('mel_content', torch.tensor(0.)).item():.3f}",
+                "mel_f": f"{losses.get('mel_final', torch.tensor(0.)).item():.3f}",
                 "stft": f"{losses.get('stft', torch.tensor(0.)).item():.3f}",
                 "spk": f"{losses.get('speaker', torch.tensor(0.)).item():.3f}",
                 "var": f"{losses.get('var', torch.tensor(0.)).item():.3f}",
@@ -873,7 +885,7 @@ class Trainer:
     def _validate(self) -> dict:
         self.model.eval()
         self.vocoder.eval()
-        loss_accum = {"mel": 0.0, "stft": 0.0, "speaker": 0.0, "var": 0.0, "total": 0.0}
+        loss_accum = {"mel": 0.0, "mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "var": 0.0, "total": 0.0}
         num_batches = 0
 
         for batch in tqdm(self.val_loader, desc="Valid", leave=False):
@@ -1000,11 +1012,13 @@ class Trainer:
             self.scheduler.step() 
             val_loss   = self._validate()
 
+            spk_film_acc = train_loss.get('spk_film_acc', 0.0) / max(1, train_loss.get('spk_film_cnt', 1))
+            pooled_ce_acc = train_loss.get('pooled_ce_acc', 0.0) / max(1, train_loss.get('pooled_ce_cnt', 1))
             print(
-                f"[epoch {epoch:03d}] train:   mel={train_loss['mel']:.3f} | stft={train_loss['stft']:.3f} | spk={train_loss['speaker']:.3f} | var={train_loss.get('var', 0.0):.3f} | cls={train_loss.get('classifier', 0.0):.3f} | ent_h={train_loss.get('entropy', 0.0):.3f} | gam_h={train_loss.get('gamma', 0.0):.3f} | total={train_loss['total']:.3f} | pooled_ce_acc={train_loss.get('pooled_ce_acc', 0.0)/max(1, train_loss.get('pooled_ce_cnt', 1)):.3f}"
+                f"[epoch {epoch:03d}] train:   mel_c={train_loss.get('mel_content', 0.0):.3f} mel_f={train_loss.get('mel_final', 0.0):.3f} spk={train_loss['speaker']:.3f} var={train_loss.get('var', 0.0):.3f} cls={train_loss.get('classifier', 0.0):.3f} sf_acc={spk_film_acc:.3f} pl_acc={pooled_ce_acc:.3f} total={train_loss['total']:.3f}"
             )
             print(
-                f"                 val:     mel={val_loss['mel']:.3f} | stft={val_loss['stft']:.3f} | spk={val_loss['speaker']:.3f} | var={val_loss.get('var', 0.0):.3f} | total={val_loss['total']:.3f}"
+                f"                 val:     mel_c={val_loss.get('mel_content', 0.0):.3f} mel_f={val_loss.get('mel_final', 0.0):.3f} spk={val_loss['speaker']:.3f} var={val_loss.get('var', 0.0):.3f} total={val_loss['total']:.3f}"
             )
 
 

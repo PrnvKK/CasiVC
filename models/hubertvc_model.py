@@ -381,7 +381,7 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         # Force FP32 for decoder to avoid NaN gradients
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            if return_bottleneck and (self.speaker_classifier is not None or self.pooled_mel_classifier is not None or self.spk_film_classifier is not None):
+            if return_bottleneck:
                 pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True, speaker_feats=speaker_feats)
             else:
                 pred_mel = self.decoder(resampled_features.float(), speaker_feats=speaker_feats)  # [B, 80, T_hubert]
@@ -479,13 +479,17 @@ class HubertVCModel(nn.Module):
                 mel_logits = self.mel_classifier(mel_feats)  # [B, num_speakers, T]
                 aux["mel_classifier_logits"] = mel_logits
 
-            # Pooled mel-bias classifier: gated CE on bias-only component
-            # intermediate: [-4]=prebias(raw), [-3]=variance(post-scale), [-2]=mel_speaker, [-1]=postbias(post-affine)
+            # Pooled mel-bias classifier: CE on speaker delta component
+            # intermediate: [-4]=prebias(raw), [-3]=variance(post-scale,detach), [-2]=mel_speaker, [-1]=postbias
+            # Three-path gradient isolation: only mel_speaker should carry CE gradient.
+            # bias_only = postbias - prebias = (variance.detach() + mel_speaker + out_bias) - content_mel
+            # bias_only contains non-detached mel_speaker (desired) and non-detached -content_mel (leakage).
+            # Detach prebias_mel AND the -prebias_mel within bias_only to isolate mel_speaker.
             if self.pooled_mel_classifier is not None and len(intermediate) >= 8:
                 prebias_mel = intermediate[-4]   # [B, 80, T] raw mel, pre-scale
-                postbias_mel = intermediate[-1]  # [B, 80, T] after speaker bias
-                bias_only = postbias_mel - prebias_mel  # [B, 80, T] scale+affine delta
-                mel_for_ce = prebias_mel.detach() + bias_only
+                postbias_mel = intermediate[-1]  # [B, 80, T] after speaker delta
+                bias_only = postbias_mel - prebias_mel.detach()  # gradient only through postbias_mel path
+                mel_for_ce = bias_only  # pure speaker delta signal for CE
                 mel_pooled = mel_for_ce.mean(dim=-1)
                 pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)
                 aux["pooled_mel_logits"] = pooled_mel_logits
@@ -506,6 +510,8 @@ class HubertVCModel(nn.Module):
             if len(intermediate) >= 8:
                 aux["prebias_mel"]   = intermediate[-4]   # raw mel — L1 target
                 aux["variance_mel"]  = intermediate[-3]   # post-scale, pre-affine — variance target
+                aux["mel_speaker"]   = intermediate[-2]   # speaker delta — mel_proj_speaker output
+                aux["postbias_mel"]  = intermediate[-1]   # post-affine, pre-clamp — speaker target
         
         return pred_mel, loss_dict, aux
 

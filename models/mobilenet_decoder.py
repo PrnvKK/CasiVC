@@ -622,6 +622,14 @@ class MobileNetDecoder(nn.Module):
         # This gives variance loss a structural head-start it cannot lose to L1 regression.
         self.raw_out_scale = nn.Parameter(torch.zeros(1, 80, 1))  # softplus(0) ≈ 0.693 → scale init ≈ 2.19
 
+        # Content-gated energy projection for mel_proj_speaker delta (Fix #21c).
+        # Gate concentrates CE gradient on vowel frames and prevents time-invariant
+        # fixed-filter sound. Conv1d(1, 1, 1) operates on per-frame content energy (scalar).
+        self.energy_gate_proj = nn.Conv1d(1, 1, kernel_size=1, bias=True)
+        with torch.no_grad():
+            nn.init.constant_(self.energy_gate_proj.weight, 0.0)
+            nn.init.constant_(self.energy_gate_proj.bias, 0.0)
+
         # Per-band output bias: handles spectral tilt / per-band mean offset
         # independently of variance scaling.
         self.out_bias = nn.Parameter(torch.zeros(1, 80, 1))
@@ -790,10 +798,22 @@ class MobileNetDecoder(nn.Module):
         content_mel = self.mel_proj_content(x)  # [B, 80, T]
 
         # Speaker delta from broadcast speaker tokens (pure identity signal)
-        # Fix #21b: uses spk tokens, not x.detach(), to prevent regression
+        # Fix #21b: uses broadcast spk tokens, not x.detach(), to prevent regression
         # as upstream strips speaker info from feature tensor over time.
+        # Three-path gradient isolation: mel_proj_speaker receives CE gradient only,
+        # L1 gradient is blocked by variance_mel.detach() in Path 3.
         if speaker_feats is not None:
-            mel_speaker = torch.zeros_like(content_mel) # DISABLED FOR PHASE 1
+            B = speaker_feats.shape[0]
+            T_mel = content_mel.shape[-1]
+            # Mean-pool speaker tokens: [B, 8, 96] → [B, 96] → broadcast to all frames
+            spk_pooled = speaker_feats.mean(dim=1)  # [B, 96]
+            spk_broadcast = spk_pooled.unsqueeze(-1).expand(B, 96, T_mel)  # [B, 96, T]
+            mel_speaker_base = self.mel_proj_speaker(spk_broadcast)  # [B, 80, T]
+            # Content-gated energy (Fix #21c): scale delta by per-frame content energy
+            # Gate is higher on vowel frames, lower on silence — concentrates CE gradient
+            content_energy = content_mel.detach().abs().mean(dim=1, keepdim=True)  # [B, 1, T]
+            energy_gate = torch.sigmoid(self.energy_gate_proj(content_energy))  # [B, 1, T]
+            mel_speaker = energy_gate * mel_speaker_base  # [B, 80, T]
         else:
             mel_speaker = torch.zeros_like(content_mel)
 
@@ -833,13 +853,13 @@ class MobileNetDecoder(nn.Module):
         variance_mel = mel_scaled  # [B, 80, T] — variance target
 
         # ── Path 3: Combine content + speaker → final output ───────────
-        # mel_speaker added to detached variance_mel: spk_film CE gradient
-        # flows ONLY to mel_proj_speaker, never upstream. Speaker delta is
-        # an additive residual on the content baseline.
-        spk_film_mel = variance_mel # PHASE 1: Strict final output L1
-
-        if speaker_feats is not None:
-            pass # DISABLED FOR PHASE 1: spk_film_mel = self.mel_speaker_affine(spk_film_mel, speaker_feats)
+        # Three-path gradient separation (Session 6 Fix #21):
+        #   L1 on prebias_mel → trains mel_proj_content (Path 1)
+        #   L1 on pred_mel    → trains mel_proj_speaker via mel_speaker (Path 3)
+        #   CE on mel_speaker → trains mel_proj_speaker for speaker discrimination
+        # variance_mel.detach() blocks L1 gradient from flowing upstream through
+        # the content path, preventing L1-vs-speaker gradient competition.
+        spk_film_mel = variance_mel.detach() + mel_speaker
 
         postbias_mel = spk_film_mel
         mel = torch.clamp(spk_film_mel, min=-11.5, max=2.0)
