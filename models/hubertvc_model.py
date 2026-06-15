@@ -292,8 +292,13 @@ class HubertVCModel(nn.Module):
         # 1. Speaker-token extraction (ECAPA-TDNN)                  #
         # --------------------------------------------------------- #
         if precomputed_speaker_feats is not None:
-            speaker_feats = precomputed_speaker_feats
-            B = speaker_feats.shape[0]
+            # Cached raw 192D ECAPA — apply trainable projection + per-token norm
+            # (mirrors content path: cache raw HuBERT 768D, project during training)
+            raw_speaker = precomputed_speaker_feats  # [B, 192]
+            B = raw_speaker.shape[0]
+            projected = self.mel_encoder.projection(raw_speaker)  # [B, 768]
+            projected = projected.view(B, self.mel_encoder.num_speaker_tokens, self.mel_encoder.output_dim)  # [B, 8, 96]
+            speaker_feats = self.mel_encoder.token_norm(projected)  # [B, 8, 96]
         else:
             if ref_audio is None:
                 raise ValueError("Either ref_audio or precomputed_speaker_feats must be provided")
@@ -502,16 +507,20 @@ class HubertVCModel(nn.Module):
                 spk_film_logits = self.spk_film_classifier(spk_film_feats)
                 aux["spk_film_classifier_logits"] = spk_film_logits
 
-            # Three-path gradient separation: expose all intermediate mels
-            #   prebias_mel  (raw, pre-scale)             → L1 target
-            #   variance_mel (post-scale, pre-affine)      → variance target (trains out_scale)
-            #   mel_speaker  (speaker delta)               → spk_film CE target
-            #   postbias_mel (post-scale, post-affine)     → speaker stats (detach protected)
-            if len(intermediate) >= 8:
-                aux["prebias_mel"]   = intermediate[-4]   # raw mel — L1 target
-                aux["variance_mel"]  = intermediate[-3]   # post-scale, pre-affine — variance target
-                aux["mel_speaker"]   = intermediate[-2]   # speaker delta — mel_proj_speaker output
-                aux["postbias_mel"]  = intermediate[-1]   # post-affine, pre-clamp — speaker target
+
+        # Three-path gradient separation: expose intermediate mels to aux
+        # (independent of classifier availability — trainer loss + eval diagnostics)
+        #   prebias_mel  (raw, pre-scale)             → L1 target
+        #   variance_mel (post-scale, pre-affine)      → variance target (trains out_scale)
+        #   mel_speaker  (speaker delta)               → spk_film CE target
+        #   postbias_mel (post-scale, post-affine)     → speaker stats (detach protected)
+        if return_bottleneck and len(intermediate) >= 8:
+            if aux is None:
+                aux = {}
+            aux["prebias_mel"]   = intermediate[-4]   # raw mel — L1 target
+            aux["variance_mel"]  = intermediate[-3]   # post-scale, pre-affine — variance target
+            aux["mel_speaker"]   = intermediate[-2]   # speaker delta — mel_proj_speaker output
+            aux["postbias_mel"]  = intermediate[-1]   # post-affine, pre-clamp — speaker target
         
         return pred_mel, loss_dict, aux
 

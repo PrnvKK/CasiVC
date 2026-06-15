@@ -182,6 +182,8 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_spk_sim_shuf_to_shuf = 0.0
     avg_spk_sim_shuf_to_target = 0.0
     avg_mel_speaker_mag = 0.0
+    avg_mel_speaker_rms_ratio = 0.0  # RMS(mel_speaker) / RMS(content_mel)
+    avg_content_l1_self = 0.0         # L1 on prebias_mel (content-only) vs GT
     evaluated_pairs = 0
     
     with torch.no_grad():
@@ -204,7 +206,10 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
             gt_mel_content = extract_mel_spectrogram(content_seg, sample_rate=audio_cfg.sample_rate).to(device)
             
             # ── 1. Self Reconstruction (Content A, Voice A) ──
-            pred_mel_self, _, _ = model(content_ref.unsqueeze(0), [content_seg])
+            pred_mel_self, _, aux_self = model(
+                content_ref.unsqueeze(0), [content_seg],
+                return_bottleneck=True, return_aux=True
+            )
             pred_mel_self_sq = pred_mel_self.squeeze(0)  # [80, T] for L1
             
             min_len = min(pred_mel_self_sq.size(-1), gt_mel_content.size(-1))
@@ -224,6 +229,12 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
             if aux_cross is not None and "mel_speaker" in aux_cross:
                 mel_spk = aux_cross["mel_speaker"]
                 avg_mel_speaker_mag += mel_spk.abs().mean().item()
+                # RMS ratio: how large is speaker delta relative to content?
+                if "prebias_mel" in aux_cross:
+                    content_mel = aux_cross["prebias_mel"]
+                    rms_spk = mel_spk.pow(2).mean().sqrt().item()
+                    rms_content = content_mel.pow(2).mean().sqrt().item()
+                    avg_mel_speaker_rms_ratio += rms_spk / (rms_content + 1e-8)
             
             # ── 3. Shuffled Reference (Content A, Voice C) ──
             pred_mel_shuffled, _, _ = model(
@@ -268,6 +279,16 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                 # SPK SIM (Shuffled vs Original Target Raw) — should be low (no tonic)
                 sim_shuf_to_target = calculate_spk_sim(spk_encoder, wav_shuffled, wav_target_raw, device)
                 avg_spk_sim_shuf_to_target += sim_shuf_to_target
+            
+            # ── Three-way ablation: content-only L1 (prebias_mel, no speaker delta) ──
+            if aux_self is not None and "prebias_mel" in aux_self:
+                content_mel_self = aux_self["prebias_mel"].squeeze(0)  # [80, T]
+                min_len_c = min(content_mel_self.size(-1), gt_mel_content.size(-1))
+                l1_content = torch.nn.functional.l1_loss(
+                    content_mel_self[:, :min_len_c],
+                    gt_mel_content[:, :min_len_c]
+                ).item()
+                avg_content_l1_self += l1_content
                 
             # Save first 5 pairs for manual listening
             if i < 5:
@@ -277,6 +298,14 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                 
                 wav_self_save = vocoder(pred_mel_self).squeeze(0).cpu()
                 torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_self.wav"), wav_self_save, audio_cfg.sample_rate)
+                
+                # Three-way ablation: content-only path (prebias_mel, no speaker delta)
+                if aux_self is not None and "prebias_mel" in aux_self:
+                    content_mel_self = aux_self["prebias_mel"]  # [1, 80, T] or [80, T]
+                    if content_mel_self.dim() == 2:
+                        content_mel_self = content_mel_self.unsqueeze(0)
+                    wav_content = vocoder(content_mel_self.to(device)).squeeze(0).cpu()
+                    torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_content_only.wav"), wav_content, audio_cfg.sample_rate)
                 
                 wav_cross_save = vocoder(pred_mel_cross).squeeze(0).cpu()
                 torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_cross.wav"), wav_cross_save, audio_cfg.sample_rate)
@@ -298,12 +327,16 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_spk_sim_shuf_to_shuf /= evaluated_pairs
     avg_spk_sim_shuf_to_target /= evaluated_pairs
     avg_mel_speaker_mag /= evaluated_pairs
+    avg_mel_speaker_rms_ratio /= evaluated_pairs
+    avg_content_l1_self /= evaluated_pairs
     
     print("\n" + "="*60)
     print("📊 EVALUATION SCOREBOARD")
     print("="*60)
     print(f"  Pairs Evaluated:          {evaluated_pairs} (out of {len(valid_manifest)})")
     print(f"  Self-Recon Mel L1:        {avg_l1_self:.4f} (Lower is better)")
+    if avg_content_l1_self > 0:
+        print(f"  Content-Only L1 (prebias):{avg_content_l1_self:.4f} (vs full {avg_l1_self:.4f} — gap = speaker-delta impact)")
     if spk_encoder is not None:
         print(f"  Self SPK_SIM:             {avg_spk_sim_self:.4f} (Target > 0.70, upper ~0.92)")
         print(f"  Cross SPK_SIM:            {avg_spk_sim_cross:.4f} (Target > 0.35)")
@@ -312,14 +345,16 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
         print(f"  Shuffled→Target SIM:      {avg_spk_sim_shuf_to_target:.4f}")
         print(f"  Delta (shuf→shuf minus shuf→target):  {avg_spk_sim_shuf_to_shuf - avg_spk_sim_shuf_to_target:.4f} (should be > 0.05)")
         if avg_mel_speaker_mag > 0:
-            print(f"  mel_speaker |mean|:      {avg_mel_speaker_mag:.4f} (should be > 0.01)")
+            print(f"  mel_speaker |mean|:       {avg_mel_speaker_mag:.4f} (should be > 0.01)")
+            print(f"  RMS(mel_speaker)/RMS(content): {avg_mel_speaker_rms_ratio:.4f} (<0.05=negligible, >0.15=dominant)")
         else:
-            print(f"  mel_speaker |mean|:      [not available - spk_film_classifier not in model]")
+            print(f"  mel_speaker |mean|:       [not available]")
     else:
-        print("  SPK_SIM:                  [Skipped - SpeechBrain missing]")
+        print("  SPK_SIM:                   [Skipped - SpeechBrain missing]")
     print("="*60)
     print(f"Sample audio saved to {output_dir}/")
     print("Listen to pair_0_pred_self.wav to verify basic intelligibility.")
+    print("Compare pair_0_pred_content_only.wav vs pair_0_pred_self.wav to isolate noise source.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate CasiVC Generalization")
