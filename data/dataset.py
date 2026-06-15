@@ -839,7 +839,7 @@ def collate_training_pairs(batch: List["TrainingPair"]) -> Dict[str, Any]:
         "ref_mel":           batched_ref_mels,         # (B, 80, T_ref) - kept for compatibility
         "content_audio":     batched_audio,            # (B, T_wav) - for HuBERT
         "content_feats":     batched_content_feats,    # (B, T, 96) - precomputed HuBERT
-        "speaker_feats":     batched_speaker_feats,    # (B, 64, 96) - precomputed ECAPA
+        "speaker_feats":     batched_speaker_feats,    # (B, 192) - raw ECAPA embedding (projected during training)
         "gt_mel":            batched_gt_mels,          # (B, 80, T_gt) - for reconstruction loss
         "gt_wave":           batched_audio,            # (B, T_wav) - for vocoder loss
         

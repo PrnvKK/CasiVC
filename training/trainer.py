@@ -563,7 +563,7 @@ class Trainer:
                 cross_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
                 if B >= 2:
                     for i in range(B):
-                        j = (i + 1) % B
+                        j = (i - 1) % B  # matches torch.roll(shifts=1): item i pairs with i-1
                         if speaker_ids[i] != speaker_ids[j]:
                             cross_mask[i] = True
                 
@@ -974,8 +974,9 @@ class Trainer:
                 content_audio_gpu = [content_audio.to(self.device)]
                 
                 with torch.inference_mode():
-                    # 1. ECAPA-TDNN Speaker Features
-                    speaker_feats = self.model.mel_encoder(ref_audio_gpu)[0] # [64, 96]
+                    # 1. ECAPA-TDNN Speaker Features — cache raw 192D embedding
+                    # (projection + token_norm applied during training so they receive gradients)
+                    speaker_feats = self.model.mel_encoder.extract_speaker_features(ref_audio_gpu, apply_projection=False)[0]  # [192]
                     
                     # 2. HuBERT Content Features 
                     hubert_out = self.model.hubert(content_audio_gpu)
