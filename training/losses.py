@@ -404,7 +404,7 @@ class VCGeneratorLoss(nn.Module):
         """
         Three-path gradient separation:
           L1      → content_mel (pre-scale)  → mel_proj → upstream
-          Variance → variance_mel (post-scale) → out_scale → upstream
+          Variance → content_mel (pre-scale)  → decoder blocks → upstream
           Speaker  → pred_mel (post-affine)  → [DETACH] → speaker_affine ONLY
         """
         outs = LossOutputs()
@@ -461,10 +461,15 @@ class VCGeneratorLoss(nn.Module):
             except Exception as exc:
                 raise RuntimeError(f"Speaker/Stats loss failed: {exc}") from exc
 
-        # Mel variance loss — on variance_mel (post-scale, pre-affine) to train out_scale
+        # Variance loss on content_mel (prebias) — forces decoder blocks to produce
+        # correct per-band temporal dynamics natively, without relying on out_scale.
+        # Previously on variance_mel (post-scale) to train out_scale, but out_scale
+        # is bypassed in Phase 1. Applying variance loss directly to content_mel
+        # (Path 1) is safe because L1 and variance are complementary objectives on
+        # the same tensor — both push toward GT, no speaker gradient competition.
         if hasattr(self.cfg, 'lambda_var') and self.cfg.lambda_var > 0:
             try:
-                var_src = variance_mel if variance_mel is not None else pred_mel
+                var_src = content_mel if content_mel is not None else pred_mel
                 if gt_lengths is not None:
                     T_common = min(var_src.size(-1), gt_mel.size(-1))
                     pred_aligned = var_src[:, :, :T_common]
@@ -483,9 +488,9 @@ class VCGeneratorLoss(nn.Module):
                     pred_std = var_src[:, :, :T_common].std(dim=-1)
                     tgt_std = gt_mel[:, :, :T_common].std(dim=-1)
                 l_var = F.l1_loss(pred_std, tgt_std)
-                outs["var"] = self.cfg.lambda_var * l_var
+                outs["var_content"] = self.cfg.lambda_var * l_var
             except Exception as exc:
-                raise RuntimeError(f"Variance loss failed: {exc}") from exc
+                raise RuntimeError(f"Content variance loss failed: {exc}") from exc
 
         return outs
 

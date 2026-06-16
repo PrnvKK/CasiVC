@@ -360,7 +360,7 @@ class Trainer:
       # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum = {"mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0, "spk_film_acc": 0.0, "spk_film_cnt": 0}
+        loss_accum = {"mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var_content": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0, "spk_film_acc": 0.0, "spk_film_cnt": 0}
         num_batches = 0
 
         # Ensure exact reproducibility for this epoch's shuffling and data augmentation (like random crops)
@@ -402,7 +402,7 @@ class Trainer:
             mel_classifier_weight = 0.0   # per-frame mel Conv1d CE remains disabled
             pooled_mel_ce_weight = getattr(self.train_cfg, 'pooled_mel_ce_weight', 0.0)
             spk_film_ce_weight = getattr(self.train_cfg, 'spk_film_ce_weight', 0.0)
-            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0 or spk_film_ce_weight > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None or self.model.spk_film_classifier is not None)
+            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0 or spk_film_ce_weight > 0 or getattr(self.train_cfg, 'lambda_var', 0) > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None or self.model.spk_film_classifier is not None or getattr(self.train_cfg, 'lambda_var', 0) > 0)
             
             pred_mel, _, aux = self.model(
                 ref_audio=ref_audio,
@@ -857,7 +857,7 @@ class Trainer:
                 "mel_f": f"{losses.get('mel_final', torch.tensor(0.)).item():.3f}",
                 "stft": f"{losses.get('stft', torch.tensor(0.)).item():.3f}",
                 "spk": f"{losses.get('speaker', torch.tensor(0.)).item():.3f}",
-                "var": f"{losses.get('var', torch.tensor(0.)).item():.3f}",
+                "var_c": f"{losses.get('var_content', torch.tensor(0.)).item():.3f}",
                 "tot": f"{total.item():.3f}",
             }
             if need_bottleneck:
@@ -885,7 +885,7 @@ class Trainer:
     def _validate(self) -> dict:
         self.model.eval()
         self.vocoder.eval()
-        loss_accum = {"mel": 0.0, "mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "var": 0.0, "total": 0.0}
+        loss_accum = {"mel": 0.0, "mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "var_content": 0.0, "total": 0.0}
         num_batches = 0
 
         for batch in tqdm(self.val_loader, desc="Valid", leave=False):
@@ -906,12 +906,14 @@ class Trainer:
             gt_lengths = batch["gt_lengths"].to(self.device) if batch.get("gt_lengths") is not None else None
 
             # Forward pass - NOW USES ref_audio and optionally precomputed features
-            pred_mel, _, _ = self.model(
+            # return_bottleneck=True needed for content_mel (variance loss)
+            pred_mel, _, aux_val = self.model(
                 ref_audio=ref_audio,
                 content_audio=content_audio,
                 gt_mels=None,
                 compute_losses=False,
-                return_aux=False,
+                return_aux=True,
+                return_bottleneck=True,
                 precomputed_speaker_feats=batch.get("speaker_feats"),
                 precomputed_content_feats=batch.get("content_feats")
             )
@@ -919,7 +921,9 @@ class Trainer:
 
             # Same-domain STFT ground truth
             gt_wave_vocoded = None
-            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths)
+            content_mel_val = aux_val.get("prebias_mel", None) if aux_val is not None else None
+            variance_mel_val = aux_val.get("variance_mel", None) if aux_val is not None else None
+            losses = self.loss_fn(pred_mel, gt_mel, pred_wave, gt_wave_vocoded, gt_lengths=gt_lengths, content_mel=content_mel_val, variance_mel=variance_mel_val)
 
             total = losses.total()
 
