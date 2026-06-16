@@ -150,7 +150,7 @@ class TrainingConfig:
   lambda_mel: float = 45.0     # Phase 1: Heavy L1 on final output
   lambda_rec: float = 3.0      # STFT (if active)
   lambda_spk: float = 1.0      # Re-enabled for Phase 2
-  lambda_var: float = 0.0      # Disabled for Phase 1
+  lambda_var: float = 10.0     # Variance loss on content_mel (prebias) — forces decoder to produce correct spectral dynamics natively
   lambda_entropy: float = 0.0  # Disabled for Phase 1
 
   # Cross-pair training
