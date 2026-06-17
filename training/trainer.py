@@ -325,7 +325,7 @@ class Trainer:
             "Decoder Adapter": "decoder.adapter",
             "Decoder Block 0": "decoder.blocks.0",
             "Decoder Mel Proj Content": "decoder.mel_proj_content",
-            "Decoder Mel Proj Speaker": "decoder.mel_proj_speaker",
+            "Decoder Speaker Delta Proj": "decoder.speaker_delta_proj",
         }
         
         # Add the final decoder block dynamically if it exists
@@ -495,8 +495,8 @@ class Trainer:
                         acc_b3 = (pred_b3 == target_expanded_b3).float().mean().item()
                         print(f"[B3_CLASSIFIER] ce={ce_b3.item():.4f}, self_accuracy={acc_b3:.4f}")
 
-            # --- Spk_film classifier CE (self-pair): supervises mel_proj_speaker output ---
-            # Provides speaker-discriminative gradient to mel_proj_speaker —
+            # --- Spk_film classifier CE (self-pair): supervises SpeakerDeltaProj output ---
+            # Provides speaker-discriminative gradient to SpeakerDeltaProj —
             # the key ingredient that makes the residual branch speaker-specific
             # rather than a generic reconstructor.
             spk_film_ce_weight = getattr(self.train_cfg, 'spk_film_ce_weight', 0.0)

@@ -150,7 +150,7 @@ class TrainingConfig:
   lambda_mel: float = 45.0     # Phase 1: Heavy L1 on final output
   lambda_rec: float = 3.0      # STFT (if active)
   lambda_spk: float = 1.0      # Re-enabled for Phase 2
-  lambda_var: float = 10.0     # Variance loss on content_mel (prebias) — forces decoder to produce correct spectral dynamics natively
+  lambda_var: float = 0.0      # Disabled (Session 13 revert): L1-vs-Var asymptotic competition on content_mel caused E30 content regression (+0.063) and audible disturbance
   lambda_entropy: float = 0.0  # Disabled for Phase 1
 
   # Cross-pair training
@@ -161,7 +161,7 @@ class TrainingConfig:
   classifier_weight: float = 0.0         # Bottleneck CE disabled (FiLM modules inactive)
   mel_classifier_weight: float = 0.0   # Per-frame mel classifier disabled
   pooled_mel_ce_weight: float = 2.0    # Pooled mel-bias CE on speaker delta
-  spk_film_ce_weight: float = 2.0      # Per-frame CE on mel_speaker delta (mel_proj_speaker)
+  spk_film_ce_weight: float = 2.0      # Per-frame CE on mel_speaker delta (SpeakerDeltaProj)
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0

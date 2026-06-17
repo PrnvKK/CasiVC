@@ -413,7 +413,7 @@ class VCGeneratorLoss(nn.Module):
 
         # Mel reconstruction loss — THREE-PATH GRADIENT SEPARATION
         # Path 1: L1 on content_mel (prebias_mel, raw) → trains mel_proj_content + upstream
-        # Path 3: L1 on pred_mel (final output) → trains mel_proj_speaker via mel_speaker
+        # Path 3: L1 on pred_mel (final output) → trains SpeakerDeltaProj via mel_speaker
         # Both use lambda_mel weight. Each path gets half the effective weight
         # to maintain the same total gradient magnitude as single-path L1.
         if hasattr(self.cfg, 'lambda_mel') and self.cfg.lambda_mel > 0:
@@ -421,7 +421,7 @@ class VCGeneratorLoss(nn.Module):
                 T_common = min(pred_mel.size(-1), gt_mel.size(-1))
                 g_align = gt_mel[:, :, :T_common]
                 
-                # Path 3: L1 on final output (trains mel_proj_speaker via mel_speaker,
+                # Path 3: L1 on final output (trains SpeakerDeltaProj via mel_speaker,
                 # since variance_mel is detached in the decoder forward pass)
                 l_mel_final = self.mel_loss(pred_mel[:, :, :T_common], g_align, lengths=gt_lengths)
                 outs["mel_final"] = (self.cfg.lambda_mel * 0.5) * l_mel_final
