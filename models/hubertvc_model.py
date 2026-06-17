@@ -499,8 +499,8 @@ class HubertVCModel(nn.Module):
                 pooled_mel_logits = self.pooled_mel_classifier(mel_pooled)
                 aux["pooled_mel_logits"] = pooled_mel_logits
 
-            # Spk_film classifier: taps mel_speaker (pure speaker delta from mel_proj_speaker)
-            # Gradient-isolated: CE flows ONLY to mel_proj_speaker, never upstream.
+            # Spk_film classifier: taps mel_speaker (pure speaker delta from SpeakerDeltaProj)
+            # Gradient-isolated: CE flows ONLY to SpeakerDeltaProj, never upstream.
             if self.spk_film_classifier is not None and len(intermediate) >= 8:
                 spk_film_feats = intermediate[-2]  # [B, 80, T] mel_speaker (speaker delta)
                 spk_film_feats = F.avg_pool1d(spk_film_feats, kernel_size=3, stride=1, padding=1)
@@ -519,7 +519,7 @@ class HubertVCModel(nn.Module):
                 aux = {}
             aux["prebias_mel"]   = intermediate[-4]   # raw mel — L1 target
             aux["variance_mel"]  = intermediate[-3]   # post-scale, pre-affine — variance target
-            aux["mel_speaker"]   = intermediate[-2]   # speaker delta — mel_proj_speaker output
+            aux["mel_speaker"]   = intermediate[-2]   # speaker delta — SpeakerDeltaProj output
             aux["postbias_mel"]  = intermediate[-1]   # post-affine, pre-clamp — speaker target
         
         return pred_mel, loss_dict, aux
