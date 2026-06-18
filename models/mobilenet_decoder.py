@@ -783,8 +783,8 @@ class MobileNetDecoder(nn.Module):
         # before mel_proj compresses it away.  Without this, block3's
         # 192→96 residual_proj crushes speaker info (cent_cos 0.49→0.75).
         if speaker_feats is not None:
-            pass # DISABLED FOR PHASE 1: x = self.speaker_film(x, speaker_feats)
-            # self._check(x, "spk_film")
+            x = self.speaker_film(x, speaker_feats.detach())
+            self._check(x, "spk_film")
 
         # ── Split mel projection: gradient-isolated paths ─────────────
         # Content path (mel_proj_content): reads all 96 ch — L1+Var only.
