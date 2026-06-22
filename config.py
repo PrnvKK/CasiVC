@@ -35,7 +35,7 @@ class DataConfig:
     dataset_root: str = "/content/LibriTTS"  # Change this to your actual path
     
     # Development mode - use dev-clean split by speakers
-    use_dev_subset: bool = True  # Set True for development, False for full dataset
+    use_dev_subset: bool = False  # Session 16: switched to train-clean-100 for data scaling (247 speakers vs 24)
     dev_subset_name: str = "dev-clean"
     
     # Speaker-level splits (percentages)
@@ -44,9 +44,12 @@ class DataConfig:
     test_speaker_ratio: float = 0.2   # 20% speakers for testing
     
     # Full dataset paths (when use_dev_subset=False)
-    train_subsets: List[str] = field(default_factory=lambda: ["train-clean-100", "train-clean-360"])
-    val_subsets: List[str] = field(default_factory=lambda: ["dev-clean"])
-    test_subsets: List[str] = field(default_factory=lambda: ["test-clean"])
+    # Session 16: train-clean-360 not downloaded — only train-clean-100 available.
+    # val/test splits are carved from train-clean-100's speaker pool (60/20/20 ratio).
+    # dev-clean/test-clean remain on disk only for eval (test_generalization.py uses /content/LibriTTS/dev-clean directly).
+    train_subsets: List[str] = field(default_factory=lambda: ["train-clean-100"])
+    val_subsets: List[str] = field(default_factory=lambda: ["train-clean-100"])
+    test_subsets: List[str] = field(default_factory=lambda: ["train-clean-100"])
     
     # Cache configuration
     cache_dir: str = "cache/"
@@ -64,7 +67,7 @@ class DataConfig:
     # Random seed for reproducible speaker splits
     speaker_split_seed: int = 42
 
-    max_items: Optional[int] = 4000
+    max_items: Optional[int] = 8000
     
     def get_dataset_path(self) -> str:
         """Get the appropriate dataset path based on configuration."""
