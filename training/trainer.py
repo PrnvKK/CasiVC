@@ -212,19 +212,30 @@ class Trainer:
     def _init_dataloaders(self) -> None:
         batch_size = getattr(self.train_cfg, "batch_size", 16)
 
+        total_max = self.data_cfg.max_items
+        if total_max is not None:
+            train_ratio = self.data_cfg.train_speaker_ratio
+            val_ratio = self.data_cfg.val_speaker_ratio
+            ratio_sum = train_ratio + val_ratio
+            train_max = int(total_max * train_ratio / ratio_sum)
+            val_max = int(total_max * val_ratio / ratio_sum)
+        else:
+            train_max = None
+            val_max = None
+
         self.train_dataset = VoiceConversionDataset(
             split="train",
             audio_config=self.audio_cfg,
             data_config=self.data_cfg,
             training_config=self.train_cfg,
-            max_items=self.data_cfg.max_items
+            max_items=train_max
         )
         self.val_dataset = VoiceConversionDataset(
             split="val",
             audio_config=self.audio_cfg,
             data_config=self.data_cfg,
             training_config=self.train_cfg,
-            max_items=self.data_cfg.max_items
+            max_items=val_max
         )
 
         self.train_loader = DataLoader(

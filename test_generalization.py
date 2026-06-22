@@ -100,7 +100,7 @@ def calculate_spk_sim(encoder, wave1, wave2, device="cpu"):
         sim = torch.nn.functional.cosine_similarity(emb1.squeeze(1), emb2.squeeze(1), dim=-1)
         return sim.item()
 
-def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = False):
+def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = False, zero_speaker_delta: bool = False):
     print("="*70)
     print("🚀 RUNNING CASIVC GENERALIZATION EVALUATION")
     print("="*70)
@@ -148,6 +148,22 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
         print(e)
         print("\nPlease run a fresh training session from scratch.")
         return
+
+    # ── Step 0 Diagnostic: zero the speaker delta branch ──────────
+    # Patches speaker_delta_proj.forward to return zeros. The rest of
+    # the forward (speaker_film, out_bias, clamp, vocoder) runs
+    # unchanged — isolates the output-level speaker delta's contribution
+    # to the disturbance. Compare audio and metrics against the normal
+    # run to determine if the buzz is speaker-side or content-side.
+    if zero_speaker_delta:
+        def _zeroed_delta(x, speaker_feats):
+            B, C, T = x.shape
+            return torch.zeros(B, 80, T, device=x.device, dtype=x.dtype)
+        model.decoder.speaker_delta_proj.forward = _zeroed_delta
+        print("\n" + "="*60)
+        print("⚠️  DIAGNOSTIC MODE: speaker_delta_proj ZEROED")
+        print("   Measuring content path through full forward (no output delta).")
+        print("="*60)
 
     # ── Manifest Setup ────────────────────────────
     print("\n[3] Preparing Data...")
@@ -361,6 +377,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="checkpoints/last.ckpt", help="Path to checkpoint")
     parser.add_argument("--output_dir", type=str, default="generalization_outputs", help="Output directory for audio")
     parser.add_argument("--smoke", action="store_true", help="Run quick 2-utterance smoke test instead of full 50-pair manifest")
+    parser.add_argument("--zero_speaker_delta", action="store_true", help="Zero the speaker delta branch to isolate disturbance source (Step 0 diagnostic)")
     args = parser.parse_args()
     
-    run_evaluation(args.checkpoint, args.output_dir, args.smoke)
+    run_evaluation(args.checkpoint, args.output_dir, args.smoke, args.zero_speaker_delta)
