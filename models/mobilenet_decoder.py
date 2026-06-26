@@ -779,12 +779,12 @@ class MobileNetDecoder(nn.Module):
               intermediate.append(x)
           
         
-        # Speaker FiLM at block3 output: re-inject speaker identity
-        # before mel_proj compresses it away.  Without this, block3's
-        # 192→96 residual_proj crushes speaker info (cent_cos 0.49→0.75).
+        # Speaker FiLM at block3 output: DISABLED (Fix #35 — ±0.001 effect,
+        # L1-only gradient trained it speaker-agnostic; journal/code mismatch resolved).
+        # Class left orphaned for checkpoint compat. Re-enable only with a
+        # speaker-discriminative supervisor on its weights.
         if speaker_feats is not None:
-            x = self.speaker_film(x, speaker_feats.detach())
-            self._check(x, "spk_film")
+            pass  # DISABLED: x = self.speaker_film(x, speaker_feats.detach())
 
         # ── Split mel projection: gradient-isolated paths ─────────────
         # Content path (mel_proj_content): reads all 96 ch — L1+Var only.
