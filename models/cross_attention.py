@@ -482,6 +482,9 @@ class PositionAgnosticCrossAttention(nn.Module):
             # carrier. Drop without replacement → cos(fused,spk_pooled) -0.027 → -0.038.
             # See CasiVC journal Action Plan Step 1 audit, E20 baseline.
             attended_features = attended_features + film_output
+            # Second post-relay injection of the same scalar·bias: bypasses film/residual
+            # erosion so fused_features carries spk_pooled direction by construction.
+            attended_features = attended_features + F.softplus(self.alpha_bias) * spk_bias
 
             # ── Source-leakage audit: is FiLM dominating or is the residual still winning? ──
             if v: print(f"[cross_attn] residual_norm contribution: std={residual_norm.std():.4f}")
