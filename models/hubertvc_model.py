@@ -196,12 +196,21 @@ class HubertVCModel(nn.Module):
             nn.init.xavier_uniform_(self.spk_film_classifier.weight)
             nn.init.zeros_(self.spk_film_classifier.bias)
             print(f"[HubertVCModel] Spk_film classifier: Conv1d(80, {num_speakers}, k=1) → {num_speakers * 81:,} params")
+
+            # Cross-attn classifier: supervises MHA value path (pre-additive attended_features)
+            # Provides speaker-discriminative gradient to Q/K/V projections only.
+            # Gradient-isolated from L1 path: no weight sharing with residual_proj/mapping_network.
+            self.cross_attn_classifier = nn.Conv1d(96, num_speakers, kernel_size=1)
+            nn.init.xavier_uniform_(self.cross_attn_classifier.weight)
+            nn.init.zeros_(self.cross_attn_classifier.bias)
+            print(f"[HubertVCModel] Cross-attn classifier: Conv1d(96, {num_speakers}, k=1) → {num_speakers * 97:,} params")
         else:
             self.speaker_classifier = None
             self.block3_classifier = None
             self.mel_classifier = None
             self.pooled_mel_classifier = None
             self.spk_film_classifier = None
+            self.cross_attn_classifier = None
 
         # 2. Sanity-check overall parameter budget
         trainables = sum(p.numel() for p in self.parameters()
@@ -362,11 +371,17 @@ class HubertVCModel(nn.Module):
         # Process entire batch at once - each item uses its OWN speaker conditioning
         # content_feats: [B, T, 96], speaker_feats: [B, 64, 96]
         # PHASE 2 Step 1: Re-enable Cross-Attention
-        fused_features = self.cross_attn(
-            content_feats,  # [B, T, 96]
-            speaker_feats   # [B, 64, 96]
-        )
-        # fused_features: [B, T, 96]
+        # Step 1 audit (Action Plan): preserve pre-attn content_feats and attention
+        # weights so test_generalization can measure source-leakage / fusion strength.
+        # content_feats here is already post-hubert_proj (96D), pre cross_attn.
+        if return_aux:
+            fused_features, attention_weights = self.cross_attn(
+                content_feats, speaker_feats, return_attention=True
+            )
+        else:
+            fused_features = self.cross_attn(content_feats, speaker_feats)
+            attention_weights = None
+        # fused_features: [B, T, 96]; attention_weights: [B, T, num_tokens] (head-averaged)
 
         # Decoder runs at Mel frame rate (proper 1.25x interpolation via Conv1D)
         if gt_mels is not None:
@@ -452,9 +467,16 @@ class HubertVCModel(nn.Module):
         # --------------------------------------------------------- #
         aux: Dict[str, Any] | None = None
         if return_aux:
+            # Step 1 audit (Action Plan): expose pre-attn content features, post-attn
+            # fused features, and head-averaged attention weights for offline
+            # source-leakage / fusion-strength diagnostics. No gradient impact.
             aux = {
               "speaker_tokens": speaker_feats,
               "content_length": fused_features.size(0),
+              "content_feats_pre_attn": content_feats,   # [B, T, 96] post-hubert_proj, pre cross_attn
+              "fused_features": fused_features,           # [B, T, 96] post cross_attn
+              "attention_weights": attention_weights,     # [B, T, num_tokens] or None
+              "attn_feats_pre_film": self.cross_attn._cached_attended_features,  # [B, T, 96] pre-additive MHA output
           }
 
         # Classifier head: per-frame speaker ID logits from decoder bottleneck
@@ -506,6 +528,16 @@ class HubertVCModel(nn.Module):
                 spk_film_feats = F.avg_pool1d(spk_film_feats, kernel_size=3, stride=1, padding=1)
                 spk_film_logits = self.spk_film_classifier(spk_film_feats)
                 aux["spk_film_classifier_logits"] = spk_film_logits
+
+            # Cross-attn classifier: supervises MHA value path (pre-additive attended_features)
+            # Gradient flows ONLY to content_proj, speaker_proj, speaker_val_proj, multihead_attn Q/K/V.
+            # Does NOT flow to residual_proj, mapping_network, or raw_film_scale.
+            if self.cross_attn_classifier is not None:
+                attn_feats = self.cross_attn._cached_attended_features  # [B, T, 96]
+                attn_feats = attn_feats.transpose(1, 2)  # [B, 96, T]
+                attn_feats = F.avg_pool1d(attn_feats, kernel_size=3, stride=1, padding=1)
+                cross_attn_logits = self.cross_attn_classifier(attn_feats)  # [B, N, T]
+                aux["cross_attn_classifier_logits"] = cross_attn_logits
 
 
         # Three-path gradient separation: expose intermediate mels to aux

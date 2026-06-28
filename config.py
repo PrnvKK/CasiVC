@@ -165,6 +165,7 @@ class TrainingConfig:
   mel_classifier_weight: float = 0.0   # Per-frame mel classifier disabled
   pooled_mel_ce_weight: float = 2.0    # Pooled mel-bias CE on speaker delta
   spk_film_ce_weight: float = 2.0      # Per-frame CE on mel_speaker delta (SpeakerDeltaProj)
+  cross_attn_ce_weight: float = 1.0    # Per-frame CE on cross_attn attended_features — provides speaker-discriminative gradient to MHA value path (Action Plan Step 1 pivot)
 
   # Set unused loss weights to zero
   lambda_aux: float = 0.0
