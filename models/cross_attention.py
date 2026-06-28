@@ -76,6 +76,10 @@ class PositionAgnosticCrossAttention(nn.Module):
         # Learnable attention temperature (softplus-constrained, starts ≈0.19 for sharper attention)
         self.raw_temperature = nn.Parameter(torch.tensor(-1.6))  # F.softplus(-1.6) ≈ 0.18
 
+        # Detached speaker bias injected pre-film into attended_features (pre-additive)
+        # softplus(-2.0) ≈ 0.13 — a small, learnable scaling of the mean speaker key direction
+        self.alpha_bias = nn.Parameter(torch.tensor(-2.0))
+
         # Multi-head attention (speaker features already at correct dimension)
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=self.d_model,
@@ -368,6 +372,14 @@ class PositionAgnosticCrossAttention(nn.Module):
             average_attn_weights=True
         )
 
+        # Detached speaker bias: inject raw mean speaker-token direction into attended_features pre-film.
+        # speaker_features.detach() is the raw mel_encoder output (== spk_pooled readout basis in test_generalization).
+        # keys would be content_proj(speaker_features) — a DIFFERENT space, useless for spk_pooled alignment.
+        if self.enable_residual:
+            spk_bias = speaker_features.detach().mean(dim=1, keepdim=True) # [B,1,96] raw speaker-token basis
+            attended_features = attended_features + F.softplus(self.alpha_bias) * spk_bias
+        self._cached_attended_features = attended_features  # for CE probe (pre-additive, pre-dropout)
+
         if v: print(f"[cross_attn] attended_features shape: {attended_features.shape}")
         if v: print(f"[cross_attn] attended_features stats: mean={attended_features.mean():.4f}, "
               f"std={attended_features.std():.4f}")
@@ -404,7 +416,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             # identical behaviour in train and eval, eliminating the 67% stronger
             # source residual at inference that caused "mix of both voices."
             residual_norm = F.instance_norm(residual.transpose(1, 2)).transpose(1, 2)
-            residual_norm = residual_norm * 0.35  # reduced from 0.6 to force decoder blocks to compute; adapter was normalizing away all FiLM signal
+            residual_norm = residual_norm * 0.35  # back up from 0.10; stronger residual needed now that CE probe gradients pull Q/K/V toward speaker (potential content erosion)
             
             # STEP 2: INJECTING THE TARGET VOICE via MAPPING NETWORK
             # RMS-normalise attended_features before mapping network.
@@ -466,6 +478,9 @@ class PositionAgnosticCrossAttention(nn.Module):
             beta_temporal_std = beta.std(dim=1).mean()
             if v: print(f"[cross_attn] FiLM beta temporal std: {beta_temporal_std:.4f}")
             film_output = residual_norm * (1.0 + gamma) + beta
+            # Variant A REMOVED (E3 test): additive relay was the only speaker
+            # carrier. Drop without replacement → cos(fused,spk_pooled) -0.027 → -0.038.
+            # See CasiVC journal Action Plan Step 1 audit, E20 baseline.
             attended_features = attended_features + film_output
 
             # ── Source-leakage audit: is FiLM dominating or is the residual still winning? ──

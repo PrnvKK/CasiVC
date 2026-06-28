@@ -188,9 +188,9 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     shuffled_offset = 2 if N >= 3 else 1
     
     results = []
-    
+
     print(f"\n[4] Running Evaluation on {N} Pairs...")
-    
+
     avg_l1_self = 0.0
     avg_spk_sim_self = 0.0
     avg_spk_sim_cross = 0.0
@@ -201,6 +201,30 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_mel_speaker_rms_ratio = 0.0  # RMS(mel_speaker) / RMS(content_mel)
     avg_content_l1_self = 0.0         # L1 on prebias_mel (content-only) vs GT
     evaluated_pairs = 0
+
+    # ── Step 1 audit (Action Plan Step 1) ───────────────────────────────
+    # Cross-attention behaviour on the CROSS path (where source leakage lives):
+    #   attn_entropy  : head-avg attention entropy per content frame.
+    #                    low  → few speaker tokens dominate (sharp fusion)
+    #                    high → diffuse (uniform ≈ log(num_tokens))
+    #   attn_max      : mean per-frame max attention weight (sharpness proxy).
+    #   cos_fused_src : cos(fused, content_feats_pre_attn) — residual pass-through.
+    #                    high → cross_attn acts as identity-ish content relay.
+    #   cos_fused_tgt : cos(fused, pooled speaker_tokens) — speaker fusion strength.
+    #                    low  → speaker info barely enters fused features.
+    #   sim_content_only_self : ECAPA SPK_SIM of vocoded prebias_mel on the
+    #                            SELF path vs the source/own raw audio.
+    #                            == Self SPK_SIM with mel_speaker removed:
+    #                            isolates whether identity survives the decoder
+    #                            without the (near-dead) output delta.
+    avg_attn_entropy = 0.0
+    avg_attn_max = 0.0
+    avg_cos_fused_src = 0.0
+    avg_cos_fused_tgt = 0.0
+    avg_cos_attn_tgt = 0.0  # cos(attn_pre_film, spk_pooled) — CE probe readout
+    avg_sim_content_only_self = 0.0  # only accumulates when SPK_SIM available
+    n_attn_samples = 0  # only pairs with attention weights present
+    n_sim_content_only = 0
     
     with torch.no_grad():
         for i in tqdm(range(N), desc="Evaluating Pairs"):
@@ -257,6 +281,41 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                 shuffled_ref.unsqueeze(0), [content_seg],
                 return_bottleneck=True, return_aux=True
             )
+
+            # ── Step 1 audit: cross-attention behaviour on the CROSS path ──
+            # Computed under no_grad; purely diagnostic, no model changes.
+            if aux_cross is not None and "attention_weights" in aux_cross \
+                    and aux_cross["attention_weights"] is not None:
+                aw = aux_cross["attention_weights"]              # [1, T, K]
+                # entropy over speaker-token keys, averaged across content frames
+                ent_per_frame = -(aw * (aw + 1e-9).log()).sum(dim=-1)  # [1, T]
+                avg_attn_entropy += ent_per_frame.mean().item()
+                # sharpness: per-frame max attention probability, averaged
+                avg_attn_max += aw.max(dim=-1).values.mean().item()
+                n_attn_samples += 1
+
+            if aux_cross is not None \
+                    and "fused_features" in aux_cross \
+                    and "content_feats_pre_attn" in aux_cross \
+                    and "speaker_tokens" in aux_cross:
+                fused = aux_cross["fused_features"]               # [1, T, 96]
+                cf = aux_cross["content_feats_pre_attn"]          # [1, T, 96]
+                st = aux_cross["speaker_tokens"]                  # [1, K, 96]
+                pooled_spk = st.mean(dim=1, keepdim=True)         # [1, 1, 96]
+                pooled_spk_b = pooled_spk.expand(-1, fused.size(1), -1)  # [1, T, 96]
+                cos_fc = torch.nn.functional.cosine_similarity(fused, cf, dim=-1)         # [1, T]
+                cos_fs = torch.nn.functional.cosine_similarity(fused, pooled_spk_b, dim=-1)  # [1, T]
+                avg_cos_fused_src += cos_fc.mean().item()
+                avg_cos_fused_tgt += cos_fs.mean().item()
+            
+            # ── Step 1 audit: cos(attn_pre_film, spk_pooled) — CE probe readout ──
+            if aux_cross is not None and "attn_feats_pre_film" in aux_cross:
+                af = aux_cross["attn_feats_pre_film"]            # [1, T, 96]
+                st = aux_cross["speaker_tokens"]                  # [1, K, 96]
+                pooled_spk = st.mean(dim=1, keepdim=True)        # [1, 1, 96]
+                pooled_spk_b = pooled_spk.expand(-1, af.size(1), -1)
+                cos_afs = torch.nn.functional.cosine_similarity(af, pooled_spk_b, dim=-1)
+                avg_cos_attn_tgt += cos_afs.mean().item()
             
             # ── Vocoder & SPK_SIM ──
             if spk_encoder is not None:
@@ -283,6 +342,19 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                 # Self SPK SIM (Self-recon vs Content Raw)
                 sim_self = calculate_spk_sim(spk_encoder, wav_self, wav_content_raw, device)
                 avg_spk_sim_self += sim_self
+
+                # Step 1 audit: content-only SPK_SIM — vocoded prebias_mel
+                # on the SELF path (no speaker delta) vs the own raw audio.
+                # If this ≈ Self SPK_SIM, mel_speaker really is dead and the
+                # identity erosion is happening upstream of the output delta.
+                if aux_self is not None and "prebias_mel" in aux_self:
+                    pred_content_mel_self = aux_self["prebias_mel"].to(device)
+                    wav_content_only = vocoder(pred_content_mel_self).squeeze(0).cpu()
+                    sim_content_only = calculate_spk_sim(
+                        spk_encoder, wav_content_only, wav_content_raw, device
+                    )
+                    avg_sim_content_only_self += sim_content_only
+                    n_sim_content_only += 1
                 
                 # Model SPK SIM (Cross vs Target Raw)
                 sim_cross = calculate_spk_sim(spk_encoder, wav_cross, wav_target_raw, device)
@@ -345,6 +417,24 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_mel_speaker_mag /= evaluated_pairs
     avg_mel_speaker_rms_ratio /= evaluated_pairs
     avg_content_l1_self /= evaluated_pairs
+
+    # Step 1 audit averages (guard against zero denominators)
+    if n_attn_samples > 0:
+        avg_attn_entropy /= n_attn_samples
+        avg_attn_max /= n_attn_samples
+    else:
+        avg_attn_entropy = 0.0
+        avg_attn_max = 0.0
+    if evaluated_pairs > 0:
+        avg_cos_fused_src /= evaluated_pairs
+        avg_cos_fused_tgt /= evaluated_pairs
+    else:
+        avg_cos_fused_src = 0.0
+        avg_cos_fused_tgt = 0.0
+    if n_sim_content_only > 0:
+        avg_sim_content_only_self /= n_sim_content_only
+    else:
+        avg_sim_content_only_self = 0.0
     
     print("\n" + "="*60)
     print("📊 EVALUATION SCOREBOARD")
@@ -367,6 +457,33 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
             print(f"  mel_speaker |mean|:       [not available]")
     else:
         print("  SPK_SIM:                   [Skipped - SpeechBrain missing]")
+
+    # ── Step 1 audit scoreboard (Action Plan Step 1) ───────────────────
+    import math as _math
+    print("-"*60)
+    print("🔎 STEP 1 AUDIT — cross-attention fusion strength")
+    print("-"*60)
+    aux_aw = aux_cross.get("attention_weights") if aux_cross is not None else None
+    n_tokens = int(aux_aw.shape[-1]) if aux_aw is not None else 0
+    print(f"  Attn Entropy (cross):     {avg_attn_entropy:.4f}"
+          + (f"  (uniform ≈ {_math.log(n_tokens):.2f} over {n_tokens} tokens)"
+             if n_tokens > 0 else "  (n/a)"))
+    print(f"  Attn Max Weight (cross):  {avg_attn_max:.4f}  (1.0 = single-token; "
+          f"1/{n_tokens if n_tokens else '?'} = uniform)")
+    print(f"  cos(fused, content_pre):  {avg_cos_fused_src:.4f}  → high = residual pass-through")
+    print(f"  cos(fused, spk_pooled):   {avg_cos_fused_tgt:.4f}  → high = speaker fusion active")
+    if n_attn_samples > 0:
+        attn_avg = avg_cos_attn_tgt / n_attn_samples
+    else:
+        attn_avg = 0.0
+    print(f"  cos(attn_pre_film, spk_pooled):  {attn_avg:.4f}  → primary readout for CE probe success")
+    if spk_encoder is not None and n_sim_content_only > 0:
+        print("-"*60)
+        print("🔎 STEP 1 AUDIT — identity preservation without output delta")
+        print("-"*60)
+        print(f"  Content-Only SPK_SIM:     {avg_sim_content_only_self:.4f}  "
+              f"(vs Self SPK_SIM {avg_spk_sim_self:.4f} — Δ = "
+              f"{avg_spk_sim_self - avg_sim_content_only_self:.4f})")
     print("="*60)
     print(f"Sample audio saved to {output_dir}/")
     print("Listen to pair_0_pred_self.wav to verify basic intelligibility.")

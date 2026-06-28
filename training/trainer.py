@@ -371,7 +371,7 @@ class Trainer:
       # ==============================================================
     def _train_epoch(self) -> dict:
         self.model.train()
-        loss_accum = {"mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var_content": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0, "spk_film_acc": 0.0, "spk_film_cnt": 0}
+        loss_accum = {"mel_content": 0.0, "mel_final": 0.0, "stft": 0.0, "speaker": 0.0, "classifier": 0.0, "var_content": 0.0, "entropy": 0.0, "total": 0.0, "pooled_ce_acc": 0.0, "pooled_ce_cnt": 0, "spk_film_acc": 0.0, "spk_film_cnt": 0, "cross_attn_acc": 0.0, "cross_attn_cnt": 0}
         num_batches = 0
 
         # Ensure exact reproducibility for this epoch's shuffling and data augmentation (like random crops)
@@ -413,7 +413,8 @@ class Trainer:
             mel_classifier_weight = 0.0   # per-frame mel Conv1d CE remains disabled
             pooled_mel_ce_weight = getattr(self.train_cfg, 'pooled_mel_ce_weight', 0.0)
             spk_film_ce_weight = getattr(self.train_cfg, 'spk_film_ce_weight', 0.0)
-            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0 or spk_film_ce_weight > 0 or getattr(self.train_cfg, 'lambda_var', 0) > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None or self.model.spk_film_classifier is not None or getattr(self.train_cfg, 'lambda_var', 0) > 0)
+            cross_attn_ce_weight = getattr(self.train_cfg, 'cross_attn_ce_weight', 0.0)
+            need_bottleneck = (classifier_weight > 0 or pooled_mel_ce_weight > 0 or spk_film_ce_weight > 0 or cross_attn_ce_weight > 0 or getattr(self.train_cfg, 'lambda_var', 0) > 0) and (self.model.speaker_classifier is not None or self.model.pooled_mel_classifier is not None or self.model.spk_film_classifier is not None or self.model.cross_attn_classifier is not None or getattr(self.train_cfg, 'lambda_var', 0) > 0)
             
             pred_mel, _, aux = self.model(
                 ref_audio=ref_audio,
@@ -525,6 +526,22 @@ class Trainer:
                     loss_accum["spk_film_cnt"] += 1
                     if num_batches == 0:
                         print(f"[SPK_FILM_CLASSIFIER] weight={spk_film_ce_weight}, ce={ce_sf.item():.4f}, self_accuracy={acc_sf:.4f}")
+
+            # --- Cross-attn classifier CE (self-pair): supervises MHA value path ---
+            if cross_attn_ce_weight > 0 and need_bottleneck and aux is not None and "cross_attn_classifier_logits" in aux:
+                ca_logits = aux["cross_attn_classifier_logits"]  # [B, N, T]
+                T_ca = ca_logits.size(-1)
+                target_expanded_ca = target_idx.unsqueeze(1).expand(-1, T_ca)
+                ce_ca = self.classifier_loss_fn(ca_logits, target_expanded_ca)
+                total = total + cross_attn_ce_weight * ce_ca
+                loss_accum["classifier"] += ce_ca.item()
+                with torch.no_grad():
+                    _, pred_ca = ca_logits.max(dim=1)
+                    acc_ca = (pred_ca == target_expanded_ca).float().mean().item()
+                    loss_accum["cross_attn_acc"] += acc_ca
+                    loss_accum["cross_attn_cnt"] += 1
+                    if num_batches == 0:
+                        print(f"[CROSS_ATTN_CE] weight={cross_attn_ce_weight}, ce={ce_ca.item():.4f}, self_accuracy={acc_ca:.4f}")
 
             # --- Mel-output classifier CE (self-pair): prevents mel_proj erasure ---
             if mel_classifier_weight > 0 and aux is not None and "mel_classifier_logits" in aux:
@@ -666,6 +683,20 @@ class Trainer:
                             loss_accum["pooled_ce_acc"] += acc_pooled_cross
                             loss_accum["pooled_ce_cnt"] += 1
                     
+                    # --- Cross-attn classifier CE on cross-pair ---
+                    if cross_attn_ce_weight > 0 and need_bottleneck and aux_cross is not None and "cross_attn_classifier_logits" in aux_cross:
+                        ca_logits_cross = aux_cross["cross_attn_classifier_logits"]  # [B, N, T]
+                        T_cac = ca_logits_cross.size(-1)
+                        target_ca_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_cac)
+                        ce_ca_cross = self.classifier_loss_fn(ca_logits_cross, target_ca_rolled)
+                        total = total + cross_attn_ce_weight * ce_ca_cross
+                        loss_accum["classifier"] += ce_ca_cross.item()
+                        with torch.no_grad():
+                            _, pred_ca_cross = ca_logits_cross.max(dim=1)
+                            acc_ca_cross = (pred_ca_cross == target_ca_rolled).float().mean().item()
+                            loss_accum["cross_attn_acc"] += acc_ca_cross
+                            loss_accum["cross_attn_cnt"] += 1
+
                     if num_batches == 0:
                         rolled_ids = [speaker_ids[(i+1) % B] for i in range(B)]
                         print(f"[CROSS-PAIR] prob={cross_pair_prob}, weight={cross_stats_weight}")
