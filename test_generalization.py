@@ -224,6 +224,9 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_cos_attn_tgt = 0.0  # cos(attn_pre_film, spk_pooled) — CE probe readout
     avg_sim_content_only_self = 0.0  # only accumulates when SPK_SIM available
     n_attn_samples = 0  # only pairs with attention weights present
+    # ── Decoder trace audit: cos(stage_pooled, spk_pooled) at each 96-dim stage ──
+    decoder_trace = {}  # name → accumulated cos sum
+    decoder_trace_counts = {}
     n_sim_content_only = 0
     
     with torch.no_grad():
@@ -316,7 +319,25 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                 pooled_spk_b = pooled_spk.expand(-1, af.size(1), -1)
                 cos_afs = torch.nn.functional.cosine_similarity(af, pooled_spk_b, dim=-1)
                 avg_cos_attn_tgt += cos_afs.mean().item()
-            
+
+            # ── Decoder trace: cos(stage_pooled, spk_pooled) at each 96-dim stage ──
+            if aux_cross is not None and "speaker_tokens" in aux_cross:
+                sp = aux_cross["speaker_tokens"].mean(dim=1).squeeze(0)  # [96]
+                stages = {}
+                if "resampled_features" in aux_cross:
+                    stages["resampled"] = aux_cross["resampled_features"].squeeze(0).mean(dim=0)
+                if "post_adapter" in aux_cross:
+                    stages["post_adapter"] = aux_cross["post_adapter"].squeeze(0).mean(dim=1)
+                if aux_cross.get("decoder_intermediates"):
+                    for i, feat in enumerate(aux_cross["decoder_intermediates"]):
+                        stages[f"block{i}"] = feat.squeeze(0).mean(dim=1)  # [B,C,T]→[C]→pool
+                for name, pooled in stages.items():
+                    if pooled.shape[0] == sp.shape[0]:  # same dim for cos
+                        cos_val = torch.nn.functional.cosine_similarity(pooled.unsqueeze(0), sp.unsqueeze(0)).item()
+                        decoder_trace.setdefault(name, 0.0)
+                        decoder_trace[name] += cos_val
+                        decoder_trace_counts[name] = decoder_trace_counts.get(name, 0) + 1
+
             # ── Vocoder & SPK_SIM ──
             if spk_encoder is not None:
                 # Target Speaker Ceiling (GT Mel of speaker reference -> Vocoded)
@@ -477,6 +498,13 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     else:
         attn_avg = 0.0
     print(f"  cos(attn_pre_film, spk_pooled):  {attn_avg:.4f}  → primary readout for CE probe success")
+    # ── Decoder trace print ──
+    if decoder_trace:
+        print("  ── DECODER TRACE: cos(stage_pooled, spk_pooled) ──")
+        for name in ["resampled", "post_adapter", "block0", "block1", "block2", "block3"]:
+            if name in decoder_trace:
+                val = decoder_trace[name] / max(decoder_trace_counts.get(name, 1), 1)
+                print(f"    {name:14s}: {val:+.4f}")
     if spk_encoder is not None and n_sim_content_only > 0:
         print("-"*60)
         print("🔎 STEP 1 AUDIT — identity preservation without output delta")

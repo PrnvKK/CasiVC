@@ -523,9 +523,19 @@ class MobileNetDecoder(nn.Module):
         upsample_stages = config.mobilenet_upsample_stages  # NEW
         
         # Adapter (no upsampling here)
-        self.adapter = nn.Sequential(
-            nn.Conv1d(in_channels, channel_progression[0], kernel_size=1, bias=True),
-        )
+        # T1 (adapter identity-freeze test): adapter is the only square 96×96
+        # unconstrained rotation in the decoder; L1 projects out speaker here
+        # (post_adapter cos +0.072→+0.005). Freeze at identity to test whether
+        # blocks 0-3 crush speaker uniformly (FAIL) or cannot (PASS).
+        # in_channels == channel_progression[0] == 96 → exact identity, no shape
+        # change; state-dict keys unchanged; -9312 trainable params.
+        _adapter_conv = nn.Conv1d(in_channels, channel_progression[0], kernel_size=1, bias=True)
+        with torch.no_grad():
+            nn.init.eye_(_adapter_conv.weight.squeeze(-1))  # [96, 96, 1] → [96, 96] storage-shared
+            nn.init.zeros_(_adapter_conv.bias)
+        _adapter_conv.weight.requires_grad_(False)
+        _adapter_conv.bias.requires_grad_(False)
+        self.adapter = nn.Sequential(_adapter_conv)
         
         # Build blocks with integrated upsampling
         blocks: List[nn.Module] = []
@@ -728,6 +738,7 @@ class MobileNetDecoder(nn.Module):
         
         # Adapter
         x = self.adapter(x)
+        self._cached_post_adapter = x  # [B, 96, T] — decoder trace audit point
         self._check(x, "adapter")
 
         # Adapter-entry speaker FiLM: inject speaker identity before
