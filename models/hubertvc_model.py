@@ -477,7 +477,14 @@ class HubertVCModel(nn.Module):
               "fused_features": fused_features,           # [B, T, 96] post cross_attn
               "attention_weights": attention_weights,     # [B, T, num_tokens] or None
               "attn_feats_pre_film": self.cross_attn._cached_attended_features,  # [B, T, 96] pre-additive MHA output
+              "resampled_features": resampled_features,                              # [B, T, 96] post TemporalResampler
           }
+
+        # Decoder trace audit: expose post-adapter + block intermediates
+        if return_bottleneck and hasattr(self.decoder, '_cached_post_adapter'):
+            aux["post_adapter"] = self.decoder._cached_post_adapter  # [B, 96, T]
+        if return_bottleneck:
+            aux["decoder_intermediates"] = intermediate  # list of 4 [B, C, T]
 
         # Classifier head: per-frame speaker ID logits from decoder bottleneck
         if return_bottleneck and self.speaker_classifier is not None:
