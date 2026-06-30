@@ -420,13 +420,14 @@ class VCGeneratorLoss(nn.Module):
             try:
                 T_common = min(pred_mel.size(-1), gt_mel.size(-1))
                 g_align = gt_mel[:, :, :T_common]
-                
-                # Path 3: L1 on final output (trains SpeakerDeltaProj via mel_speaker,
-                # since variance_mel is detached in the decoder forward pass)
+
+                # Path 3: reduced-weight L1 on pred_mel — enough to bound SpeakerDeltaProj
+                # magnitude, not enough to crush direction learned by CE.
+                # α=0.1 → effective weight 4.5 (~2:1 L1:CE on delta path).
                 l_mel_final = self.mel_loss(pred_mel[:, :, :T_common], g_align, lengths=gt_lengths)
-                outs["mel_final"] = (self.cfg.lambda_mel * 0.5) * l_mel_final
-                
-                # Path 1: L1 on content_mel / prebias_mel (trains mel_proj_content + upstream)
+                outs["mel_final"] = (self.cfg.lambda_mel * 0.1) * l_mel_final
+
+                # Path 1: full reconstruction weight on content_mel
                 if content_mel is not None:
                     T_common_c = min(content_mel.size(-1), gt_mel.size(-1))
                     l_mel_content = self.mel_loss(
@@ -434,9 +435,9 @@ class VCGeneratorLoss(nn.Module):
                         gt_mel[:, :, :T_common_c],
                         lengths=gt_lengths
                     )
-                    outs["mel_content"] = (self.cfg.lambda_mel * 0.5) * l_mel_content
+                    outs["mel_content"] = self.cfg.lambda_mel * l_mel_content   # full weight (was ×0.5)
                 else:
-                    # Fallback: if content_mel not provided, use full weight on final only
+                    # Safety fallback: if content_mel not provided, use full weight on final only
                     outs["mel_final"] = self.cfg.lambda_mel * l_mel_final
             except Exception as exc:
                 raise RuntimeError(f"Mel loss failed: {exc}") from exc
