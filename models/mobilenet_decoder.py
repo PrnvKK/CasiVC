@@ -444,7 +444,6 @@ class SpeakerDeltaProj(nn.Module):
         self.speaker_dim = speaker_dim
         self.n_mel_bands = n_mel_bands
 
-        # Concatenated input: pooled x (96) + pooled speaker (96) = 192
         self.mlp = nn.Sequential(
             nn.Linear(feature_dim + speaker_dim, feature_dim),
             nn.LeakyReLU(0.2),
@@ -457,47 +456,56 @@ class SpeakerDeltaProj(nn.Module):
                     nn.init.xavier_uniform_(m.weight, gain=mlp_gain)
                     nn.init.zeros_(m.bias)
 
-        # Learnable delta_scale: softplus reparam, init modest.
-        # raw_delta_scale=0.3 → softplus(0.3)≈0.85 → scale≈0.95 (was 0.79).
-        # 20% more delta authority; training grows further if speaker modulation reduces L1.
         self.raw_delta_scale = nn.Parameter(torch.tensor(0.3))
 
         self._verbose = True
 
-    def forward(self, x: torch.Tensor, speaker_feats: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, speaker_feats: torch.Tensor,
+                content_speaker_feats: torch.Tensor | None = None) -> tuple:
         """
         Args:
-            x:              [B, 96, T] decoder features (post-SpeakerFiLM)
-            speaker_feats:  [B, num_tokens, 96] speaker tokens
+            x:                      [B, 96, T] decoder features (detached in caller)
+            speaker_feats:          [B, num_tokens, 96] target speaker tokens
+            content_speaker_feats:  [B, num_tokens, 96] content speaker tokens (None → gate=1)
         Returns:
-            per-band speaker-conditioned delta: [B, 80, T]
+            (delta, gate, cos_value) — delta [B, 80, T], gate [B], cos_value [B]
         """
         B, C, T = x.shape
 
-        # Pool speaker tokens: mean over token dim → [B, 96]
         spk_pooled = speaker_feats.mean(dim=1)  # [B, 96]
 
-        # Per-frame: pool x features and concatenate with speaker
-        # x is [B, 96, T]; pool over T for global context, but also
-        # keep per-frame structure by processing each frame.
-        # Efficient approach: broadcast speaker to all frames.
+        # ── G2 gate: cos(target_pooled, content_pooled) → mute delta for self pairs ──
+        if content_speaker_feats is not None:
+            content_pooled = content_speaker_feats.mean(dim=1)  # [B, 96]
+            cos_value = F.cosine_similarity(spk_pooled, content_pooled, dim=-1)  # [B]
+            gate = torch.clamp(1.0 - cos_value, 0.0, 1.0).detach()  # S21-LIVE: detach required
+        else:
+            gate = torch.ones(B, device=x.device, dtype=x.dtype)
+            cos_value = torch.zeros_like(gate)
+
+        # S21-LIVE: gate is detached, x is detached from caller — no gradient bridges
+        x_gated = x * gate[:, None, None]
+
         spk_expanded = spk_pooled.unsqueeze(-1).expand(B, self.speaker_dim, T)  # [B, 96, T]
-        combined = torch.cat([x, spk_expanded], dim=1)  # [B, 192, T]
+        combined = torch.cat([x_gated, spk_expanded], dim=1)  # [B, 192, T]
         combined = combined.permute(0, 2, 1)  # [B, T, 192]
 
-        delta = self.mlp(combined)  # [B, T, 80]
-        delta = delta.permute(0, 2, 1)  # [B, 80, T]
+        delta_raw = self.mlp(combined)  # [B, T, 80]
+        delta_raw = delta_raw.permute(0, 2, 1)  # [B, 80, T]
 
-        # Learnable scale
-        delta_scale = F.softplus(self.raw_delta_scale) + 0.1  # always > 0.1
-        delta = delta * delta_scale
+        delta_scale = F.softplus(self.raw_delta_scale) + 0.1
+        delta = delta_raw * delta_scale
+
+        # S21-LIVE: output gate — detached scalar, no gradient to cos pipeline
+        delta = delta * gate[:, None, None]
 
         if self._verbose:
             print(f"[speaker_delta_proj] delta_scale: {delta_scale.item():.4f}")
             print(f"[speaker_delta_proj] delta: mean={delta.mean():.4f}, std={delta.std():.4f}, "
                   f"min={delta.min():.4f}, max={delta.max():.4f}")
+            print(f"[speaker_delta_proj] gate: mean={gate.mean():.4f}, cos: mean={cos_value.mean():.4f}")
 
-        return delta
+        return delta, gate, cos_value
 
 
 # --------------------------------------------------------------------------- #
@@ -717,7 +725,7 @@ class MobileNetDecoder(nn.Module):
                 print(f"✅ {tag:16s}  mean={x.mean():7.4f}  std={x.std():7.4f}")
 
     
-    def forward(self, fused: torch.Tensor, return_intermediate: bool = False, speaker_feats: torch.Tensor | None = None) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
+    def forward(self, fused: torch.Tensor, return_intermediate: bool = False, speaker_feats: torch.Tensor | None = None, content_speaker_feats: torch.Tensor | None = None) -> Tuple[torch.Tensor, List[torch.Tensor]] | torch.Tensor:
 
         # Validate input
         if fused.ndim != 3:
@@ -802,12 +810,15 @@ class MobileNetDecoder(nn.Module):
 
         if speaker_feats is not None:
             # Per-frame speaker delta from decoder features (detached) + speaker tokens.
-            # x.detach(): CE gradient stops at SpeakerDeltaProj.mlp, never reaches decoder.
-            # Natural per-frame energy variation (low-energy silence → small deltas)
-            # replaces the removed energy_gate_proj — no learned gate for L1 to exploit.
-            mel_speaker = self.speaker_delta_proj(x.detach(), speaker_feats)  # [B, 80, T]
+            # S21-LIVE: x.detach() — blocks CE gradient from reaching decoder blocks.
+            # G2 gate inside SpeakerDeltaProj is detached — no bridge to mel_encoder projection.
+            mel_speaker, self._last_gate, self._last_cos = self.speaker_delta_proj(
+                x.detach(), speaker_feats, content_speaker_feats
+            )
         else:
             mel_speaker = torch.zeros_like(content_mel)
+            self._last_gate = None
+            self._last_cos = None
 
         # ── Path 1: L1 target — raw mel, pre-scale ────────────────────
         # L1 trains mel_proj_content directly. out_scale NOT in L1 gradient path.
