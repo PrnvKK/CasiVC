@@ -424,7 +424,8 @@ class Trainer:
                 return_aux=need_bottleneck,
                 return_bottleneck=need_bottleneck,
                 precomputed_speaker_feats=batch.get("speaker_feats"),
-                precomputed_content_feats=batch.get("content_feats")
+                precomputed_content_feats=batch.get("content_feats"),
+                precomputed_content_speaker_feats=batch.get("speaker_feats")  # S21: same raw ECAPA as target → self gate≈0
             )
 
             # 🔍 TEMPORAL ALIGNMENT CHECK (print once)
@@ -613,7 +614,8 @@ class Trainer:
                         return_aux=need_bottleneck,
                         return_bottleneck=need_bottleneck,
                         precomputed_speaker_feats=rolled_speaker_feats,
-                        precomputed_content_feats=batch.get("content_feats")
+                        precomputed_content_feats=batch.get("content_feats"),
+                        precomputed_content_speaker_feats=batch.get("speaker_feats")  # S21: original (unrolled) raw ECAPA as content speaker
                     )
                     pred_cross = pred_cross.to(torch.float32)
                     
@@ -630,13 +632,18 @@ class Trainer:
                     cross_loss = cross_loss_tensor * cross_stats_weight
                     total = total + cross_loss
                     
-                    # --- Classifier CE on cross-pair (target = rolled speaker) ---
+                    # --- Classifier CE on cross-pair (target = rolled speaker, masked by cross_mask) ---
+                    mask_f = cross_mask.float()
+                    valid_count = mask_f.sum().clamp(min=1)
+
                     if need_bottleneck and aux_cross is not None and "classifier_logits" in aux_cross:
                         logits_cross = aux_cross["classifier_logits"]  # [B, N, T]
                         target_idx_rolled = torch.roll(batch["target_speaker_idx"], shifts=1, dims=0).to(self.device)
                         T_cross = logits_cross.size(-1)
                         target_cross_expanded = target_idx_rolled.unsqueeze(1).expand(-1, T_cross)
-                        ce_loss_cross = self.classifier_loss_fn(logits_cross, target_cross_expanded)
+                        ce_raw = F.cross_entropy(logits_cross, target_cross_expanded, reduction='none')  # [B, T]
+                        ce_per_item = ce_raw.mean(dim=-1)  # [B]
+                        ce_loss_cross = (ce_per_item * mask_f).sum() / valid_count
                         total = total + classifier_weight * ce_loss_cross
 
                     # --- Block3 classifier CE on cross-pair ---
@@ -644,7 +651,9 @@ class Trainer:
                         b3_logits_cross = aux_cross["block3_classifier_logits"]  # [B, N, T]
                         T_b3c = b3_logits_cross.size(-1)
                         target_b3_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_b3c)
-                        ce_b3_cross = self.classifier_loss_fn(b3_logits_cross, target_b3_rolled)
+                        ce_b3_raw = F.cross_entropy(b3_logits_cross, target_b3_rolled, reduction='none')  # [B, T]
+                        ce_b3_per_item = ce_b3_raw.mean(dim=-1)  # [B]
+                        ce_b3_cross = (ce_b3_per_item * mask_f).sum() / valid_count
                         total = total + classifier_weight * ce_b3_cross
                         loss_accum["classifier"] += ce_b3_cross.item()
 
@@ -654,7 +663,9 @@ class Trainer:
                         sf_logits_cross = aux_cross["spk_film_classifier_logits"]  # [B, N, T]
                         T_sfc = sf_logits_cross.size(-1)
                         target_sf_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_sfc)
-                        ce_sf_cross = self.classifier_loss_fn(sf_logits_cross, target_sf_rolled)
+                        ce_sf_raw = F.cross_entropy(sf_logits_cross, target_sf_rolled, reduction='none')  # [B, T]
+                        ce_sf_per_item = ce_sf_raw.mean(dim=-1)  # [B]
+                        ce_sf_cross = (ce_sf_per_item * mask_f).sum() / valid_count
                         total = total + spk_film_ce_weight * ce_sf_cross
                         loss_accum["classifier"] += ce_sf_cross.item()
                         with torch.no_grad():
@@ -668,13 +679,16 @@ class Trainer:
                         mel_logits_cross = aux_cross["mel_classifier_logits"]  # [B, N, T]
                         T_melc = mel_logits_cross.size(-1)
                         target_mel_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_melc)
-                        ce_mel_cross = self.classifier_loss_fn(mel_logits_cross, target_mel_rolled)
+                        ce_mel_raw = F.cross_entropy(mel_logits_cross, target_mel_rolled, reduction='none')  # [B, T]
+                        ce_mel_per_item = ce_mel_raw.mean(dim=-1)  # [B]
+                        ce_mel_cross = (ce_mel_per_item * mask_f).sum() / valid_count
                         total = total + mel_classifier_weight * ce_mel_cross
 
                     # --- Pooled mel-bias CE on cross-pair (gated) ---
                     if pooled_mel_ce_weight > 0 and aux_cross is not None and "pooled_mel_logits" in aux_cross:
                         pooled_logits_cross = aux_cross["pooled_mel_logits"]  # [B, N]
-                        ce_pooled_cross = F.cross_entropy(pooled_logits_cross, target_idx_rolled)
+                        ce_pooled_raw = F.cross_entropy(pooled_logits_cross, target_idx_rolled, reduction='none')  # [B]
+                        ce_pooled_cross = (ce_pooled_raw * mask_f).sum() / valid_count
                         total = total + pooled_mel_ce_weight * ce_pooled_cross
                         loss_accum["classifier"] += ce_pooled_cross.item()
                         with torch.no_grad():
@@ -688,7 +702,9 @@ class Trainer:
                         ca_logits_cross = aux_cross["cross_attn_classifier_logits"]  # [B, N, T]
                         T_cac = ca_logits_cross.size(-1)
                         target_ca_rolled = target_idx_rolled.unsqueeze(1).expand(-1, T_cac)
-                        ce_ca_cross = self.classifier_loss_fn(ca_logits_cross, target_ca_rolled)
+                        ce_ca_raw = F.cross_entropy(ca_logits_cross, target_ca_rolled, reduction='none')  # [B, T]
+                        ce_ca_per_item = ce_ca_raw.mean(dim=-1)  # [B]
+                        ce_ca_cross = (ce_ca_per_item * mask_f).sum() / valid_count
                         total = total + cross_attn_ce_weight * ce_ca_cross
                         loss_accum["classifier"] += ce_ca_cross.item()
                         with torch.no_grad():

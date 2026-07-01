@@ -276,6 +276,7 @@ class HubertVCModel(nn.Module):
     return_bottleneck: bool = False,
     precomputed_speaker_feats: Optional[torch.Tensor] = None,
     precomputed_content_feats: Optional[torch.Tensor] = None,
+    precomputed_content_speaker_feats: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor] | None, Dict[str, Any] | None]:
         """
         Parameters
@@ -286,8 +287,10 @@ class HubertVCModel(nn.Module):
         gt_mels       : optional ground-truth mels for reconstruction loss
         compute_losses: if True, returns {"mel": …}
         return_aux    : if True, returns dict with intermediate tensors
-        precomputed_speaker_feats: Optional precomputed ECAPA features [B, 64, 96]
+        precomputed_speaker_feats: Optional precomputed ECAPA features [B, 192]
         precomputed_content_feats: Optional precomputed HuBERT features [B, T, 96]
+        precomputed_content_speaker_feats: Optional raw ECAPA of content audio [B, 192]
+            (projection+token_norm applied internally for G2 gate; caller hands raw)
 
         Returns
         -------
@@ -326,6 +329,15 @@ class HubertVCModel(nn.Module):
             if self._verbose:
                 print(f"[ECAPA-TDNN] Speaker feats shape: {speaker_feats.shape}")
                 print(f"Speaker feats (96D): μ={speaker_feats.mean():.4f}, σ={speaker_feats.std():.4f}")
+
+        # 1b. Content speaker features (raw ECAPA B,192) for G2 gate
+        if precomputed_content_speaker_feats is not None:
+            raw_content_spk = precomputed_content_speaker_feats  # [B, 192]
+            projected_cs = self.mel_encoder.projection(raw_content_spk)  # [B, 768]
+            projected_cs = projected_cs.view(B, self.mel_encoder.num_speaker_tokens, self.mel_encoder.output_dim)  # [B, 8, 96]
+            content_speaker_tokens = self.mel_encoder.token_norm(projected_cs)  # [B, 8, 96]
+        else:
+            content_speaker_tokens = None
 
         # --------------------------------------------------------- #
         # 2. HuBERT content features                                #
@@ -402,9 +414,9 @@ class HubertVCModel(nn.Module):
         # Force FP32 for decoder to avoid NaN gradients
         with torch.amp.autocast(device_type=device.type, enabled=False):
             if return_bottleneck:
-                pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True, speaker_feats=speaker_feats)
+                pred_mel, intermediate = self.decoder(resampled_features.float(), return_intermediate=True, speaker_feats=speaker_feats, content_speaker_feats=content_speaker_tokens)
             else:
-                pred_mel = self.decoder(resampled_features.float(), speaker_feats=speaker_feats)  # [B, 80, T_hubert]
+                pred_mel = self.decoder(resampled_features.float(), speaker_feats=speaker_feats, content_speaker_feats=content_speaker_tokens)  # [B, 80, T_hubert]
 
             # Upsample output from HuBERT rate → mel rate (deterministic, clean interpolation)
             if gt_mels is not None:
@@ -479,6 +491,11 @@ class HubertVCModel(nn.Module):
               "attn_feats_pre_film": self.cross_attn._cached_attended_features,  # [B, T, 96] pre-additive MHA output
               "resampled_features": resampled_features,                              # [B, T, 96] post TemporalResampler
           }
+            # S21: expose G2 gate and cos from SpeakerDeltaProj via decoder attributes
+            if hasattr(self.decoder, '_last_gate') and self.decoder._last_gate is not None:
+                aux["speaker_delta_gate"] = self.decoder._last_gate.detach()
+            if hasattr(self.decoder, '_last_cos') and self.decoder._last_cos is not None:
+                aux["speaker_delta_cos"] = self.decoder._last_cos.detach()
 
         # Decoder trace audit: expose post-adapter + block intermediates
         if return_bottleneck and hasattr(self.decoder, '_cached_post_adapter'):

@@ -200,6 +200,9 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_mel_speaker_mag = 0.0
     avg_mel_speaker_rms_ratio = 0.0  # RMS(mel_speaker) / RMS(content_mel)
     avg_content_l1_self = 0.0         # L1 on prebias_mel (content-only) vs GT
+    avg_speaker_delta_gate = 0.0       # S21: G2 gate on cross path (should be ≥0.3)
+    avg_speaker_delta_cos = 0.0         # S21: cos between content and target pooled tokens
+    n_gate_samples = 0
     evaluated_pairs = 0
 
     # ── Step 1 audit (Action Plan Step 1) ───────────────────────────────
@@ -248,10 +251,16 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
             
             gt_mel_content = extract_mel_spectrogram(content_seg, sample_rate=audio_cfg.sample_rate).to(device)
             
+            # ── S21: raw content speaker ECAPA (B,192) for G2 gate ──
+            content_spk_raw = model.mel_encoder.extract_speaker_features(
+                content_seg.unsqueeze(0), apply_projection=False
+            )[0]  # [192]
+
             # ── 1. Self Reconstruction (Content A, Voice A) ──
             pred_mel_self, _, aux_self = model(
                 content_ref.unsqueeze(0), [content_seg],
-                return_bottleneck=True, return_aux=True
+                return_bottleneck=True, return_aux=True,
+                precomputed_content_speaker_feats=content_spk_raw.unsqueeze(0)  # [1, 192]
             )
             pred_mel_self_sq = pred_mel_self.squeeze(0)  # [80, T] for L1
             
@@ -265,7 +274,8 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
             # ── 2. Cross Conversion (Content A, Voice B) ──
             pred_mel_cross, _, aux_cross = model(
                 spk_ref.unsqueeze(0), [content_seg],
-                return_bottleneck=True, return_aux=True
+                return_bottleneck=True, return_aux=True,
+                precomputed_content_speaker_feats=content_spk_raw.unsqueeze(0)  # [1, 192]
             )
             
             # mel_speaker magnitude (measure whether speaker delta branch is active)
@@ -279,10 +289,17 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                     rms_content = content_mel.pow(2).mean().sqrt().item()
                     avg_mel_speaker_rms_ratio += rms_spk / (rms_content + 1e-8)
             
+            # S21: collect G2 gate/cos from cross path
+            if aux_cross is not None and "speaker_delta_gate" in aux_cross:
+                avg_speaker_delta_gate += aux_cross["speaker_delta_gate"].mean().item()
+                avg_speaker_delta_cos += aux_cross["speaker_delta_cos"].mean().item()
+                n_gate_samples += 1
+            
             # ── 3. Shuffled Reference (Content A, Voice C) ──
             pred_mel_shuffled, _, _ = model(
                 shuffled_ref.unsqueeze(0), [content_seg],
-                return_bottleneck=True, return_aux=True
+                return_bottleneck=True, return_aux=True,
+                precomputed_content_speaker_feats=content_spk_raw.unsqueeze(0)  # [1, 192]
             )
 
             # ── Step 1 audit: cross-attention behaviour on the CROSS path ──
@@ -439,6 +456,10 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_mel_speaker_rms_ratio /= evaluated_pairs
     avg_content_l1_self /= evaluated_pairs
 
+    if n_gate_samples > 0:
+        avg_speaker_delta_gate /= n_gate_samples
+        avg_speaker_delta_cos /= n_gate_samples
+
     # Step 1 audit averages (guard against zero denominators)
     if n_attn_samples > 0:
         avg_attn_entropy /= n_attn_samples
@@ -476,6 +497,12 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
             print(f"  RMS(mel_speaker)/RMS(content): {avg_mel_speaker_rms_ratio:.4f} (<0.05=negligible, >0.15=dominant)")
         else:
             print(f"  mel_speaker |mean|:       [not available]")
+        print(f"  ── S21 G2 Gate Diagnostics ──")
+        if n_gate_samples > 0:
+            print(f"  speaker_delta_gate (cross): {avg_speaker_delta_gate:.4f} (target ≥ 0.3)")
+            print(f"  speaker_delta_cos (cross):  {avg_speaker_delta_cos:.4f} (target ≤ 0.7)")
+        else:
+            print(f"  speaker_delta_gate/cos:     [not available — check aux dict availability]")
     else:
         print("  SPK_SIM:                   [Skipped - SpeechBrain missing]")
 
