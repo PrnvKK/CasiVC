@@ -4,6 +4,8 @@ import torch
 import torchaudio
 import argparse
 import random
+import soundfile as sf
+import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
@@ -156,13 +158,23 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     # to the disturbance. Compare audio and metrics against the normal
     # run to determine if the buzz is speaker-side or content-side.
     if zero_speaker_delta:
-        def _zeroed_delta(x, speaker_feats):
+        # S21 SpeakerDeltaProj.forward signature is (x, speaker_feats,
+        # content_speaker_feats=None) -> (delta, gate, cos_value). The patch
+        # must match so the 3-tuple unpack at the call site doesn't crash.
+        # Delta force-zeroed; gate/cos returned as ones/zeros (delta is gone,
+        # so gate diagnostics are moot in this mode).
+        def _zeroed_delta(x, speaker_feats, content_speaker_feats=None):
             B, C, T = x.shape
-            return torch.zeros(B, 80, T, device=x.device, dtype=x.dtype)
+            delta = torch.zeros(B, 80, T, device=x.device, dtype=x.dtype)
+            gate = torch.ones(B, device=x.device, dtype=x.dtype)
+            cos_value = torch.zeros(B, device=x.device, dtype=x.dtype)
+            return delta, gate, cos_value
         model.decoder.speaker_delta_proj.forward = _zeroed_delta
         print("\n" + "="*60)
-        print("⚠️  DIAGNOSTIC MODE: speaker_delta_proj ZEROED")
+        print("⚠️  DIAGNOSTIC MODE: speaker_delta_proj ZEROED (global, all paths)")
         print("   Measuring content path through full forward (no output delta).")
+        print("   NOTE: in-run Cross Content-Only SPK_SIM (prebias_mel) supersedes")
+        print("   this for the S22 decision — this flag is a heavier audio-inspection hammer.")
         print("="*60)
 
     # ── Manifest Setup ────────────────────────────
@@ -226,11 +238,13 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     avg_cos_fused_tgt = 0.0
     avg_cos_attn_tgt = 0.0  # cos(attn_pre_film, spk_pooled) — CE probe readout
     avg_sim_content_only_self = 0.0  # only accumulates when SPK_SIM available
+    avg_sim_content_only_cross = 0.0  # S22 check: cross content-only (delta removed)
     n_attn_samples = 0  # only pairs with attention weights present
     # ── Decoder trace audit: cos(stage_pooled, spk_pooled) at each 96-dim stage ──
     decoder_trace = {}  # name → accumulated cos sum
     decoder_trace_counts = {}
     n_sim_content_only = 0
+    n_sim_content_only_cross = 0  # S22 check: cross content-only pairs
     
     with torch.no_grad():
         for i in tqdm(range(N), desc="Evaluating Pairs"):
@@ -346,8 +360,8 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                 if "post_adapter" in aux_cross:
                     stages["post_adapter"] = aux_cross["post_adapter"].squeeze(0).mean(dim=1)
                 if aux_cross.get("decoder_intermediates"):
-                    for i, feat in enumerate(aux_cross["decoder_intermediates"]):
-                        stages[f"block{i}"] = feat.squeeze(0).mean(dim=1)  # [B,C,T]→[C]→pool
+                    for j, feat in enumerate(aux_cross["decoder_intermediates"]):
+                        stages[f"block{j}"] = feat.squeeze(0).mean(dim=1)  # [B,C,T]→[C]→pool
                 for name, pooled in stages.items():
                     if pooled.shape[0] == sp.shape[0]:  # same dim for cos
                         cos_val = torch.nn.functional.cosine_similarity(pooled.unsqueeze(0), sp.unsqueeze(0)).item()
@@ -393,6 +407,20 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                     )
                     avg_sim_content_only_self += sim_content_only
                     n_sim_content_only += 1
+
+                # S22 check: Cross content-only SPK_SIM — vocoded prebias_mel on the
+                # CROSS path (content_mel with NO speaker delta) vs TARGET speaker raw.
+                # Δ from Cross SPK_SIM = speaker delta's contribution to cross identity.
+                #   Δ ≈ 0 → delta decorative at output → S22 (pre-adapter x) wrong lever.
+                #   Δ > 0 → delta load-bearing      → S22 (pre-adapter x) well-motivated.
+                if aux_cross is not None and "prebias_mel" in aux_cross:
+                    pred_content_mel_cross = aux_cross["prebias_mel"].to(device)
+                    wav_cross_content_only = vocoder(pred_content_mel_cross).squeeze(0).cpu()
+                    sim_content_only_cross = calculate_spk_sim(
+                        spk_encoder, wav_cross_content_only, wav_target_raw, device
+                    )
+                    avg_sim_content_only_cross += sim_content_only_cross
+                    n_sim_content_only_cross += 1
                 
                 # Model SPK SIM (Cross vs Target Raw)
                 sim_cross = calculate_spk_sim(spk_encoder, wav_cross, wav_target_raw, device)
@@ -418,26 +446,32 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
                 
             # Save first 5 pairs for manual listening
             if i < 5:
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_source_content.wav"), content_seg.cpu().unsqueeze(0), audio_cfg.sample_rate)
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_target_voice.wav"), spk_ref.cpu().unsqueeze(0), audio_cfg.sample_rate)
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_shuffled_voice.wav"), shuffled_ref.cpu().unsqueeze(0), audio_cfg.sample_rate)
-                
+                def _save_audio(filepath, tensor_1d, sr):
+                    data = tensor_1d.detach().cpu().float().numpy()
+                    sf.write(filepath, data, sr)
+                    if i == 0:
+                        print(f"  [SAVE] {filepath}  ({data.shape[0] / sr:.1f}s)")
+
+                _save_audio(os.path.join(output_dir, f"pair_{i}_source_content.wav"), content_seg, audio_cfg.sample_rate)
+                _save_audio(os.path.join(output_dir, f"pair_{i}_target_voice.wav"), spk_ref, audio_cfg.sample_rate)
+                _save_audio(os.path.join(output_dir, f"pair_{i}_shuffled_voice.wav"), shuffled_ref, audio_cfg.sample_rate)
+
                 wav_self_save = vocoder(pred_mel_self).squeeze(0).cpu()
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_self.wav"), wav_self_save, audio_cfg.sample_rate)
-                
+                _save_audio(os.path.join(output_dir, f"pair_{i}_pred_self.wav"), wav_self_save, audio_cfg.sample_rate)
+
                 # Three-way ablation: content-only path (prebias_mel, no speaker delta)
                 if aux_self is not None and "prebias_mel" in aux_self:
                     content_mel_self = aux_self["prebias_mel"]  # [1, 80, T] or [80, T]
                     if content_mel_self.dim() == 2:
                         content_mel_self = content_mel_self.unsqueeze(0)
                     wav_content = vocoder(content_mel_self.to(device)).squeeze(0).cpu()
-                    torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_content_only.wav"), wav_content, audio_cfg.sample_rate)
-                
+                    _save_audio(os.path.join(output_dir, f"pair_{i}_pred_content_only.wav"), wav_content, audio_cfg.sample_rate)
+
                 wav_cross_save = vocoder(pred_mel_cross).squeeze(0).cpu()
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_cross.wav"), wav_cross_save, audio_cfg.sample_rate)
-                
+                _save_audio(os.path.join(output_dir, f"pair_{i}_pred_cross.wav"), wav_cross_save, audio_cfg.sample_rate)
+
                 wav_shuf_save = vocoder(pred_mel_shuffled).squeeze(0).cpu()
-                torchaudio.save(os.path.join(output_dir, f"pair_{i}_pred_shuffled.wav"), wav_shuf_save, audio_cfg.sample_rate)
+                _save_audio(os.path.join(output_dir, f"pair_{i}_pred_shuffled.wav"), wav_shuf_save, audio_cfg.sample_rate)
 
             evaluated_pairs += 1
 
@@ -477,6 +511,10 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
         avg_sim_content_only_self /= n_sim_content_only
     else:
         avg_sim_content_only_self = 0.0
+    if n_sim_content_only_cross > 0:
+        avg_sim_content_only_cross /= n_sim_content_only_cross
+    else:
+        avg_sim_content_only_cross = 0.0
     
     print("\n" + "="*60)
     print("📊 EVALUATION SCOREBOARD")
@@ -488,6 +526,8 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
     if spk_encoder is not None:
         print(f"  Self SPK_SIM:             {avg_spk_sim_self:.4f} (Target > 0.70, upper ~0.92)")
         print(f"  Cross SPK_SIM:            {avg_spk_sim_cross:.4f} (Target > 0.35)")
+        if n_sim_content_only_cross > 0:
+            print(f"  Cross Content-Only SPK_SIM: {avg_sim_content_only_cross:.4f}  (delta Δ = {avg_spk_sim_cross - avg_sim_content_only_cross:.4f} — S22 decision)")
         print(f"  Vocoder Ceiling SIM:      {avg_spk_sim_ceiling:.4f} (Upper bound for vocoded audio)")
         print(f"  Shuffled→Shuffled SIM:    {avg_spk_sim_shuf_to_shuf:.4f}")
         print(f"  Shuffled→Target SIM:      {avg_spk_sim_shuf_to_target:.4f}")
@@ -539,10 +579,368 @@ def run_evaluation(checkpoint_path: str, output_dir: str, smoke_test: bool = Fal
         print(f"  Content-Only SPK_SIM:     {avg_sim_content_only_self:.4f}  "
               f"(vs Self SPK_SIM {avg_spk_sim_self:.4f} — Δ = "
               f"{avg_spk_sim_self - avg_sim_content_only_self:.4f})")
+    if spk_encoder is not None and n_sim_content_only_cross > 0:
+        print("-"*60)
+        print("🔎 S22 DECISION — cross identity with/without speaker delta")
+        print("-"*60)
+        print(f"  Cross Content-Only SPK_SIM: {avg_sim_content_only_cross:.4f}  "
+              f"(vs Cross SPK_SIM {avg_spk_sim_cross:.4f} — Δ = "
+              f"{avg_spk_sim_cross - avg_sim_content_only_cross:.4f})")
+        print(f"  → Δ = speaker delta's contribution to cross identity (decisive for S22):")
+        print(f"     Δ ≈ 0  → delta decorative at output → S22 (pre-adapter x) WRONG lever")
+        print(f"     Δ > 0  → delta load-bearing         → S22 (pre-adapter x) well-motivated")
     print("="*60)
     print(f"Sample audio saved to {output_dir}/")
     print("Listen to pair_0_pred_self.wav to verify basic intelligibility.")
     print("Compare pair_0_pred_content_only.wav vs pair_0_pred_self.wav to isolate noise source.")
+
+
+def run_delta_scale_sweep(checkpoint_path: str, output_dir: str, smoke_test: bool = False,
+                          s_values=None, num_pairs: int = 50):
+    """Eval-only sweep: scale SpeakerDeltaProj's output delta by s and measure
+    Cross/Self SPK_SIM. Decoder combines as variance_mel.detach() + mel_speaker
+    (mobilenet_decoder.py:865), so scaling the delta at the source yields
+    pred_mel = clamp(content_mel + out_bias + s*mel_speaker). No training, no
+    model code change — forward is patched per s and restored in finally.
+
+    Decision rule (best s by Cross SPK_SIM):
+      s~0    -> delta harmful; retire SpeakerDeltaProj, tune upstream alpha_bias/cross-attn
+      s<0    -> delta has speaker info but wrong sign/basis (flippable)
+      0<s<1  -> delta over-amplified; dial down (raw_delta_scale / CE weight)
+      s>1    -> delta needs more power -> S22 (richer x) or alpha-reduction viable
+    """
+    if s_values is None:
+        s_values = [-1.0, -0.5, 0.0, 0.25, 0.5, 1.0, 1.5]
+
+    print("=" * 70)
+    print("🎚️  DELTA SCALE SWEEP — SpeakerDeltaProj output scaling (eval-only)")
+    print("=" * 70)
+    print(f"s_values: {s_values}  | pairs: {num_pairs}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(output_dir, exist_ok=True)
+
+    audio_cfg = AudioConfig()
+    model_cfg = ModelConfig()
+    train_cfg = TrainingConfig()
+
+    # ── Load vocoder + SPK_SIM encoder + model (mirrors run_evaluation) ──
+    print("\n[1] Loading Vocoder & Metrics...")
+    vocoder = load_vocoder(None, device=str(device))
+    vocoder.eval()
+
+    spk_encoder = None
+    if SPEECHBRAIN_AVAILABLE:
+        try:
+            spk_encoder = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir="pretrained_models/spkrec-ecapa-voxceleb",
+                run_opts={"device": str(device)}
+            )
+            spk_encoder.eval()
+            print("✅ Loaded ECAPA-TDNN for SPK_SIM metric.")
+        except Exception as e:
+            print(f"⚠️ Failed to load ECAPA-TDNN: {e}")
+    if spk_encoder is None:
+        print("❌ SPK_SIM requires SpeechBrain ECAPA-TDNN. Aborting sweep.")
+        return
+
+    print(f"\n[2] Loading Model from {checkpoint_path}...")
+    if not os.path.exists(checkpoint_path):
+        print(f"❌ Checkpoint not found: {checkpoint_path}. Exiting.")
+        return
+    model = HubertVCModel(audio_cfg, model_cfg, train_cfg).to(device)
+    model.eval()
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = ckpt.get("model_state", ckpt)
+    model.load_state_dict(state_dict, strict=False)
+    print("✅ Model loaded successfully (Strict Mode Disabled).")
+
+    # Suppress per-call verbose prints (sweep makes hundreds of calls; keep output clean)
+    model._verbose = False
+    model.decoder._verbose = False
+    model.cross_attn._verbose = False
+    model.decoder.speaker_delta_proj._verbose = False
+
+    # ── Manifest ──
+    print("\n[3] Preparing Data...")
+    if smoke_test:
+        print("💨 SMOKE TEST MODE: Running 2 fixed utterances.")
+        manifest = [
+            "/content/LibriTTS/dev-clean/2428/83705/2428_83705_000000_000001.wav",
+            "/content/LibriTTS/dev-clean/1988/148538/1988_148538_000002_000000.wav"
+        ]
+    else:
+        manifest = build_or_load_manifest("/content/LibriTTS", num_utterances=num_pairs, seed=42)
+    valid_manifest = [p for p in manifest if os.path.exists(p)]
+    if not valid_manifest:
+        print("❌ No valid audio files found in manifest. Check your dataset paths.")
+        return
+    N = min(len(valid_manifest), num_pairs)
+    valid_manifest = valid_manifest[:N]
+    print(f"Using {N} pairs (content[i] -> target[(i+1)%N]).")
+
+    # ── Per-s accumulators ──
+    cross_sims = {s: 0.0 for s in s_values}
+    self_sims = {s: 0.0 for s in s_values}
+    self_l1s = {s: 0.0 for s in s_values}
+    counts = {s: 0 for s in s_values}
+
+    # Save the bound class-method forward; patch per s, restore in finally.
+    sdp = model.decoder.speaker_delta_proj
+    _orig_forward = sdp.forward
+
+    def _make_scaled(scalar, orig):
+        def _scaled(x, speaker_feats, content_speaker_feats=None):
+            delta, gate, cos = orig(x, speaker_feats, content_speaker_feats)
+            return delta * scalar, gate, cos  # real gate/cos preserved; only delta scaled
+        return _scaled
+
+    print(f"\n[4] Sweeping {len(s_values)} scale values x {N} pairs...")
+    try:
+        with torch.no_grad():
+            for i in tqdm(range(N), desc="Sweep pairs"):
+                content_path = valid_manifest[i]
+                spk_path = valid_manifest[(i + 1) % N]
+
+                content_audio = load_audio(content_path, sample_rate=audio_cfg.sample_rate).to(device)
+                spk_ref = load_audio(spk_path, sample_rate=audio_cfg.sample_rate).to(device)
+                content_seg = content_audio
+                content_ref = content_audio
+
+                gt_mel_content = extract_mel_spectrogram(content_seg, sample_rate=audio_cfg.sample_rate).to(device)
+
+                # Raw content speaker ECAPA (B,192) for the G2 gate
+                content_spk_raw = model.mel_encoder.extract_speaker_features(
+                    content_seg.unsqueeze(0), apply_projection=False
+                )[0]  # [192]
+
+                wav_content_raw = content_audio.cpu().unsqueeze(0)
+                wav_target_raw = spk_ref.cpu().unsqueeze(0)
+
+                for s in s_values:
+                    sdp.forward = _make_scaled(s, _orig_forward)
+
+                    # Cross conversion (Content A, Voice B) with delta scaled by s
+                    pred_mel_cross, _, _ = model(
+                        spk_ref.unsqueeze(0), [content_seg],
+                        return_bottleneck=True, return_aux=True,
+                        precomputed_content_speaker_feats=content_spk_raw.unsqueeze(0)
+                    )
+                    wav_cross = vocoder(pred_mel_cross).squeeze(0).cpu()
+                    cross_sims[s] += calculate_spk_sim(spk_encoder, wav_cross, wav_target_raw, device)
+
+                    # Self reconstruction (Content A, Voice A) — gate~0 => delta~0 => s-invariant
+                    pred_mel_self, _, _ = model(
+                        content_ref.unsqueeze(0), [content_seg],
+                        return_bottleneck=True, return_aux=True,
+                        precomputed_content_speaker_feats=content_spk_raw.unsqueeze(0)
+                    )
+                    wav_self = vocoder(pred_mel_self).squeeze(0).cpu()
+                    self_sims[s] += calculate_spk_sim(spk_encoder, wav_self, wav_content_raw, device)
+
+                    # Self L1 (reconstruction quality, should be ~flat across s)
+                    pred_sq = pred_mel_self.squeeze(0)
+                    min_len = min(pred_sq.size(-1), gt_mel_content.size(-1))
+                    self_l1s[s] += torch.nn.functional.l1_loss(
+                        pred_sq[:, :min_len], gt_mel_content[:, :min_len]
+                    ).item()
+                    counts[s] += 1
+    finally:
+        sdp.forward = _orig_forward  # restore original forward
+
+    # ── Average + report ──
+    rows = []
+    for s in s_values:
+        c = max(counts[s], 1)
+        rows.append((s, cross_sims[s] / c, self_sims[s] / c, self_l1s[s] / c))
+
+    best = max(rows, key=lambda r: r[1])  # best by Cross SPK_SIM
+    s0_cross = next((r[1] for r in rows if r[0] == 0.0), None)
+
+    print("\n" + "=" * 60)
+    print("📊 DELTA SCALE SWEEP RESULTS")
+    print("=" * 60)
+    print(f"{'s':>6} {'Cross SPK_SIM':>16} {'Self SPK_SIM':>16} {'Self L1':>10}")
+    print("-" * 52)
+    for s, cs, ss, l1 in rows:
+        marker = "  <- best cross" if s == best[0] else ""
+        print(f"{s:>6.2f} {cs:>16.4f} {ss:>16.4f} {l1:>10.4f}{marker}")
+    print("-" * 52)
+    print(f"Best s (cross) = {best[0]:.2f}  ->  Cross SPK_SIM = {best[1]:.4f}")
+    if s0_cross is not None:
+        print(f"s=0 Cross SPK_SIM = {s0_cross:.4f}  (prebias ablation was 0.1940; close = out_bias SPK_SIM-neutral, confirmed)")
+    print("\n→ Decision rule (best s by Cross SPK_SIM):")
+    print("   best s ~ 0    -> delta harmful; retire SpeakerDeltaProj, tune upstream alpha_bias/cross-attn")
+    print("   best s < 0    -> delta has speaker info but wrong sign/basis (flippable)")
+    print("   0 < best < 1  -> delta over-amplified; dial down (raw_delta_scale / CE weight)")
+    print("   best s > 1    -> delta needs more power -> S22 (richer x) or alpha-reduction viable")
+    print("=" * 60)
+
+
+def run_alpha_bias_sweep(checkpoint_path: str, output_dir: str, smoke_test: bool = False,
+                         k_values=None, num_pairs: int = 50):
+    """Eval-only sweep: scale the detached speaker-bias injection in cross-attention
+    (cross_attention.py:380, 487 — the alpha_bias * spk_bias term) by k and measure
+    Cross/Self SPK_SIM. The bias injection is the most direct knob on how much
+    target-speaker signal enters fused_features upstream. k=1.0 is the trained point
+    (should reproduce Cross SPK_SIM ~0.1816). No training; _bias_scale_k defaults to
+    1.0 so normal training/eval is byte-identical.
+
+    Decision rule (best k by Cross SPK_SIM):
+      Cross rises monotonically with k -> entry-limited; upstream injection is the lever
+      Cross flat / drops at high k     -> crush-limited; decoder crushes the extra (S19)
+      Cross peaks then declines        -> mild entry-limit + overshoot at high k
+    NOTE: scales only the additive bias injection, not the attention K/V fusion.
+    """
+    if k_values is None:
+        k_values = [0.0, 0.5, 1.0, 2.0, 4.0]
+
+    print("=" * 70)
+    print("🎚️  ALPHA_BIAS SCALE SWEEP — upstream speaker-bias injection (eval-only)")
+    print("=" * 70)
+    print(f"k_values: {k_values}  | pairs: {num_pairs}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(output_dir, exist_ok=True)
+
+    audio_cfg = AudioConfig()
+    model_cfg = ModelConfig()
+    train_cfg = TrainingConfig()
+
+    # ── Load vocoder + SPK_SIM encoder + model (mirrors run_evaluation) ──
+    print("\n[1] Loading Vocoder & Metrics...")
+    vocoder = load_vocoder(None, device=str(device))
+    vocoder.eval()
+
+    spk_encoder = None
+    if SPEECHBRAIN_AVAILABLE:
+        try:
+            spk_encoder = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir="pretrained_models/spkrec-ecapa-voxceleb",
+                run_opts={"device": str(device)}
+            )
+            spk_encoder.eval()
+            print("✅ Loaded ECAPA-TDNN for SPK_SIM metric.")
+        except Exception as e:
+            print(f"⚠️ Failed to load ECAPA-TDNN: {e}")
+    if spk_encoder is None:
+        print("❌ SPK_SIM requires SpeechBrain ECAPA-TDNN. Aborting sweep.")
+        return
+
+    print(f"\n[2] Loading Model from {checkpoint_path}...")
+    if not os.path.exists(checkpoint_path):
+        print(f"❌ Checkpoint not found: {checkpoint_path}. Exiting.")
+        return
+    model = HubertVCModel(audio_cfg, model_cfg, train_cfg).to(device)
+    model.eval()
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = ckpt.get("model_state", ckpt)
+    model.load_state_dict(state_dict, strict=False)
+    print("✅ Model loaded successfully (Strict Mode Disabled).")
+
+    # Suppress per-call verbose prints (sweep makes hundreds of calls)
+    model._verbose = False
+    model.decoder._verbose = False
+    model.cross_attn._verbose = False
+    model.decoder.speaker_delta_proj._verbose = False
+
+    # ── Manifest ──
+    print("\n[3] Preparing Data...")
+    if smoke_test:
+        print("💨 SMOKE TEST MODE: Running 2 fixed utterances.")
+        manifest = [
+            "/content/LibriTTS/dev-clean/2428/83705/2428_83705_000000_000001.wav",
+            "/content/LibriTTS/dev-clean/1988/148538/1988_148538_000002_000000.wav"
+        ]
+    else:
+        manifest = build_or_load_manifest("/content/LibriTTS", num_utterances=num_pairs, seed=42)
+    valid_manifest = [p for p in manifest if os.path.exists(p)]
+    if not valid_manifest:
+        print("❌ No valid audio files found in manifest. Check your dataset paths.")
+        return
+    N = min(len(valid_manifest), num_pairs)
+    valid_manifest = valid_manifest[:N]
+    print(f"Using {N} pairs (content[i] -> target[(i+1)%N]).")
+
+    # ── Per-k accumulators ──
+    cross_sims = {k: 0.0 for k in k_values}
+    self_sims = {k: 0.0 for k in k_values}
+    counts = {k: 0 for k in k_values}
+
+    print(f"\n[4] Sweeping {len(k_values)} scale values x {N} pairs...")
+    try:
+        with torch.no_grad():
+            for i in tqdm(range(N), desc="Sweep pairs"):
+                content_path = valid_manifest[i]
+                spk_path = valid_manifest[(i + 1) % N]
+
+                content_audio = load_audio(content_path, sample_rate=audio_cfg.sample_rate).to(device)
+                spk_ref = load_audio(spk_path, sample_rate=audio_cfg.sample_rate).to(device)
+                content_seg = content_audio
+                content_ref = content_audio
+
+                content_spk_raw = model.mel_encoder.extract_speaker_features(
+                    content_seg.unsqueeze(0), apply_projection=False
+                )[0]  # [192]
+
+                wav_content_raw = content_audio.cpu().unsqueeze(0)
+                wav_target_raw = spk_ref.cpu().unsqueeze(0)
+
+                for k in k_values:
+                    model.cross_attn._bias_scale_k = k
+
+                    # Cross conversion (Content A, Voice B) with bias injection scaled by k
+                    pred_mel_cross, _, _ = model(
+                        spk_ref.unsqueeze(0), [content_seg],
+                        return_bottleneck=True, return_aux=True,
+                        precomputed_content_speaker_feats=content_spk_raw.unsqueeze(0)
+                    )
+                    wav_cross = vocoder(pred_mel_cross).squeeze(0).cpu()
+                    cross_sims[k] += calculate_spk_sim(spk_encoder, wav_cross, wav_target_raw, device)
+
+                    # Self reconstruction — bias is self-speaker here, so it reinforces
+                    # self identity (expect self SPK_SIM to rise slightly with k).
+                    pred_mel_self, _, _ = model(
+                        content_ref.unsqueeze(0), [content_seg],
+                        return_bottleneck=True, return_aux=True,
+                        precomputed_content_speaker_feats=content_spk_raw.unsqueeze(0)
+                    )
+                    wav_self = vocoder(pred_mel_self).squeeze(0).cpu()
+                    self_sims[k] += calculate_spk_sim(spk_encoder, wav_self, wav_content_raw, device)
+
+                    counts[k] += 1
+    finally:
+        model.cross_attn._bias_scale_k = 1.0  # restore
+
+    # ── Average + report ──
+    rows = []
+    for k in k_values:
+        c = max(counts[k], 1)
+        rows.append((k, cross_sims[k] / c, self_sims[k] / c))
+
+    best = max(rows, key=lambda r: r[1])  # best by Cross SPK_SIM
+    k1_cross = next((r[1] for r in rows if r[0] == 1.0), None)
+
+    print("\n" + "=" * 60)
+    print("📊 ALPHA_BIAS SCALE SWEEP RESULTS")
+    print("=" * 60)
+    print(f"{'k':>6} {'Cross SPK_SIM':>16} {'Self SPK_SIM':>16}")
+    print("-" * 42)
+    for k, cs, ss in rows:
+        marker = "  <- best cross" if k == best[0] else ""
+        print(f"{k:>6.2f} {cs:>16.4f} {ss:>16.4f}{marker}")
+    print("-" * 42)
+    print(f"Best k (cross) = {best[0]:.2f}  ->  Cross SPK_SIM = {best[1]:.4f}")
+    if k1_cross is not None:
+        print(f"k=1.0 Cross SPK_SIM = {k1_cross:.4f}  (trained point; should match E30 Cross ~0.1816)")
+    print("\n→ Decision rule (best k by Cross SPK_SIM):")
+    print("   Cross rises monotonically with k -> ENTRY-LIMITED; upstream injection is the lever (strengthen alpha_bias / cross-attn)")
+    print("   Cross flat / drops at high k     -> CRUSH-LIMITED; decoder crushes the extra (S19) -> decoder is the ceiling")
+    print("   Cross peaks then declines        -> mild entry-limit + overshoot at high k")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate CasiVC Generalization")
@@ -550,6 +948,22 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="generalization_outputs", help="Output directory for audio")
     parser.add_argument("--smoke", action="store_true", help="Run quick 2-utterance smoke test instead of full 50-pair manifest")
     parser.add_argument("--zero_speaker_delta", action="store_true", help="Zero the speaker delta branch to isolate disturbance source (Step 0 diagnostic)")
+    parser.add_argument("--delta_sweep", action="store_true", help="Eval-only sweep: scale mel_speaker by s in {-1..1.5}, measure Cross/Self SPK_SIM. Decisive for S22 motivation.")
+    parser.add_argument("--s_values", type=str, default=None, help="Comma-separated scale factors, e.g. '-1,-0.5,0,0.25,0.5,1,1.5' (default)")
+    parser.add_argument("--num_pairs", type=int, default=50, help="Number of pairs for the sweep (default 50, comparable to the E30 scoreboard)")
+    parser.add_argument("--alpha_bias_sweep", action="store_true", help="Eval-only sweep: scale the upstream speaker-bias injection (cross_attn alpha_bias) by k in {0..4}. Tests entry- vs crush-limited.")
+    parser.add_argument("--k_values", type=str, default=None, help="Comma-separated bias scale factors, e.g. '0,0.5,1,2,4' (default)")
     args = parser.parse_args()
     
-    run_evaluation(args.checkpoint, args.output_dir, args.smoke, args.zero_speaker_delta)
+    if args.delta_sweep:
+        s_vals = None
+        if args.s_values:
+            s_vals = [float(v.strip()) for v in args.s_values.split(",")]
+        run_delta_scale_sweep(args.checkpoint, args.output_dir, args.smoke, s_vals, num_pairs=args.num_pairs)
+    elif args.alpha_bias_sweep:
+        k_vals = None
+        if args.k_values:
+            k_vals = [float(v.strip()) for v in args.k_values.split(",")]
+        run_alpha_bias_sweep(args.checkpoint, args.output_dir, args.smoke, k_vals, num_pairs=args.num_pairs)
+    else:
+        run_evaluation(args.checkpoint, args.output_dir, args.smoke, args.zero_speaker_delta)
