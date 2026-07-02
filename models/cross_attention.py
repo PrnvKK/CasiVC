@@ -80,6 +80,12 @@ class PositionAgnosticCrossAttention(nn.Module):
         # softplus(-2.0) ≈ 0.13 — a small, learnable scaling of the mean speaker key direction
         self.alpha_bias = nn.Parameter(torch.tensor(-2.0))
 
+        # Eval-only sweep knob for the detached speaker-bias injection above
+        # (the F.softplus(alpha_bias) * spk_bias term at L380 and L487).
+        # Default 1.0 = no effect (training/eval unchanged). Set != 1.0 only by
+        # test_generalization.run_alpha_bias_sweep to probe entry- vs crush-limited.
+        self._bias_scale_k = 1.0
+
         # Multi-head attention (speaker features already at correct dimension)
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=self.d_model,
@@ -377,7 +383,7 @@ class PositionAgnosticCrossAttention(nn.Module):
         # keys would be content_proj(speaker_features) — a DIFFERENT space, useless for spk_pooled alignment.
         if self.enable_residual:
             spk_bias = speaker_features.detach().mean(dim=1, keepdim=True) # [B,1,96] raw speaker-token basis
-            attended_features = attended_features + F.softplus(self.alpha_bias) * spk_bias
+            attended_features = attended_features + F.softplus(self.alpha_bias) * spk_bias * self._bias_scale_k
         self._cached_attended_features = attended_features  # for CE probe (pre-additive, pre-dropout)
 
         if v: print(f"[cross_attn] attended_features shape: {attended_features.shape}")
@@ -484,7 +490,7 @@ class PositionAgnosticCrossAttention(nn.Module):
             attended_features = attended_features + film_output
             # Second post-relay injection of the same scalar·bias: bypasses film/residual
             # erosion so fused_features carries spk_pooled direction by construction.
-            attended_features = attended_features + F.softplus(self.alpha_bias) * spk_bias
+            attended_features = attended_features + F.softplus(self.alpha_bias) * spk_bias * self._bias_scale_k
 
             # ── Source-leakage audit: is FiLM dominating or is the residual still winning? ──
             if v: print(f"[cross_attn] residual_norm contribution: std={residual_norm.std():.4f}")
