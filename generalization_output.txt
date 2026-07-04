@@ -1,0 +1,200 @@
+epoch 3
+
+============================================================
+📊 EVALUATION SCOREBOARD
+============================================================
+  Pairs Evaluated:          50 (out of 50)
+  Self-Recon Mel L1:        0.9476 (Lower is better)
+  Content-Only L1 (prebias):0.9476 (vs full 0.9476 — gap = speaker-delta impact)
+  Self SPK_SIM:             0.1669 (Target > 0.70, upper ~0.92)
+  Cross SPK_SIM:            0.0456 (Target > 0.35)
+  Vocoder Ceiling SIM:      0.9205 (Upper bound for vocoded audio)
+  Shuffled→Shuffled SIM:    0.0451
+  Shuffled→Target SIM:      0.0246
+  Delta (shuf→shuf minus shuf→target):  0.0205 (should be > 0.05)
+  mel_speaker |mean|:       0.7384 (should be > 0.01)
+  RMS(mel_speaker)/RMS(content): 0.2262 (<0.05=negligible, >0.15=dominant)
+  ── S21 G2 Gate Diagnostics ──
+  speaker_delta_gate (cross): 0.6512 (target ≥ 0.3)
+  speaker_delta_cos (cross):  0.3430 (target ≤ 0.7)
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — cross-attention fusion strength
+------------------------------------------------------------
+  Attn Entropy (cross):     0.9589  (uniform ≈ 2.08 over 8 tokens)
+  Attn Max Weight (cross):  0.5559  (1.0 = single-token; 1/8 = uniform)
+  cos(fused, content_pre):  0.2973  → high = residual pass-through
+  cos(fused, spk_pooled):   0.0642  → high = speaker fusion active
+  cos(attn_pre_film, spk_pooled):  0.0320  → primary readout for CE probe success
+  ── DECODER TRACE: cos(stage_pooled, spk_pooled) ──
+    resampled     : +0.0739
+    post_adapter  : +0.0236
+    block3        : +0.0487
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — identity preservation without output delta
+------------------------------------------------------------
+  Content-Only SPK_SIM:     0.1669  (vs Self SPK_SIM 0.1669 — Δ = -0.0000)
+============================================================
+
+epoch 10
+============================================================
+📊 EVALUATION SCOREBOARD
+============================================================
+  Pairs Evaluated:          50 (out of 50)
+  Self-Recon Mel L1:        0.9616 (Lower is better)
+  Content-Only L1 (prebias):0.9616 (vs full 0.9616 — gap = speaker-delta impact)
+  Self SPK_SIM:             0.3369 (Target > 0.70, upper ~0.92)
+  Cross SPK_SIM:            0.1204 (Target > 0.35)
+  Vocoder Ceiling SIM:      0.9205 (Upper bound for vocoded audio)
+  Shuffled→Shuffled SIM:    0.1190
+  Shuffled→Target SIM:      0.0527
+  Delta (shuf→shuf minus shuf→target):  0.0663 (should be > 0.05)
+  mel_speaker |mean|:       0.8080 (should be > 0.01)
+  RMS(mel_speaker)/RMS(content): 0.2466 (<0.05=negligible, >0.15=dominant)
+  ── S21 G2 Gate Diagnostics ──
+  speaker_delta_gate (cross): 0.7612 (target ≥ 0.3)
+  speaker_delta_cos (cross):  0.2293 (target ≤ 0.7)
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — cross-attention fusion strength
+------------------------------------------------------------
+  Attn Entropy (cross):     1.2804  (uniform ≈ 2.08 over 8 tokens)
+  Attn Max Weight (cross):  0.4854  (1.0 = single-token; 1/8 = uniform)
+  cos(fused, content_pre):  0.3875  → high = residual pass-through
+  cos(fused, spk_pooled):   0.0575  → high = speaker fusion active
+  cos(attn_pre_film, spk_pooled):  0.0570  → primary readout for CE probe success
+  ── DECODER TRACE: cos(stage_pooled, spk_pooled) ──
+    resampled     : +0.0858
+    post_adapter  : -0.0013
+    block3        : +0.0549
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — identity preservation without output delta
+------------------------------------------------------------
+  Content-Only SPK_SIM:     0.3369  (vs Self SPK_SIM 0.3369 — Δ = 0.0000)
+============================================================
+
+epoch 20
+============================================================
+📊 EVALUATION SCOREBOARD
+============================================================
+  Pairs Evaluated:          50 (out of 50)
+  Self-Recon Mel L1:        0.9615 (Lower is better)
+  Content-Only L1 (prebias):0.9615 (vs full 0.9615 — gap = speaker-delta impact)
+  Self SPK_SIM:             0.3864 (Target > 0.70, upper ~0.92)
+  Cross SPK_SIM:            0.1724 (Target > 0.35)
+  Vocoder Ceiling SIM:      0.9205 (Upper bound for vocoded audio)
+  Shuffled→Shuffled SIM:    0.1608
+  Shuffled→Target SIM:      0.0709
+  Delta (shuf→shuf minus shuf→target):  0.0899 (should be > 0.05)
+  mel_speaker |mean|:       0.6486 (should be > 0.01)
+  RMS(mel_speaker)/RMS(content): 0.1984 (<0.05=negligible, >0.15=dominant)
+  ── S21 G2 Gate Diagnostics ──
+  speaker_delta_gate (cross): 0.7793 (target ≥ 0.3)
+  speaker_delta_cos (cross):  0.1990 (target ≤ 0.7)
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — cross-attention fusion strength
+------------------------------------------------------------
+  Attn Entropy (cross):     1.2400  (uniform ≈ 2.08 over 8 tokens)
+  Attn Max Weight (cross):  0.4941  (1.0 = single-token; 1/8 = uniform)
+  cos(fused, content_pre):  0.4366  → high = residual pass-through
+  cos(fused, spk_pooled):   0.0589  → high = speaker fusion active
+  cos(attn_pre_film, spk_pooled):  0.0570  → primary readout for CE probe success
+  ── DECODER TRACE: cos(stage_pooled, spk_pooled) ──
+    resampled     : +0.1020
+    post_adapter  : +0.0166
+    block3        : +0.0332
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — identity preservation without output delta
+------------------------------------------------------------
+  Content-Only SPK_SIM:     0.3864  (vs Self SPK_SIM 0.3864 — Δ = -0.0000)
+============================================================
+
+epoch 30
+
+===========================================================
+📊 DELTA SCALE SWEEP RESULTS
+============================================================
+     s    Cross SPK_SIM     Self SPK_SIM    Self L1
+----------------------------------------------------
+ -1.00           0.1592           0.4172     0.9518
+ -0.50           0.1894           0.4172     0.9518
+  0.00           0.1940           0.4172     0.9518
+  0.25           0.1944           0.4172     0.9518
+  0.50           0.1946           0.4172     0.9518  <- best cross
+  1.00           0.1816           0.4172     0.9518
+  1.50           0.1609           0.4172     0.9518
+----------------------------------------------------
+Best s (cross) = 0.50  ->  Cross SPK_SIM = 0.1946
+s=0 Cross SPK_SIM = 0.1940  (prebias ablation was 0.1940; close = out_bias SPK_SIM-neutral, confirmed)
+
+→ Decision rule (best s by Cross SPK_SIM):
+   best s ~ 0    -> delta harmful; retire SpeakerDeltaProj, tune upstream alpha_bias/cross-attn
+   best s < 0    -> delta has speaker info but wrong sign/basis (flippable)
+   0 < best < 1  -> delta over-amplified; dial down (raw_delta_scale / CE weight)
+   best s > 1    -> delta needs more power -> S22 (richer x) or alpha-reduction viable
+============================================================
+
+
+
+============================================================
+📊 ALPHA_BIAS SCALE SWEEP RESULTS
+============================================================
+     k    Cross SPK_SIM     Self SPK_SIM
+------------------------------------------
+  0.00           0.1835           0.4106  <- best cross
+  0.50           0.1813           0.4134
+  1.00           0.1816           0.4172
+  2.00           0.1768           0.4166
+  4.00           0.1712           0.4151
+------------------------------------------
+Best k (cross) = 0.00  ->  Cross SPK_SIM = 0.1835
+k=1.0 Cross SPK_SIM = 0.1816  (trained point; should match E30 Cross ~0.1816)
+
+→ Decision rule (best k by Cross SPK_SIM):
+   Cross rises monotonically with k -> ENTRY-LIMITED; upstream injection is the lever (strengthen alpha_bias / cross-attn)
+   Cross flat / drops at high k     -> CRUSH-LIMITED; decoder crushes the extra (S19) -> decoder is the ceiling
+   Cross peaks then declines        -> mild entry-limit + overshoot at high k
+============================================================
+
+
+
+=============================================================
+📊 EVALUATION SCOREBOARD
+============================================================
+  Pairs Evaluated:          50 (out of 50)
+  Self-Recon Mel L1:        0.9518 (Lower is better)
+  Content-Only L1 (prebias):0.9518 (vs full 0.9518 — gap = speaker-delta impact)
+  Self SPK_SIM:             0.4172 (Target > 0.70, upper ~0.92)
+  Cross SPK_SIM:            0.1816 (Target > 0.35)
+  Cross Content-Only SPK_SIM: 0.1940  (delta Δ = -0.0124 — S22 decision)
+  Vocoder Ceiling SIM:      0.9205 (Upper bound for vocoded audio)
+  Shuffled→Shuffled SIM:    0.1674
+  Shuffled→Target SIM:      0.0732
+  Delta (shuf→shuf minus shuf→target):  0.0942 (should be > 0.05)
+  mel_speaker |mean|:       0.5955 (should be > 0.01)
+  RMS(mel_speaker)/RMS(content): 0.1838 (<0.05=negligible, >0.15=dominant)
+  ── S21 G2 Gate Diagnostics ──
+  speaker_delta_gate (cross): 0.7974 (target ≥ 0.3)
+  speaker_delta_cos (cross):  0.1772 (target ≤ 0.7)
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — cross-attention fusion strength
+------------------------------------------------------------
+  Attn Entropy (cross):     1.2597  (uniform ≈ 2.08 over 8 tokens)
+  Attn Max Weight (cross):  0.4905  (1.0 = single-token; 1/8 = uniform)
+  cos(fused, content_pre):  0.4599  → high = residual pass-through
+  cos(fused, spk_pooled):   0.0534  → high = speaker fusion active
+  cos(attn_pre_film, spk_pooled):  0.0637  → primary readout for CE probe success
+  ── DECODER TRACE: cos(stage_pooled, spk_pooled) ──
+    resampled     : +0.0992
+    post_adapter  : +0.0231
+    block3        : +0.0373
+------------------------------------------------------------
+🔎 STEP 1 AUDIT — identity preservation without output delta
+------------------------------------------------------------
+  Content-Only SPK_SIM:     0.4172  (vs Self SPK_SIM 0.4172 — Δ = 0.0000)
+------------------------------------------------------------
+🔎 S22 DECISION — cross identity with/without speaker delta
+------------------------------------------------------------
+  Cross Content-Only SPK_SIM: 0.1940  (vs Cross SPK_SIM 0.1816 — Δ = -0.0124)
+  → Δ = speaker delta's contribution to cross identity (decisive for S22):
+     Δ ≈ 0  → delta decorative at output → S22 (pre-adapter x) WRONG lever
+     Δ > 0  → delta load-bearing         → S22 (pre-adapter x) well-motivated
+============================================================
