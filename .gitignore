@@ -1,0 +1,50 @@
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Model Checkpoints & Pretrained weights
+checkpoints/*
+!checkpoints/MANIFEST.yaml
+pretrained_models/
+*.ckpt
+*.pt
+*.pth
+*.bin
+
+# Caches & Artifacts
+cache/
+test_cache/
+test_data/
+eval_results/
+eval_manifest.json
+hubertvc_cache/
+*.wav
+eval/**/logs/
+data/LibriTTS/
+
+# Archived superseded code & artifacts
+_archive/
+casivc_colab.zip
+colab_artifacts/
+samples/
+samples_phase2/
+samples_smooth3/
+
+# System & IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Run logs & scratch
+*.out.txt
+*.err.txt
