@@ -1,0 +1,84 @@
+# vc_research/roles.yaml
+# ---------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH FOR ROLE NAMES AND PERMISSIONS.
+#
+# Every doc / brief / template refers to roles by their stable SLOT name
+# (`director`, `executor`), never by a model/vendor name. To rename a role,
+# edit only `display_name` here. To swap the model behind a role, edit `model`.
+#
+# As of 2026-09-30:
+#   director = Claude  (SOTA / research lead)
+#   executor = opencode (implementation + run agent)
+# ---------------------------------------------------------------------------
+
+roles:
+
+  director:
+    # The costly, high-context "SOTA" model. Proposes theory, writes briefs,
+    # adjudicates results, owns Research.md and the kill log.
+    display_name: Claude
+    model: claude
+    may_read:
+      - vc_research/Research.md
+      - vc_research/CURRENT_STATE.md
+      - vc_research/STATUS.md
+      - vc_research/EVIDENCE_LOG.md
+      - vc_research/ledger.md
+      - vc_research/kill_log.md
+      - eval/INDEX.md
+      - vc_research/changes/**
+    may_write:
+      - vc_research/Research.md
+      - vc_research/EVIDENCE_LOG.md
+      - vc_research/claude_decisions/**
+      - vc_research/claude_briefs/**
+      - vc_research/kill_log.md
+    must_not_write:
+      - src/**
+      - tools/**
+      - eval/**
+    budget:
+      tokens_per_task: 60000
+
+  executor:
+    # The cheap, short-context implementation + run agent. Reads only the
+    # program contract, its assigned brief, and one experiment folder. Never
+    # reads Research.md or project history.
+    display_name: opencode
+    model: opencode
+    may_read:
+      - vc_research/program.md
+      - vc_research/roles.yaml
+      - vc_research/claude_briefs/<assigned brief>
+      - vc_research/changes/experiments/<assigned EXP>/**
+      - src/vc/**
+      - tools/**
+      - tests/**
+      - probes/**
+      - baselines/**
+    may_write:
+      - src/vc/**
+      - tools/**
+      - tests/**
+      - probes/**
+      - baselines/**
+      - vc_research/changes/**
+      - eval/<assigned EXP>/**
+      - vc_research/ledger.md        # status column only
+    must_not_write:
+      - vc_research/Research.md
+      - vc_research/kill_log.md
+      - vc_research/claude_briefs/**
+      - vc_research/claude_decisions/**
+      - eval/INDEX.md
+      - eval/PROTOCOL.md
+      - eval/splits/**
+    budget:
+      tokens_per_task: 30000
+      wallclock_min: 60
+
+# Gate: an EXP above this estimated wall-clock/cost needs an explicit
+# `claude_decisions/` sign-off from the director before the executor may run it.
+escalation:
+  wallclock_min_threshold: 90
+  require_decision_for_scaleup: true
