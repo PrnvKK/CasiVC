@@ -1,0 +1,10 @@
+{
+  "target": "eval/EXP-003-scaleup-ladder",
+  "rel_from_here": "../../../../eval/EXP-003-scaleup-ladder",
+  "files": [
+    "cf_cont100_n620.json",
+    "cf_km100_n620.json",
+    "cf_km100_id_n620.json"
+  ],
+  "note": "Frozen evidence. Read via this pointer when symlinks are unavailable."
+}
