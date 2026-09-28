@@ -1,4 +1,12 @@
-# CasiVC Journal (condensed)
+# CasiVC Journal (condensed) — HISTORICAL
+
+> **Historical record of a retired architecture.** Many conclusions below
+> (e.g. "L1 crushes any speaker module", "Cross SPK_SIM ceiling ~0.20 is
+> structural") were drawn from runs later found to be corrupted by the
+> training-validity bug. See [`HANDOFF-2026-09-30.md`](HANDOFF-2026-09-30.md)
+> and the current control plane in
+> [`../vc_research/CURRENT_STATE.md`](../vc_research/CURRENT_STATE.md).
+> Keep this file for context, not as current fact.
 
 ## Invariants (Sessions 1–17)
 - L1 asymptotically crushes any speaker module sharing its gradient path. CE is the only gradient source that survives.
