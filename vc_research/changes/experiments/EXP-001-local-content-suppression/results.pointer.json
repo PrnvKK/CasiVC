@@ -1,0 +1,15 @@
+{
+  "target": "eval/EXP-001-local-content-suppression",
+  "rel_from_here": "../../../../eval/EXP-001-local-content-suppression",
+  "files": [
+    "v0_full_eval.json",
+    "cf_cont_s1_n240.json",
+    "cf_cont_s2_n240.json",
+    "cf_km_n240.json",
+    "cf_km_id_n240.json",
+    "cf_vq_fixed_n240.json",
+    "cf_vq_fixed_s1_n240.json",
+    "cf_vq_fixed_s2_n240.json"
+  ],
+  "note": "Frozen evidence. Read via this pointer when symlinks are unavailable."
+}

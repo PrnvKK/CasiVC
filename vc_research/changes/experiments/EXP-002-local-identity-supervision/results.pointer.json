@@ -1,0 +1,12 @@
+{
+  "target": "eval/EXP-002-local-identity-supervision",
+  "rel_from_here": "../../../../eval/EXP-002-local-identity-supervision",
+  "files": [
+    "cf_vq_fixed_id_n240.json",
+    "cf_vq_fixed_id_s1_n240.json",
+    "cf_vq_fixed_id_s2_n240.json",
+    "cf_vq_fixed_id_eval_rows.json",
+    "v1_true_ecapa_results.json"
+  ],
+  "note": "Frozen evidence. Read via this pointer when symlinks are unavailable."
+}

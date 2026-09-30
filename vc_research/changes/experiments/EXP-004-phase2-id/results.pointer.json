@@ -1,0 +1,8 @@
+{
+  "target": "eval/EXP-004-phase2-id",
+  "rel_from_here": "../../../../eval/EXP-004-phase2-id",
+  "files": [
+    "cf_km100_idP2_n620.json"
+  ],
+  "note": "Frozen evidence. Read via this pointer when symlinks are unavailable."
+}

@@ -1,0 +1,105 @@
+# checkpoints/MANIFEST.yaml
+# Canonical checkpoint registry. Checkpoints are gitignored (large binaries);
+# this manifest is the tracked, hash-pinned index. Regenerate with:
+#   python -c "from vc.eval.manifest import sha256_file; ..."
+# or tools/checkpoint_manifest.py if added later.
+#
+# sha256 computed 2026-09-30.
+
+checkpoints:
+
+  ident_valid:                       # V0 continuous (repaired), seed 0, 20 ep
+    file: checkpoints/ident_valid.ckpt
+    sha256: d5fd432cac635ef10eea5c6c30955b96e588d20e13156743a57779be37eadf3e
+    content: continuous
+    experiment: EXP-001
+
+  cf_vq_fixed:                       # corrected VQ (canonical local)
+    file: checkpoints/cf_vq_fixed.ckpt
+    sha256: 948964b105a3f32b2dd54fd4d34cf8d9c55010be2fce01ce5aa3c1aee054b501
+    content: vq
+    experiment: EXP-001
+
+  cf_vq_fixed_id:                    # VQ + id (canonical local breakthrough)
+    file: checkpoints/cf_vq_fixed_id.ckpt
+    sha256: 69773282275c8a92c069890b3a8cc3c7dce5b9af2e7a474a03ba68b85f486002
+    content: vq
+    experiment: EXP-002
+
+  cf_vq_fixed_id_s1:
+    file: checkpoints/cf_vq_fixed_id_s1.ckpt
+    sha256: 9e4f5c7e8d0138ab6b865aeb025ee9a717866e89c8b10297ae07b0038f3d4c78
+    content: vq
+    experiment: EXP-002
+    seed: 1
+
+  cf_vq_fixed_id_s2:
+    file: checkpoints/cf_vq_fixed_id_s2.ckpt
+    sha256: 89d8fa9141df494daa1742fd6031546a1c2d91d95eb65b5607049c45bd7009f1
+    content: vq
+    experiment: EXP-002
+    seed: 2
+
+  cf_vq_fixed_s1:
+    file: checkpoints/cf_vq_fixed_s1.ckpt
+    sha256: ee60c9149983e835dcd86e387c084ea7beac5eb277e0a7bdb5cf52a26ebffec5
+    content: vq
+    experiment: EXP-001
+    seed: 1
+
+  cf_vq_fixed_s2:
+    file: checkpoints/cf_vq_fixed_s2.ckpt
+    sha256: 2a269607c988bdec52a763717f06b1f104d6a005989b9fdcac7a52c6ab844c9c
+    content: vq
+    experiment: EXP-001
+    seed: 2
+
+  cf_cont_s1:
+    file: checkpoints/cf_cont_s1.ckpt
+    sha256: f109668dc3a6ede7cbf552984d40eda113a1c8a8f6694158f4519b9ed6b4d31f
+    content: continuous
+    experiment: EXP-001
+    seed: 1
+
+  cf_cont_s2:
+    file: checkpoints/cf_cont_s2.ckpt
+    sha256: d048eca48b13612440f53b5bfb626270893194f605e92d6d8c4213570c1521b3
+    content: continuous
+    experiment: EXP-001
+    seed: 2
+
+  cf_km:
+    file: checkpoints/cf_km.ckpt
+    sha256: 2274de478f7f3d62507f7c0f004643108fb93c813d5a1cbd72bd1b780e772e07
+    content: vq
+    experiment: EXP-001
+
+  cf_km_id:
+    file: checkpoints/cf_km_id.ckpt
+    sha256: e5f5c09f055e3aa85797a5d62a9bd7c13826c07b04e1327df062bf9b257c1d07
+    content: vq
+    experiment: EXP-001
+
+  cf_cont100:                        # Colab scale-up
+    file: checkpoints/cf_cont100.ckpt
+    sha256: ae92cd792669d9928df233aed75c8cd64f8b60533c90c1b95bfda3c07f11e49a
+    content: continuous
+    experiment: EXP-003
+
+  cf_km100:
+    file: checkpoints/cf_km100.ckpt
+    sha256: 2008d882bbb664b49a7607ce42b2913ec8bcbe739bc56e5e478a7f84c924a76b
+    content: vq
+    experiment: EXP-003
+
+  cf_km100_id:
+    file: checkpoints/cf_km100_id.ckpt
+    sha256: e0d94fbc3a968260ad345e761341fd7e99e8fbae554f120f3bd9bda2c8ec4795
+    content: vq
+    experiment: EXP-003
+
+  cf_km100_idP2:                     # Phase-2 id (CURRENT BEST)
+    file: checkpoints/cf_km100_idP2.ckpt
+    sha256: 46a0c1270fa3b0b26c6889b0f8045aab986f40d8f3324539a30be0b459be2142
+    content: vq
+    experiment: EXP-004
